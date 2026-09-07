@@ -1,11 +1,13 @@
 from __future__ import annotations
-
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from chat_database import get_message, get_message_range
-
+from chat_database import (
+    get_message,
+    get_chronological_context,
+)
 
 # ============================================================
 # CONFIG
@@ -118,21 +120,53 @@ def normalize_message(row: Any) -> Optional[TimelineMessage]:
     if row is None:
         return None
 
-    if isinstance(row, dict):
+    # ---------------------------------------------------------
+    # SQLite Row
+    # ---------------------------------------------------------
+    if isinstance(row, sqlite3.Row):
+        message_id = row["id"]
+        timestamp = row["timestamp"]
+        sender = row["sender"]
+        message = row["message"]
+
+    # ---------------------------------------------------------
+    # Dictionary
+    # ---------------------------------------------------------
+    elif isinstance(row, dict):
         message_id = row.get("id", row.get("message_id"))
-        timestamp = row.get("timestamp", row.get("datetime", row.get("date")))
+        timestamp = row.get(
+            "timestamp",
+            row.get("datetime", row.get("date")),
+        )
         sender = row.get("sender", "")
         message = row.get("message", row.get("text", ""))
 
+    # ---------------------------------------------------------
+    # Generic object
+    # ---------------------------------------------------------
     else:
-        message_id = getattr(row, "id", getattr(row, "message_id", None))
+        message_id = getattr(
+            row,
+            "id",
+            getattr(row, "message_id", None),
+        )
+
         timestamp = getattr(
             row,
             "timestamp",
-            getattr(row, "datetime", getattr(row, "date", None)),
+            getattr(
+                row,
+                "datetime",
+                getattr(row, "date", None),
+            ),
         )
+
         sender = getattr(row, "sender", "")
-        message = getattr(row, "message", getattr(row, "text", ""))
+        message = getattr(
+            row,
+            "message",
+            getattr(row, "text", ""),
+        )
 
     if message_id is None:
         return None
@@ -164,23 +198,28 @@ def fetch_anchor(anchor_id: int) -> Optional[TimelineMessage]:
 # ============================================================
 # FETCH CHRONOLOGICAL DATASET
 # ============================================================
-
 def fetch_candidate_timeline(
     anchor_id: int,
     lookaround: int = ID_LOOKAROUND,
 ) -> List[TimelineMessage]:
 
-    start_id = max(1, anchor_id - lookaround)
-    end_id = anchor_id + lookaround
-
     try:
-        rows = get_message_range(start_id, end_id)
-    except Exception:
+        rows = get_chronological_context(
+            message_id=anchor_id,
+            before=40,
+            after=40,
+        )
+    except Exception as e:
+        print(
+            f"Failed to fetch chronological context "
+            f"for anchor {anchor_id}: {e}"
+        )
         return []
 
     messages = []
 
     for row in rows:
+
         msg = normalize_message(row)
 
         if msg is None:
@@ -191,8 +230,12 @@ def fetch_candidate_timeline(
 
         messages.append(msg)
 
+    # -------------------------------------------------------------
     # CRITICAL:
-    # IDs are NOT used to determine chronological order.
+    # Sort by actual timestamp.
+    # Never sort by message ID.
+    # -------------------------------------------------------------
+
     messages.sort(
         key=lambda x: (
             x.timestamp,
@@ -387,6 +430,10 @@ def expand_single_anchor(
 # ============================================================
 
 def get_candidate_id(candidate: Any) -> Optional[int]:
+
+    # Direct integer anchor ID.
+    if isinstance(candidate, int):
+        return candidate
 
     if isinstance(candidate, dict):
         value = candidate.get(
