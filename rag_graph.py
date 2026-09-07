@@ -96,13 +96,14 @@ from langchain_ollama import ChatOllama
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END
 
-from vectorstore import load_vectorstore
-
+from hybrid_retriever import hybrid_search
 from analytics import build_style_profile
+
+from query_router import route_query
 
 from chat_database import (
     search_messages,
-    get_message_range,
+    get_chronological_context,
 )
 
 
@@ -154,10 +155,51 @@ class GraphState(TypedDict):
 
     scope: str
 
+    primary_intent: str
+
+    secondary_intents: List[str]
+
 
 # =====================================================================
 # Scope classification
 # =====================================================================
+# =====================================================================
+# Query routing
+# =====================================================================
+
+def route_query_node(
+    state: GraphState,
+) -> GraphState:
+    """
+    Detect the primary and secondary analytical intents
+    before the existing scope/retrieval pipeline runs.
+
+    This step is observational for now.
+    The detected intents do NOT control graph routing yet.
+    """
+
+    route = route_query(
+        state["question"]
+    )
+
+    primary_intent = route.primary_intent.value
+
+    secondary_intents = [
+        intent.value
+        for intent in route.secondary_intents
+    ]
+
+    print(
+        f"[QUERY ROUTER] "
+        f"Primary={primary_intent} "
+        f"Secondary={secondary_intents}"
+    )
+
+    return {
+        **state,
+        "primary_intent": primary_intent,
+        "secondary_intents": secondary_intents,
+    }
 
 def classify_scope(
     state: GraphState,
@@ -463,20 +505,20 @@ def keyword_retrieve(
 # =====================================================================
 # Hybrid retrieval
 # =====================================================================
-
 def retrieve(
     state: GraphState,
 ) -> GraphState:
     """
-    Hybrid retrieval.
+    Retrieve evidence using the deterministic hybrid retriever.
 
-    Semantic:
-        Chroma finds conceptually similar conversation sections.
+    The hybrid retriever combines:
+        - semantic message retrieval
+        - lexical SQLite retrieval
+        - query expansion
+        - evidence scoring
+        - conversation chunk retrieval
 
-    Keyword:
-        SQLite FTS5 finds exact lexical matches.
-
-    Results are combined into one candidate pool.
+    The LLM is not involved in retrieval.
     """
 
     question = state["question"]
@@ -497,122 +539,116 @@ def retrieve(
         f"Question: {question}"
     )
 
-    # -------------------------------------------------------------
-    # Semantic retrieval
-    # -------------------------------------------------------------
-
-    vectorstore = load_vectorstore()
-
-    retriever = vectorstore.as_retriever(
-        search_kwargs={
-            "k": SEMANTIC_TOP_K,
-        }
-    )
-
-    semantic_docs = retriever.invoke(
-        question
-    )
-
-    # -------------------------------------------------------------
-    # Keyword retrieval
-    # -------------------------------------------------------------
-
-    keyword_docs = keyword_retrieve(
+    result = hybrid_search(
         question,
-        limit=KEYWORD_TOP_K,
+        message_top_k=20,
+        lexical_top_k=20,
+        chunk_top_k=5,
     )
 
-    # -------------------------------------------------------------
-    # Merge
-    # -------------------------------------------------------------
-
-    combined = []
-
-    seen_semantic_ranges = set()
-
-    seen_keyword_messages = set()
-
-    # -------------------------------------------------------------
-    # Semantic results
-    # -------------------------------------------------------------
-
-    for document in semantic_docs:
-
-        start_id = document.metadata.get(
-            "start_message_id"
-        )
-
-        end_id = document.metadata.get(
-            "end_message_id"
-        )
-
-        key = (
-            start_id,
-            end_id,
-        )
-
-        if key in seen_semantic_ranges:
-
-            continue
-
-        seen_semantic_ranges.add(
-            key
-        )
-
-        combined.append(
-            document
-        )
-
-    # -------------------------------------------------------------
-    # Keyword results
-    # -------------------------------------------------------------
-
-    for document in keyword_docs:
-
-        message_id = document.metadata.get(
-            "message_id"
-        )
-
-        if message_id in seen_keyword_messages:
-
-            continue
-
-        seen_keyword_messages.add(
-            message_id
-        )
-
-        combined.append(
-            document
-        )
-
-    # -------------------------------------------------------------
-    # Bound candidate pool
-    # -------------------------------------------------------------
-
-    combined = combined[
-        :MAX_HYBRID_CANDIDATES
-    ]
+    candidates = result["candidates"]
+    chunks = result["chunks"]
 
     print(
-        f"Semantic candidates: "
-        f"{len(semantic_docs)}"
+        f"Message candidates: {len(candidates)}"
     )
 
     print(
-        f"Keyword candidates:  "
-        f"{len(keyword_docs)}"
+        f"Conversation chunks: {len(chunks)}"
     )
 
     print(
-        f"Combined candidates:  "
-        f"{len(combined)}"
+        "\nTop hybrid candidates:"
+    )
+
+    for rank, candidate in enumerate(
+        candidates[:10],
+        start=1,
+    ):
+        print(
+            f"  #{rank} "
+            f"ID={candidate.message_id} "
+            f"score={candidate.score:.4f} "
+            f"sources={candidate.sources}"
+        )
+
+        if candidate.message:
+            print(
+                f"      {candidate.sender}: "
+                f"{candidate.message}"
+            )
+
+    documents = []
+
+    # -------------------------------------------------------------
+    # Convert ranked message candidates into Documents
+    # -------------------------------------------------------------
+
+    for candidate in candidates[:MAX_HYBRID_CANDIDATES]:
+
+        content = (
+            f"[ID {candidate.message_id}] "
+            f"[{candidate.timestamp}] "
+            f"{candidate.sender or ''}: "
+            f"{candidate.message or ''}"
+        )
+
+        documents.append(
+            Document(
+                page_content=content,
+                metadata={
+                    "source": "hybrid_search",
+                    "message_id": candidate.message_id,
+                    "timestamp": candidate.timestamp,
+                    "sender": candidate.sender,
+                    "hybrid_score": candidate.score,
+                    "semantic_rank": candidate.semantic_rank,
+                    "lexical_rank": candidate.lexical_rank,
+                    "semantic_distance": candidate.semantic_distance,
+                    "matched_terms": candidate.matched_terms,
+                    "sources": candidate.sources,
+                },
+            )
+        )
+
+    # -------------------------------------------------------------
+    # Add conversation chunks as supporting evidence
+    # -------------------------------------------------------------
+
+    for chunk in chunks:
+
+        documents.append(
+            Document(
+                page_content=chunk["document"],
+                metadata={
+                    "source": "conversation_chunk",
+                    "start_message_id":
+                        chunk["start_message_id"],
+                    "end_message_id":
+                        chunk["end_message_id"],
+                    "episode_id":
+                        chunk["episode_id"],
+                    "chunk_id":
+                        chunk["chunk_id"],
+                    "participants":
+                        chunk["participants"],
+                    "chunk_rank":
+                        chunk["rank"],
+                    "semantic_distance":
+                        chunk["distance"],
+                },
+            )
+        )
+
+    print(
+        f"\nTotal retrieval documents: "
+        f"{len(documents)}"
     )
 
     return {
         **state,
-        "documents": combined,
+        "documents": documents,
     }
-
 
 # =====================================================================
 # Grade retrieved documents
@@ -622,89 +658,42 @@ def grade_documents(
     state: GraphState,
 ) -> GraphState:
     """
-    Ask the LLM whether each candidate contains information useful
-    for answering the question.
+    Keep the full hybrid retrieval candidate pool.
 
-    Context expansion happens AFTER grading so that the grader does
-    not have to process unnecessarily large contexts.
+    Retrieval is recall-first:
+    semantic and keyword retrieval identify candidates,
+    while the LLM should reason over the retrieved context
+    instead of acting as a hard recall filter.
     """
 
-    question = state["question"]
-
-    relevant_docs = []
+    documents = state["documents"]
 
     print(
-        "\nGrading retrieved candidates..."
+        "\nSkipping LLM relevance grading."
+    )
+
+    print(
+        f"Retrieved candidates kept: "
+        f"{len(documents)}"
     )
 
     for index, document in enumerate(
-        state["documents"],
+        documents,
         start=1,
     ):
-
         source = document.metadata.get(
             "source",
-            "semantic_search",
-        )
-
-        prompt = (
-            "You are a relevance grader for a WhatsApp "
-            "conversation retrieval system.\n\n"
-
-            "Determine whether the document contains information "
-            "that could help answer the question.\n\n"
-
-            "Answer with exactly one word:\n"
-            "'yes' = relevant\n"
-            "'no' = not relevant\n\n"
-
-            f"Question:\n{question}\n\n"
-
-            f"Document:\n"
-            f"{document.page_content}\n\n"
-
-            "Decision:"
-        )
-
-        try:
-
-            response = llm.invoke(
-                prompt
-            ).content.strip().lower()
-
-        except Exception as e:
-
-            print(
-                f"  Candidate {index}: "
-                f"LLM grading failed: {e}"
-            )
-
-            continue
-
-        relevant = response.startswith(
-            "yes"
+            "unknown",
         )
 
         print(
             f"  Candidate {index}: "
-            f"{'RELEVANT' if relevant else 'not relevant'} "
             f"[{source}]"
         )
 
-        if relevant:
-
-            relevant_docs.append(
-                document
-            )
-
-    print(
-        f"Relevant documents: "
-        f"{len(relevant_docs)}"
-    )
-
     return {
         **state,
-        "documents": relevant_docs,
+        "documents": documents,
     }
 
 
@@ -800,138 +789,154 @@ def expand_context(
     state: GraphState,
 ) -> GraphState:
     """
-    Expand relevant retrieval results using SQLite.
+    Expand retrieved message anchors using true chronological
+    neighbors from SQLite.
 
-    Semantic result:
-        expand using its start/end message IDs.
-
-    Keyword result:
-        expand around its individual message ID.
+    Message IDs are stable identifiers only and are not assumed
+    to represent chronological order.
     """
 
     expanded_documents = []
 
-    for document in state["documents"]:
+    for document in state["documents"][:5]:
 
-        source = document.metadata.get(
-            "source"
+        message_id = document.metadata.get(
+            "message_id"
         )
 
         # ---------------------------------------------------------
-        # Semantic Chroma result
+        # Conversation chunk
         # ---------------------------------------------------------
 
-        if source != "keyword_search":
+        if document.metadata.get("source") == "conversation_chunk":
 
-            expanded_document = (
-                expand_document_context(
-                    document,
-                    before=CONTEXT_BEFORE,
-                    after=CONTEXT_AFTER,
-                )
+            start_id = document.metadata.get(
+                "start_message_id"
+            )
+
+            end_id = document.metadata.get(
+                "end_message_id"
+            )
+
+            if start_id is None or end_id is None:
+                expanded_documents.append(document)
+                continue
+
+            # Expand around the first message of the chunk.
+            rows = get_chronological_context(
+                int(start_id),
+                before=CONTEXT_BEFORE,
+                after=CONTEXT_AFTER,
             )
 
         # ---------------------------------------------------------
-        # Keyword SQLite result
+        # Hybrid message result
         # ---------------------------------------------------------
+
+        elif message_id is not None:
+
+            rows = get_chronological_context(
+                int(message_id),
+                before=CONTEXT_BEFORE,
+                after=CONTEXT_AFTER,
+            )
 
         else:
 
-            message_id = document.metadata.get(
-                "message_id"
+            expanded_documents.append(document)
+            continue
+
+        if not rows:
+            expanded_documents.append(document)
+            continue
+
+        # ---------------------------------------------------------
+        # Format chronological transcript
+        # ---------------------------------------------------------
+
+        lines = []
+
+        for row in rows:
+
+            timestamp = row["timestamp"]
+
+            try:
+                dt = datetime.fromisoformat(
+                    timestamp
+                )
+
+                timestamp_text = dt.strftime(
+                    "%d/%m/%Y %I:%M %p"
+                )
+
+            except Exception:
+
+                timestamp_text = (
+                    timestamp or ""
+                )
+
+            sender = row["sender"] or ""
+            message = row["message"] or ""
+
+            lines.append(
+                f"[ID {row['id']}] "
+                f"[{timestamp_text}] "
+                f"{sender}: "
+                f"{message}"
             )
 
-            if message_id is None:
+        anchor_text = document.page_content
 
-                expanded_document = document
+        expanded_transcript = (
+            "[RETRIEVED ANCHOR]\n"
+            f"{anchor_text}\n\n"
+            "[CHRONOLOGICAL CONTEXT]\n"
+            + "\n".join(lines)
+        )
 
-            else:
+        # ---------------------------------------------------------
+        # Preserve retrieval metadata
+        # ---------------------------------------------------------
 
-                message_id = int(
-                    message_id
-                )
+        new_metadata = dict(
+            document.metadata
+        )
 
-                start_id = max(
-                    0,
-                    message_id - CONTEXT_BEFORE,
-                )
+        new_metadata[
+            "context_expanded"
+        ] = True
 
-                end_id = (
-                    message_id + CONTEXT_AFTER
-                )
+        new_metadata[
+            "context_messages_before"
+        ] = CONTEXT_BEFORE
 
-                rows = get_message_range(
-                    start_id,
-                    end_id,
-                )
+        new_metadata[
+            "context_messages_after"
+        ] = CONTEXT_AFTER
 
-                if not rows:
+        new_metadata[
+            "context_method"
+        ] = "chronological"
 
-                    expanded_document = (
-                        document
-                    )
+        new_metadata[
+            "context_start_message_id"
+        ] = rows[0]["id"]
 
-                else:
-
-                    lines = []
-
-                    for row in rows:
-
-                        timestamp = (
-                            row["timestamp"]
-                        )
-
-                        sender = (
-                            row["sender"]
-                            or ""
-                        )
-
-                        message = (
-                            row["message"]
-                            or ""
-                        )
-
-                        lines.append(
-                            f"[ID {row['id']}] "
-                            f"[{timestamp}] "
-                            f"{sender}: "
-                            f"{message}"
-                        )
-
-                    expanded_document = (
-                        Document(
-                            page_content="\n".join(
-                                lines
-                            ),
-
-                            metadata={
-                                **document.metadata,
-
-                                "context_expanded": True,
-
-                                "expanded_start_message_id":
-                                    start_id,
-
-                                "expanded_end_message_id":
-                                    end_id,
-
-                                "context_messages_before":
-                                    CONTEXT_BEFORE,
-
-                                "context_messages_after":
-                                    CONTEXT_AFTER,
-                            },
-                        )
-                    )
+        new_metadata[
+            "context_end_message_id"
+        ] = rows[-1]["id"]
 
         expanded_documents.append(
-            expanded_document
+            Document(
+                page_content=expanded_transcript,
+                metadata=new_metadata,
+            )
         )
 
     print(
-        f"\nContext expansion:"
-        f" {len(expanded_documents)} "
-        f"documents expanded."
+        f"\nContext expansion: "
+        f"{len(expanded_documents)} "
+        f"documents expanded chronologically."
     )
 
     return {
@@ -958,6 +963,12 @@ def generate(
         document.page_content
         for document in documents
     )
+
+    print("\n" + "=" * 70)
+    print("CONTEXT SENT TO LLM")
+    print("=" * 70)
+    print(context)
+    print("=" * 70)
 
     is_profile = any(
         document.metadata.get("source")
@@ -1152,6 +1163,11 @@ def build_graph():
     # -------------------------------------------------------------
 
     workflow.add_node(
+        "route_query",
+        route_query_node,
+    )
+
+    workflow.add_node(
         "classify_scope",
         classify_scope,
     )
@@ -1196,7 +1212,12 @@ def build_graph():
     # -------------------------------------------------------------
 
     workflow.set_entry_point(
-        "classify_scope"
+        "route_query"
+    )
+
+    workflow.add_edge(
+        "route_query",
+        "classify_scope",
     )
 
     # -------------------------------------------------------------
@@ -1344,6 +1365,12 @@ def ask(
 
         "scope":
             "",
+
+        "primary_intent":
+            "",
+
+        "secondary_intents":
+            [],
     }
 
     result = graph.invoke(

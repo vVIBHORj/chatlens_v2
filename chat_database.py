@@ -889,6 +889,128 @@ def get_message(
 
     return row
 
+# =====================================================================
+# Get chronological neighbors
+# =====================================================================
+
+def get_chronological_context(
+    message_id: int,
+    before: int = 40,
+    after: int = 40,
+    database_path: str = DATABASE_PATH,
+) -> List[sqlite3.Row]:
+    """
+    Retrieve messages chronologically surrounding a target message.
+
+    IMPORTANT:
+        Message IDs are stable identifiers only.
+        They are NOT assumed to represent chronological order.
+
+    The target message's timestamp is used to locate its real
+    chronological neighbors.
+    """
+
+    connection = get_connection(
+        database_path
+    )
+
+    cursor = connection.cursor()
+
+    # -------------------------------------------------------------
+    # Get target message
+    # -------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM messages
+        WHERE id = ?
+        """,
+        (
+            int(message_id),
+        ),
+    )
+
+    target = cursor.fetchone()
+
+    if target is None:
+        connection.close()
+        return []
+
+    target_timestamp = target["timestamp"]
+
+    if not target_timestamp:
+        connection.close()
+        return [target]
+
+    # -------------------------------------------------------------
+    # Messages BEFORE target
+    # -------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM messages
+        WHERE
+            timestamp IS NOT NULL
+            AND timestamp < ?
+        ORDER BY
+            timestamp DESC,
+            id DESC
+        LIMIT ?
+        """,
+        (
+            target_timestamp,
+            int(before),
+        ),
+    )
+
+    before_rows = cursor.fetchall()
+
+    # -------------------------------------------------------------
+    # Messages AFTER target
+    # -------------------------------------------------------------
+
+    cursor.execute(
+        """
+        SELECT *
+        FROM messages
+        WHERE
+            timestamp IS NOT NULL
+            AND timestamp > ?
+        ORDER BY
+            timestamp ASC,
+            id ASC
+        LIMIT ?
+        """,
+        (
+            target_timestamp,
+            int(after),
+        ),
+    )
+
+    after_rows = cursor.fetchall()
+
+    connection.close()
+
+    # -------------------------------------------------------------
+    # Combine and sort chronologically
+    # -------------------------------------------------------------
+
+    rows = (
+        list(reversed(before_rows))
+        + [target]
+        + list(after_rows)
+    )
+
+    rows.sort(
+        key=lambda row: (
+            row["timestamp"] or "",
+            row["id"],
+        )
+    )
+
+    return rows
 
 # =====================================================================
 # Get surrounding context

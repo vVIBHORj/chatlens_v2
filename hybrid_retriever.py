@@ -16,6 +16,7 @@ from chat_database import search_messages
 MESSAGE_SEMANTIC_TOP_K = 20
 LEXICAL_TOP_K = 20
 CHUNK_TOP_K = 5
+MESSAGE_QUALITY_WEIGHT = 0.05
 
 # RRF is still useful as one piece of evidence,
 # but it is no longer the final ranking mechanism.
@@ -123,6 +124,7 @@ class HybridCandidate:
     semantic_evidence: float = 0.0
     lexical_evidence: float = 0.0
     term_coverage: float = 0.0
+    message_quality: float = 0.0
     multi_source_bonus: float = 0.0
 
     # Original retrieval information
@@ -181,7 +183,126 @@ def extract_query_terms(query: str) -> List[str]:
 
     return terms
 
+# ============================================================
+# QUERY EXPANSION
+# ============================================================
 
+QUERY_EXPANSIONS = {
+    "girlfriend": [
+        "girlfriend",
+        "girl",
+        "bandi",
+        "wali",
+        "meri wali",
+        "relationship",
+        "dating",
+        "partner",
+    ],
+    "boyfriend": [
+        "boyfriend",
+        "ladka",
+        "banda",
+        "wala",
+        "mera wala",
+        "relationship",
+        "dating",
+        "partner",
+    ],
+    "friend": [
+        "friend",
+        "dost",
+        "yaar",
+        "buddy",
+    ],
+    "sports": [
+        "sports",
+        "sport",
+        "game",
+        "khel",
+        "tennis",
+        "badminton",
+        "cricket",
+        "football",
+        "basketball",
+    ],
+    "laptop": [
+        "laptop",
+        "notebook",
+        "computer",
+        "asus",
+        "hp",
+        "omen",
+        "lenovo",
+        "dell",
+        "acer",
+    ],
+}
+
+
+def expand_query_terms(
+    query_terms: List[str],
+) -> List[str]:
+    """
+    Expand important query concepts into terms that may
+    actually appear in the conversation.
+
+    Original query terms are always preserved.
+    """
+
+    expanded_terms = []
+
+    for term in query_terms:
+
+        if term not in expanded_terms:
+            expanded_terms.append(term)
+
+        normalized = term.lower().strip()
+
+        expansions = QUERY_EXPANSIONS.get(
+            normalized,
+            [],
+        )
+
+        for expansion in expansions:
+
+            if expansion not in expanded_terms:
+                expanded_terms.append(expansion)
+
+    return expanded_terms
+
+
+def build_semantic_query(
+    query: str,
+    query_terms: List[str],
+) -> str:
+    """
+    Build a compact semantic-search query.
+
+    Keeps the original user query intact while adding
+    only a small number of high-value expanded concepts.
+    """
+
+    semantic_terms = []
+
+    for term in query_terms:
+        normalized = term.lower().strip()
+
+        expansions = QUERY_EXPANSIONS.get(
+            normalized,
+            [],
+        )
+
+        for expansion in expansions[:4]:
+            if expansion not in semantic_terms:
+                semantic_terms.append(expansion)
+
+    if not semantic_terms:
+        return query
+
+    return (
+        f"{query} "
+        + " ".join(semantic_terms)
+    )
 # ============================================================
 # TEXT NORMALIZATION
 # ============================================================
@@ -241,6 +362,40 @@ def calculate_term_coverage(
 
     return coverage, matched
 
+def calculate_message_quality(message: str) -> float:
+    """
+    Estimate whether a retrieved message contains enough
+    substantive text to be useful as an answer anchor.
+
+    Short acknowledgements and isolated fragments receive
+    a lower score, while normal conversational messages
+    receive a higher score.
+    """
+
+    if not message:
+        return 0.0
+
+    text = normalize_text(message)
+
+    if not text:
+        return 0.0
+
+    word_count = len(text.split())
+
+    if word_count <= 1:
+        return 0.25
+
+    if word_count == 2:
+        return 0.50
+
+    if word_count == 3:
+        return 0.70
+
+    if word_count >= 8:
+        return 1.0
+
+    return 0.85
+
 
 # ============================================================
 # RRF
@@ -277,10 +432,26 @@ def semantic_message_search(
 def lexical_search(
     query: str,
     top_k: int = LEXICAL_TOP_K,
+    query_terms: Optional[List[str]] = None,
 ):
+    """
+    Run SQLite lexical retrieval using expanded query terms.
+
+    The original query is preserved when no expanded terms
+    are provided.
+    """
+
+    if query_terms:
+        lexical_query = " ".join(
+            f'"{term}"'
+            for term in query_terms
+            if term.strip()
+        )
+    else:
+        lexical_query = query
 
     return search_messages(
-        query,
+        lexical_query,
         limit=top_k,
     )
 
@@ -376,6 +547,15 @@ def hybrid_search(
 
     query_terms = extract_query_terms(query)
 
+    expanded_query_terms = expand_query_terms(
+        query_terms
+    )
+
+    semantic_query = build_semantic_query(
+        query,
+        query_terms,
+    )
+
     candidates: Dict[
         int,
         HybridCandidate,
@@ -386,7 +566,7 @@ def hybrid_search(
     # ========================================================
 
     semantic_results = semantic_message_search(
-        query,
+        semantic_query,
         top_k=message_top_k,
     )
 
@@ -426,9 +606,8 @@ def hybrid_search(
         candidate.semantic_rank = rank
         candidate.semantic_distance = distance
 
-        # RRF-like normalized semantic evidence.
         candidate.semantic_evidence = (
-            rrf_score(rank)
+            1.0 / rank
         )
 
         candidate.message = (
@@ -457,6 +636,7 @@ def hybrid_search(
     lexical_results = lexical_search(
         query,
         top_k=lexical_top_k,
+        query_terms=expanded_query_terms,
     )
 
     # ========================================================
@@ -499,7 +679,7 @@ def hybrid_search(
         candidate.lexical_rank = rank
 
         candidate.lexical_evidence = (
-            rrf_score(rank)
+            1.0 / rank
         )
 
         if "lexical" not in candidate.sources:
@@ -560,6 +740,10 @@ def hybrid_search(
 
         candidate.term_coverage = coverage
         candidate.matched_terms = matched
+        
+        candidate.message_quality = calculate_message_quality(
+            candidate.message or ""
+        )
 
     # ========================================================
     # 6. MULTI-SOURCE BONUS
@@ -606,6 +790,13 @@ def hybrid_search(
             (
                 candidate.term_coverage
                 * TERM_COVERAGE_WEIGHT
+            )
+
+            +
+
+            (
+                (candidate.message_quality - 1.0)
+                * MESSAGE_QUALITY_WEIGHT
             )
 
             +
@@ -674,6 +865,8 @@ def hybrid_search(
     return {
         "query": query,
         "query_terms": query_terms,
+        "expanded_query_terms": expanded_query_terms,
+        "semantic_query": semantic_query,
         "candidates": ranked_candidates,
         "chunks": chunks,
         "semantic_message_results": semantic_results,
@@ -701,6 +894,16 @@ def print_hybrid_results(
     print(
         f"Query terms: "
         f"{result['query_terms']}"
+    )
+
+    print(
+        f"Expanded terms: "
+        f"{result['expanded_query_terms']}"
+    )
+
+    print(
+        f"Semantic query: "
+        f"{result['semantic_query']}"
     )
 
     print("\n" + "-" * 80)
@@ -743,6 +946,11 @@ def print_hybrid_results(
         print(
             f"   Term coverage: "
             f"{candidate.term_coverage:.2f}"
+        )
+
+        print(
+            f"   Message quality: "
+            f"{candidate.message_quality:.2f}"
         )
 
         print(
