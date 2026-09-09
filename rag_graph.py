@@ -205,50 +205,33 @@ def classify_scope(
     state: GraphState,
 ) -> GraphState:
     """
-    Decide whether the question requires a whole-conversation
-    analysis or a specific retrieval-based answer.
+    Determine whether the query should use whole-conversation
+    analysis or retrieval-based analysis.
 
-    broad:
-        Questions about overall patterns, communication style,
-        general tone, personality-like behavioral patterns,
-        changes over time, etc.
-
-    specific:
-        Questions about particular messages, dates, events,
-        topics, people, or exact things said.
+    The deterministic query router is the primary signal.
     """
 
-    question = state["question"]
+    primary_intent = state["primary_intent"]
 
-    prompt = (
-        "Classify the following question about a WhatsApp "
-        "conversation as exactly one word: 'broad' or 'specific'.\n\n"
+    # Whole-conversation analytical intents
+    broad_intents = {
+        "statistics",
+        "time_analysis",
+        "behavior_analysis",
+        "sentiment_analysis",
+        "comparison",
+        "anomaly_detection",
+    }
 
-        "'broad' means the user is asking about overall conversation "
-        "patterns, communication style, general mood, general tone, "
-        "changes over time, or something that requires looking across "
-        "the whole conversation.\n\n"
-
-        "'specific' means the user is asking about a particular "
-        "message, topic, event, date, person, plan, or exact thing "
-        "someone said.\n\n"
-
-        f"Question: {question}\n\n"
-
-        "Answer with exactly one word:"
-    )
-
-    response = llm.invoke(
-        prompt
-    ).content.strip().lower()
-
-    if "broad" in response:
-
+    if primary_intent in broad_intents:
         scope = "broad"
-
     else:
-
         scope = "specific"
+
+    print(
+        f"[SCOPE] Primary intent={primary_intent} "
+        f"-> Scope={scope}"
+    )
 
     return {
         **state,
@@ -789,16 +772,59 @@ def expand_context(
     state: GraphState,
 ) -> GraphState:
     """
-    Expand retrieved message anchors using true chronological
-    neighbors from SQLite.
+    Expand retrieved message anchors using chronological neighbors
+    when appropriate.
 
-    Message IDs are stable identifiers only and are not assumed
-    to represent chronological order.
+    Topic-synthesis semantic queries should preserve the retrieved
+    anchors without expanding every anchor, because broad topic
+    questions benefit from evidence across multiple retrieved points
+    rather than large amounts of surrounding conversational noise.
     """
 
     expanded_documents = []
 
-    for document in state["documents"][:5]:
+    primary_intent = state.get("primary_intent")
+
+    # -------------------------------------------------------------
+    # Semantic topic questions
+    # -------------------------------------------------------------
+
+    if primary_intent == "semantic_rag":
+
+        for document in state["documents"][:20]:
+
+            new_metadata = dict(
+                document.metadata
+            )
+
+            new_metadata["context_expanded"] = False
+            new_metadata["context_method"] = "retrieved_anchor"
+
+            expanded_documents.append(
+                Document(
+                    page_content=(
+                        "[RETRIEVED ANCHOR]\n"
+                        f"{document.page_content}"
+                    ),
+                    metadata=new_metadata,
+                )
+            )
+
+        print(
+            f"\nContext expansion skipped for semantic topic query: "
+            f"{len(expanded_documents)} retrieved documents preserved."
+        )
+
+        return {
+            **state,
+            "documents": expanded_documents,
+        }
+
+    # -------------------------------------------------------------
+    # Other query types
+    # -------------------------------------------------------------
+
+    for document in state["documents"][:10]:
 
         message_id = document.metadata.get(
             "message_id"
@@ -822,7 +848,6 @@ def expand_context(
                 expanded_documents.append(document)
                 continue
 
-            # Expand around the first message of the chunk.
             rows = get_chronological_context(
                 int(start_id),
                 before=CONTEXT_BEFORE,
@@ -973,7 +998,6 @@ def generate(
     is_profile = any(
         document.metadata.get("source")
         == "whole_conversation_profile"
-
         for document in documents
     )
 
@@ -992,10 +1016,10 @@ def generate(
     else:
 
         context_note = (
-            "The context below contains conversation sections "
-            "retrieved using semantic and keyword search. Relevant "
-            "sections have been expanded using surrounding original "
-            "WhatsApp messages to preserve conversational context."
+            "The context below contains conversation messages retrieved "
+            "because they may be relevant to the user's question. Some "
+            "messages are exact retrieved anchors and some are nearby "
+            "chronological context. Nearby messages may be unrelated."
         )
 
     # -------------------------------------------------------------
@@ -1005,8 +1029,7 @@ def generate(
     if not context.strip():
 
         prompt = (
-            "You are answering a question about a WhatsApp "
-            "conversation.\n\n"
+            "You are answering a question about a WhatsApp conversation.\n\n"
 
             "There is no reliable retrieved context available.\n\n"
 
@@ -1020,24 +1043,50 @@ def generate(
     else:
 
         prompt = (
-            "You are analyzing a WhatsApp conversation.\n\n"
+            "You are an evidence-grounded assistant analyzing a "
+            "WhatsApp conversation.\n\n"
 
             f"{context_note}\n\n"
 
-            "IMPORTANT RULES:\n"
+            "IMPORTANT RULES:\n\n"
 
-            "1. Use ONLY information contained in the context.\n"
-            "2. Do not invent names, dates, events, motivations, "
-            "or statements.\n"
-            "3. If the context is insufficient, say so.\n"
+            "1. Use ONLY information contained in the context.\n\n"
+
+            "2. Treat messages that directly mention the subject of "
+            "the user's question as strong evidence, even when the "
+            "surrounding chronological messages are unrelated.\n\n"
+
+            "3. Synthesize evidence across ALL retrieved sections. "
+            "Do not judge relevance based only on one chronological "
+            "section.\n\n"
+
             "4. Distinguish direct evidence from reasonable "
-            "interpretation.\n"
-            "5. When discussing a sequence of messages, preserve "
-            "the chronological order.\n"
-            "6. Do not assume that every message in an expanded "
-            "context section is directly relevant.\n\n"
+            "interpretation.\n\n"
 
-            f"CONTEXT:\n"
+            "5. If multiple messages refer to the same topic, combine "
+            "them into a concise summary instead of discussing each "
+            "message in isolation.\n\n"
+
+            "6. Do not require a long or detailed conversation before "
+            "acknowledging a topic. A direct message about a topic is "
+            "valid evidence that the topic was discussed.\n\n"
+
+            "7. Do not invent names, dates, events, motivations, "
+            "or statements that are not supported by the context.\n\n"
+
+            "8. Do not assume that every message in an expanded "
+            "chronological section is relevant. Focus on messages "
+            "that actually help answer the question.\n\n"
+
+            "9. If the evidence supports only a limited conclusion, "
+            "give that limited conclusion rather than saying there "
+            "was no discussion.\n\n"
+
+            "10. If the context genuinely contains no useful evidence "
+            "for the question, say that the available context is "
+            "insufficient.\n\n"
+
+            "CONTEXT:\n"
             f"{context}\n\n"
 
             f"USER QUESTION:\n"
