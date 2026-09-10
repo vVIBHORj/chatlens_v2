@@ -160,6 +160,4 @@ python rag_graph.py "your question"     # ask a question (build the vectorstore 
 
 All parsing, embedding, retrieval, and generation happen on your machine through a local Ollama instance — no conversation data is ever sent to a third-party API. Only analyze conversations you're authorized to analyze.
 
-## License
 
-Add your preferred license (e.g. MIT) here.
