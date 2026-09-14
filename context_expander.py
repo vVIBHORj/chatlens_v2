@@ -431,6 +431,10 @@ def expand_single_anchor(
 
 def get_candidate_id(candidate: Any) -> Optional[int]:
 
+    # Direct integer anchor ID.
+    if isinstance(candidate, int):
+        return candidate
+
     if isinstance(candidate, dict):
         value = candidate.get(
             "message_id",
