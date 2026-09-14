@@ -119,6 +119,7 @@ class HybridCandidate:
 
     # Final evidence score
     score: float = 0.0
+    evidence_score: float = 0.0
 
     # Individual evidence components
     semantic_evidence: float = 0.0
@@ -533,7 +534,62 @@ def get_row_value(
     except AttributeError:
         return default
 
+def calculate_evidence_score(
+    candidate: HybridCandidate,
+) -> float:
+    """
+    Estimate how useful a retrieved message is as direct evidence
+    for answering the user's question.
 
+    This is intentionally deterministic and does not replace
+    the hybrid retrieval score.
+    """
+
+    score = 0.0
+
+    message = (candidate.message or "").strip()
+
+    if not message:
+        return 0.0
+
+    # ---------------------------------------------------------
+    # 1. Exact lexical matches
+    # ---------------------------------------------------------
+
+    if candidate.matched_terms:
+
+        score += min(
+            len(candidate.matched_terms) * 0.20,
+            0.60,
+        )
+
+    # ---------------------------------------------------------
+    # 2. Retrieval agreement
+    # ---------------------------------------------------------
+
+    has_semantic = (
+        candidate.semantic_rank is not None
+    )
+
+    has_lexical = (
+        candidate.lexical_rank is not None
+    )
+
+    if has_semantic and has_lexical:
+        score += 0.20
+
+    # ---------------------------------------------------------
+    # 3. Message quality
+    # ---------------------------------------------------------
+
+    score += (
+        candidate.message_quality * 0.20
+    )
+
+    return round(
+        min(score, 1.0),
+        4,
+    )
 # ============================================================
 # HYBRID SEARCH
 # ============================================================
@@ -805,6 +861,16 @@ def hybrid_search(
         )
 
     # ========================================================
+    # 7B. EVIDENCE SCORE
+    # ========================================================
+
+    for candidate in candidates.values():
+
+        candidate.evidence_score = (
+            calculate_evidence_score(candidate)
+        )
+
+    # ========================================================
     # 8. SORT
     # ========================================================
 
@@ -931,6 +997,11 @@ def print_hybrid_results(
         print(
             f"   FINAL SCORE: "
             f"{candidate.score:.6f}"
+        )
+
+        print(
+            f"   EVIDENCE SCORE: "
+            f"{candidate.evidence_score:.6f}"
         )
 
         print(
