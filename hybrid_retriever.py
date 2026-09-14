@@ -536,13 +536,13 @@ def get_row_value(
 
 def calculate_evidence_score(
     candidate: HybridCandidate,
+    query: str,
 ) -> float:
     """
     Estimate how useful a retrieved message is as direct evidence
     for answering the user's question.
 
-    This is intentionally deterministic and does not replace
-    the hybrid retrieval score.
+    This score is deterministic and query-aware.
     """
 
     score = 0.0
@@ -557,14 +557,38 @@ def calculate_evidence_score(
     # ---------------------------------------------------------
 
     if candidate.matched_terms:
-
         score += min(
             len(candidate.matched_terms) * 0.20,
-            0.60,
+            0.40,
         )
 
     # ---------------------------------------------------------
-    # 2. Retrieval agreement
+    # 2. Query relevance
+    # ---------------------------------------------------------
+
+    query_words = set(
+        word.lower().strip(".,!?;:'\"()[]{}")
+        for word in query.split()
+        if word.strip()
+    )
+
+    message_lower = message.lower()
+
+    query_matches = [
+        word
+        for word in query_words
+        if len(word) > 2
+        and word in message_lower
+    ]
+
+    if query_matches:
+        score += min(
+            len(query_matches) * 0.15,
+            0.30,
+        )
+
+    # ---------------------------------------------------------
+    # 3. Retrieval agreement
     # ---------------------------------------------------------
 
     has_semantic = (
@@ -576,14 +600,14 @@ def calculate_evidence_score(
     )
 
     if has_semantic and has_lexical:
-        score += 0.20
+        score += 0.10
 
     # ---------------------------------------------------------
-    # 3. Message quality
+    # 4. Message quality
     # ---------------------------------------------------------
 
     score += (
-        candidate.message_quality * 0.20
+        candidate.message_quality * 0.10
     )
 
     return round(
@@ -867,7 +891,10 @@ def hybrid_search(
     for candidate in candidates.values():
 
         candidate.evidence_score = (
-            calculate_evidence_score(candidate)
+            calculate_evidence_score(
+                candidate,
+                query,
+            )
         )
 
     # ========================================================
