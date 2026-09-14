@@ -666,7 +666,9 @@ LEXICAL_STOPWORDS = {
     "did",
     "have",
     "has",
-    "had",
+    "had","explicitly",
+    "mentioned",
+    "conversation"
 }
 
 

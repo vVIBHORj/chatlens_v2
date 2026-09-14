@@ -1,6 +1,9 @@
 import re
-from dataclasses import dataclass
+
+from dataclasses import dataclass, field
+
 from enum import Enum
+
 from typing import List
 
 class QueryIntent(str, Enum):
@@ -18,6 +21,188 @@ class QueryIntent(str, Enum):
 class QueryRoute:
     primary_intent: QueryIntent
     secondary_intents: List[QueryIntent]
+    
+@dataclass
+class QuerySpec:
+
+    intent: QueryIntent
+
+    target: str | None = None
+
+    entities: List[str] = field(
+        default_factory=list
+    )
+
+    answer_type: str = "semantic"
+
+    constraints: List[str] = field(
+        default_factory=list
+    )
+
+def build_query_spec(query: str) -> QuerySpec:
+    """
+    Build a deterministic structured representation of a user query.
+
+    The function identifies:
+    - analytical intent
+    - likely target phrase
+    - explicitly named entities
+    - expected answer type
+    - retrieval constraints
+
+    It does not answer the question and contains no
+    domain-specific topic vocabulary.
+    """
+
+    route = route_query(query)
+    text = normalize_query(query)
+
+    constraints = []
+    entities = []
+    target = None
+
+    if not text:
+        return QuerySpec(
+            intent=route.primary_intent,
+            target=None,
+            entities=[],
+            answer_type="semantic",
+            constraints=[],
+        )
+
+    # --------------------------------------------------------
+    # Explicit-information constraint
+    # --------------------------------------------------------
+
+    if re.search(
+        r"\bexplicit(?:ly)?\b",
+        text,
+    ):
+        constraints.append("explicit")
+
+    # --------------------------------------------------------
+    # Speaker-specific constraint
+    #
+    # Only treat a word as a speaker when the grammatical
+    # structure indicates a named subject.
+    # --------------------------------------------------------
+
+    speaker_match = re.search(
+        r"\bwhat did\s+([a-z0-9_]+)\s+(?:say|mention|tell|write|talk)\b",
+        text,
+    )
+
+    if speaker_match:
+        entities.append(
+            speaker_match.group(1)
+        )
+        constraints.append("speaker_specific")
+
+    # --------------------------------------------------------
+    # Answer type
+    # --------------------------------------------------------
+
+    answer_type = "semantic"
+
+    if re.search(
+        r"\bwho\b",
+        text,
+    ):
+        answer_type = "person"
+
+    elif re.search(
+        r"\bhow many\b|\bhow much\b|\bpercentage\b|\baverage\b",
+        text,
+    ):
+        answer_type = "numeric"
+
+    elif re.search(
+        r"\bwhat .* mentioned\b"
+        r"|\bwhat .* discussed\b"
+        r"|\bwhich .* mentioned\b",
+        text,
+    ):
+        answer_type = "list"
+
+    elif route.primary_intent in {
+        QueryIntent.STATISTICS,
+        QueryIntent.TIME_ANALYSIS,
+        QueryIntent.BEHAVIOR_ANALYSIS,
+        QueryIntent.SENTIMENT_ANALYSIS,
+        QueryIntent.COMPARISON,
+        QueryIntent.ANOMALY_DETECTION,
+    }:
+        answer_type = "analytic"
+
+    # --------------------------------------------------------
+    # Generic target extraction
+    #
+    # For now we only extract the object of common semantic
+    # question constructions. No topic vocabulary is used.
+    # --------------------------------------------------------
+
+    target_patterns = [
+        r"\bwhat did (?:we|you|they)\s+(?:discuss|talk about)\s+(.+)$",
+        r"\bwhat did\s+[a-z0-9_]+\s+(?:say|mention|tell|write)\s+about\s+(.+)$",
+        r"\bwhat .*?\s+about\s+(.+)$",
+        r"\bwhat .*?\s+(?:mentioned|discussed)\s+(.+)$",
+    ]
+
+    for pattern in target_patterns:
+
+        match = re.search(
+            pattern,
+            text,
+        )
+
+        if match:
+
+            candidate = match.group(1).strip()
+
+            if candidate:
+                target = candidate
+                break
+
+    # --------------------------------------------------------
+    # Remove entity from target when the query explicitly
+    # identifies a speaker.
+    # --------------------------------------------------------
+
+    if target and entities:
+
+        for entity in entities:
+
+            target = re.sub(
+                rf"\b{re.escape(entity)}\b",
+                "",
+                target,
+            ).strip()
+
+    if target:
+        target = re.sub(
+            r"\s+",
+            " ",
+            target,
+        ).strip()
+
+    # --------------------------------------------------------
+    # Aggregation constraint
+    # --------------------------------------------------------
+
+    if route.primary_intent in {
+        QueryIntent.STATISTICS,
+        QueryIntent.COMPARISON,
+    }:
+        constraints.append("aggregated")
+
+    return QuerySpec(
+        intent=route.primary_intent,
+        target=target,
+        entities=entities,
+        answer_type=answer_type,
+        constraints=constraints,
+    )
+
 
 
 def normalize_query(query: str) -> str:
@@ -29,6 +214,171 @@ def normalize_query(query: str) -> str:
         " ",
         query.lower(),
     ).strip()
+    
+def extract_query_terms(query: str) -> List[str]:
+    """
+    Extract likely content-bearing terms from a query.
+
+    This is domain-agnostic. It does not contain knowledge about
+    specific topics such as sports, travel, money, laptops, etc.
+
+    Analytical/statistical queries are handled separately by the
+    query router, so their structural words are not treated as
+    semantic retrieval targets.
+    """
+
+    text = normalize_query(query)
+
+    if not text:
+        return []
+
+    tokens = re.findall(
+        r"\b[a-z0-9']+\b",
+        text,
+    )
+
+    structural_words = {
+        "what", "whats", "what's",
+        "who", "whom", "whose", "which",
+        "where", "when", "why", "how",
+
+        "is", "are", "am", "was", "were",
+        "be", "been", "being",
+
+        "do", "does", "did",
+        "can", "could", "would", "should",
+        "will", "shall", "may", "might",
+
+        "have", "has", "had",
+
+        "i", "me", "my",
+        "we", "our",
+        "you", "your",
+        "they", "their",
+
+        "it", "its",
+        "this", "that", "these", "those",
+
+        "the", "a", "an",
+        "of", "to", "for", "from",
+        "with", "about", "in", "on", "at",
+        "by", "and", "or", "but", "as",
+        "into", "over", "between",
+        "through", "up", "down",
+
+        "more", "most", "less", "least",
+        "fewer", "many", "much",
+        "often", "usually",
+
+        "really", "just",
+        "main", "overall", "general",
+        "common", "mainly",
+        "each", "person", "people",
+
+        "chat", "chats",
+        "conversation", "conversations",
+        "message", "messages",
+
+        "discuss", "discussed", "discussing",
+        "talk", "talked", "talking",
+        "say", "said",
+        "tell", "told",
+        "decide", "decided", "decision",
+
+        "behind", "context",
+        "explicitly", "explicit",
+        "mentioned",
+    }
+
+    analytical_terms = {
+        QueryIntent.STATISTICS: {
+            "send", "sends", "sent",
+            "sending",
+            "count", "number",
+            "average", "percentage",
+            "total", "highest", "lowest",
+            "longest", "shortest",
+            "frequency",
+        },
+
+        QueryIntent.TIME_ANALYSIS: {
+            "time", "times",
+            "day", "days",
+            "week", "weeks",
+            "month", "months",
+            "year", "years",
+            "active", "activity",
+            "frequency",
+            "change", "changed",
+            "over",
+        },
+
+        QueryIntent.BEHAVIOR_ANALYSIS: {
+            "initiate", "initiates",
+            "starts", "start",
+            "responds", "respond",
+            "replies", "reply",
+            "asks", "ask",
+            "uses", "use",
+            "writes", "write",
+            "longer",
+            "style", "pattern",
+            "communication",
+            "conversation",
+            "emojis", "emoji",
+        },
+
+        QueryIntent.SENTIMENT_ANALYSIS: {
+            "sentiment",
+            "tone",
+            "positive", "negative",
+            "happy", "sad",
+            "angry", "frustrated",
+            "excited",
+            "emotional",
+        },
+
+        QueryIntent.COMPARISON: {
+            "compare", "comparison",
+            "versus", "vs",
+            "increased", "decreased",
+            "change",
+        },
+
+        QueryIntent.ANOMALY_DETECTION: {
+            "unusual", "unusually",
+            "anomaly", "anomalies",
+            "abnormal",
+            "spike", "spikes",
+            "outlier", "outliers",
+        },
+    }
+
+    route = route_query(query)
+
+    excluded_terms = set(structural_words)
+
+    excluded_terms.update(
+        analytical_terms.get(
+            route.primary_intent,
+            set(),
+        )
+    )
+
+    terms = []
+
+    for token in tokens:
+
+        if token in excluded_terms:
+            continue
+
+        if len(token) <= 2:
+            continue
+
+        if token not in terms:
+            terms.append(token)
+
+    return terms
 
 def detect_secondary_intents(query: str) -> List[QueryIntent]:
     """
@@ -200,27 +550,6 @@ def detect_secondary_intents(query: str) -> List[QueryIntent]:
     return secondary
 
 
-def route_query(query: str) -> QueryRoute:
-    """
-    Build a complete query route consisting of one primary
-    intent and zero or more supporting intents.
-    """
-
-    primary = detect_query_intent(query)
-
-    secondary = detect_secondary_intents(query)
-
-    # The primary intent should never appear as a secondary intent.
-    secondary = [
-        intent
-        for intent in secondary
-        if intent != primary
-    ]
-
-    return QueryRoute(
-        primary_intent=primary,
-        secondary_intents=secondary,
-    )
     
     
 
@@ -457,6 +786,29 @@ def detect_query_intent(query: str) -> QueryIntent:
     return QueryIntent.SEMANTIC_RAG
 
 
+def route_query(query: str) -> QueryRoute:
+    """
+    Build a complete query route consisting of one primary
+    intent and zero or more supporting intents.
+    """
+
+    primary = detect_query_intent(query)
+
+    secondary = detect_secondary_intents(query)
+
+    # The primary intent should never appear as a secondary intent.
+    secondary = [
+        intent
+        for intent in secondary
+        if intent != primary
+    ]
+
+    return QueryRoute(
+        primary_intent=primary,
+        secondary_intents=secondary,
+    )
+
+
 if __name__ == "__main__":
 
     TEST_QUERIES = [
@@ -567,3 +919,29 @@ if __name__ == "__main__":
             )
         else:
             print("Secondary: none")
+            
+            
+if __name__ == "__main__":
+
+    test_queries = [
+        "What sports are explicitly mentioned in the conversation?",
+        "What did Udit say about money?",
+        "What did we discuss about travel?",
+        "What laptop was EXODIA considering buying?",
+        "Who sends the most messages?",
+        "When are we most active?",
+        "Who uses more emojis?",
+        "What is the overall sentiment of the conversation?",
+    ]
+
+    for query in test_queries:
+
+        spec = build_query_spec(query)
+
+        print()
+        print("QUERY:", query)
+        print("INTENT:", spec.intent.value)
+        print("TARGET:", spec.target)
+        print("ENTITIES:", spec.entities)
+        print("ANSWER TYPE:", spec.answer_type)
+        print("CONSTRAINTS:", spec.constraints)

@@ -99,7 +99,7 @@ from langgraph.graph import StateGraph, END
 from hybrid_retriever import hybrid_search
 from analytics import build_style_profile
 
-from query_router import route_query
+from query_router import route_query,QuerySpec
 
 from chat_database import (
     search_messages,
@@ -137,7 +137,6 @@ llm = ChatOllama(
 # =====================================================================
 # Graph state
 # =====================================================================
-
 class GraphState(TypedDict):
     question: str
 
@@ -159,6 +158,7 @@ class GraphState(TypedDict):
 
     secondary_intents: List[str]
 
+    query_spec: QuerySpec
 
 # =====================================================================
 # Scope classification
@@ -552,6 +552,7 @@ def retrieve(
             f"  #{rank} "
             f"ID={candidate.message_id} "
             f"score={candidate.score:.4f} "
+            f"evidence={candidate.evidence_score:.4f} "
             f"sources={candidate.sources}"
         )
 
@@ -585,6 +586,7 @@ def retrieve(
                     "timestamp": candidate.timestamp,
                     "sender": candidate.sender,
                     "hybrid_score": candidate.score,
+                    "evidence_score": candidate.evidence_score,
                     "semantic_rank": candidate.semantic_rank,
                     "lexical_rank": candidate.lexical_rank,
                     "semantic_distance": candidate.semantic_distance,
@@ -1082,7 +1084,23 @@ def generate(
             "give that limited conclusion rather than saying there "
             "was no discussion.\n\n"
 
-            "10. If the context genuinely contains no useful evidence "
+            "10. Treat an explicit statement as evidence, but do not "
+            "convert a mention into an action.\n\n"
+
+            "11. Do not infer that two people did something together "
+            "unless the context explicitly supports that conclusion.\n\n"
+
+            "12. Distinguish between direct evidence, a mention, and "
+            "an indirect reference. For example: 'We played tennis' "
+            "is direct evidence; 'There is a tennis court' is only a "
+            "mention; and 'Football ground mein tha' is an indirect "
+            "reference.\n\n"
+
+            "13. When evidence is ambiguous, use cautious wording such "
+            "as 'football was mentioned' rather than 'they played "
+            "football.'\n\n"
+
+            "14. If the context genuinely contains no useful evidence "
             "for the question, say that the available context is "
             "insufficient.\n\n"
 
@@ -1144,14 +1162,49 @@ def check_grounded(
     answer = state["generation"]
 
     prompt = (
-        "You are a factual groundedness checker.\n\n"
+        "You are a strict factual groundedness checker for a WhatsApp "
+        "conversation analysis system.\n\n"
 
-        "Determine whether the answer is supported by the supplied "
-        "conversation context.\n\n"
+        "Your job is to determine whether EVERY substantive claim in the "
+        "ANSWER is directly supported by the supplied CONTEXT.\n\n"
+
+        "Rules:\n"
+        "1. Check the answer claim-by-claim, not just whether the general "
+        "topic appears in the context.\n\n"
+
+        "2. A claim is supported only if the context explicitly states it "
+        "or it is an extremely direct paraphrase of what the context says.\n\n"
+
+        "3. Do NOT treat semantic similarity as factual evidence.\n\n"
+
+        "4. Do NOT infer actions, intentions, plans, relationships, "
+        "participants, or events that are not explicitly stated.\n\n"
+
+        "5. A message mentioning a sport does not prove that someone "
+        "played that sport.\n\n"
+
+        "6. A message mentioning a person does not prove that the person "
+        "participated in the event being discussed.\n\n"
+
+        "7. A message about a possibility or question does not prove that "
+        "the event actually happened.\n\n"
+
+        "8. If even ONE substantive claim in the answer is unsupported, "
+        "return 'no'.\n\n"
+
+        "9. Ignore minor wording differences, grammar mistakes, and "
+        "harmless paraphrasing when checking factual support.\n\n"
+
+        "Examples:\n"
+        "- Context: 'Tennis ni hai?' -> 'They played tennis' = no.\n"
+        "- Context: 'Football ground mein tha' -> 'They played football' = no.\n"
+        "- Context: 'Tum konsi sports loge?' -> 'Sports were discussed' = yes.\n"
+        "- Context: 'Tennis ball leke aaiyo' -> 'They discussed tennis' = yes.\n"
+        "- Context: 'Khelo to bata dena' -> 'They played together' = no.\n\n"
 
         "Answer with exactly one word:\n"
-        "'yes' = the answer is supported by the context\n"
-        "'no' = the answer contains unsupported or invented claims\n\n"
+        "'yes' = EVERY substantive claim in the answer is supported\n"
+        "'no' = AT LEAST ONE substantive claim is unsupported\n\n"
 
         f"CONTEXT:\n"
         f"{context}\n\n"
@@ -1167,6 +1220,10 @@ def check_grounded(
         response = llm.invoke(
             prompt
         ).content.strip().lower()
+
+        print(
+            f"[GROUNDEDNESS CHECK] Raw response: {response!r}"
+        )
 
         grounded = response.startswith(
             "yes"
