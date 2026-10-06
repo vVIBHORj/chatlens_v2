@@ -669,10 +669,25 @@ def hybrid_search(
         )
 
         if message_id is None:
+            print(
+                f"[INVALID MESSAGE CANDIDATE] "
+                f"rank={rank} "
+                f"reason=missing_message_id "
+                f"content_preview={document.page_content[:60]!r}"
+            )
             continue
 
-        if message_id not in candidates:
+        is_new = message_id not in candidates
 
+        if not is_new:
+            print(
+                f"[DUPLICATE MERGE] "
+                f"message_id={message_id} "
+                f"sources=[semantic_message] "
+                f"keeping best semantic_rank={candidates[message_id].semantic_rank}"
+            )
+
+        if is_new:
             candidates[message_id] = (
                 HybridCandidate(
                     message_id=message_id
@@ -683,25 +698,27 @@ def hybrid_search(
             message_id
         ]
 
-        candidate.semantic_rank = rank
-        candidate.semantic_distance = distance
+        # Keep the best (lowest-numbered) semantic rank
+        if (
+            is_new
+            or candidate.semantic_rank is None
+            or rank < candidate.semantic_rank
+        ):
+            candidate.semantic_rank = rank
+            candidate.semantic_distance = distance
+            candidate.semantic_evidence = 1.0 / rank
 
-        candidate.semantic_evidence = (
-            1.0 / rank
-        )
+        if not candidate.message:
+            candidate.message = (
+                metadata.get("message")
+                or document.page_content
+            )
 
-        candidate.message = (
-            metadata.get("message")
-            or document.page_content
-        )
+        if not candidate.sender:
+            candidate.sender = metadata.get("sender")
 
-        candidate.sender = metadata.get(
-            "sender"
-        )
-
-        candidate.timestamp = metadata.get(
-            "timestamp"
-        )
+        if not candidate.timestamp:
+            candidate.timestamp = metadata.get("timestamp")
 
         if "semantic_message" not in candidate.sources:
 
@@ -908,7 +925,7 @@ def hybrid_search(
     )
 
     # ========================================================
-    # 9. CONVERSATION CHUNKS
+    # 9. CONVERSATION CHUNKS  (deduplicated by chunk_id)
     # ========================================================
 
     chunk_results = semantic_chunk_search(
@@ -917,6 +934,7 @@ def hybrid_search(
     )
 
     chunks = []
+    seen_chunk_ids = set()
 
     for rank, (
         document,
@@ -927,6 +945,20 @@ def hybrid_search(
     ):
 
         metadata = document.metadata or {}
+
+        chunk_id = metadata.get("chunk_id")
+
+        if chunk_id is not None and chunk_id in seen_chunk_ids:
+            print(
+                f"[DUPLICATE MERGE] "
+                f"chunk_id={chunk_id} "
+                f"sources=[semantic_chunk] "
+                f"skipping duplicate rank={rank}"
+            )
+            continue
+
+        if chunk_id is not None:
+            seen_chunk_ids.add(chunk_id)
 
         chunks.append(
             {
@@ -941,14 +973,35 @@ def hybrid_search(
                 "episode_id": metadata.get(
                     "episode_id"
                 ),
-                "chunk_id": metadata.get(
-                    "chunk_id"
-                ),
+                "chunk_id": chunk_id,
                 "participants": metadata.get(
                     "participants"
                 ),
                 "document": document.page_content,
             }
+        )
+
+    # ========================================================
+    # RETRIEVAL INVARIANT CHECK
+    # ========================================================
+
+    all_ids = [c.message_id for c in ranked_candidates]
+    unique_ids = set(all_ids)
+
+    print(
+        f"[RETRIEVAL INVARIANT] "
+        f"message_candidates={len(all_ids)} "
+        f"unique_message_ids={len(unique_ids)}"
+    )
+
+    if len(all_ids) != len(unique_ids):
+        duplicates = [
+            mid for mid in unique_ids
+            if all_ids.count(mid) > 1
+        ]
+        raise RuntimeError(
+            f"[RETRIEVAL INVARIANT VIOLATED] "
+            f"duplicate message_ids={duplicates}"
         )
 
     # ========================================================
