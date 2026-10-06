@@ -99,11 +99,17 @@ from langgraph.graph import StateGraph, END
 from hybrid_retriever import hybrid_search
 from analytics import build_style_profile
 
-from query_router import route_query,QuerySpec
 
 from chat_database import (
     search_messages,
     get_chronological_context,
+    get_message_range,
+)
+
+from query_router import (
+    route_query,
+    QuerySpec,
+    build_query_spec,
 )
 
 
@@ -139,15 +145,12 @@ llm = ChatOllama(
 # =====================================================================
 class GraphState(TypedDict):
     question: str
-
     original_question: str
 
     documents: List[Document]
 
     generation: str
-
     rewrite_count: int
-
     grounded: bool
 
     df: Optional[pd.DataFrame]
@@ -155,10 +158,9 @@ class GraphState(TypedDict):
     scope: str
 
     primary_intent: str
-
     secondary_intents: List[str]
 
-    query_spec: QuerySpec
+    query_spec: Optional[QuerySpec]
 
 # =====================================================================
 # Scope classification
@@ -170,35 +172,30 @@ class GraphState(TypedDict):
 def route_query_node(
     state: GraphState,
 ) -> GraphState:
-    """
-    Detect the primary and secondary analytical intents
-    before the existing scope/retrieval pipeline runs.
 
-    This step is observational for now.
-    The detected intents do NOT control graph routing yet.
-    """
-
-    route = route_query(
+    spec = build_query_spec(
         state["question"]
     )
 
-    primary_intent = route.primary_intent.value
-
-    secondary_intents = [
-        intent.value
-        for intent in route.secondary_intents
-    ]
-
     print(
-        f"[QUERY ROUTER] "
-        f"Primary={primary_intent} "
-        f"Secondary={secondary_intents}"
+        f"[QUERY SPEC] "
+        f"intent={spec.intent.value} "
+        f"target={spec.target!r} "
+        f"entities={spec.entities} "
+        f"answer_type={spec.answer_type} "
+        f"constraints={spec.constraints}"
     )
 
     return {
         **state,
-        "primary_intent": primary_intent,
-        "secondary_intents": secondary_intents,
+        "query_spec": spec,
+        "primary_intent": spec.intent.value,
+        "secondary_intents": [
+            intent.value
+            for intent in route_query(
+                state["question"]
+            ).secondary_intents
+        ],
     }
 
 def classify_scope(
@@ -1045,70 +1042,108 @@ def generate(
     else:
 
         prompt = (
-            "You are an evidence-grounded assistant analyzing a "
-            "WhatsApp conversation.\n\n"
+            "You are an ultra-conservative, evidence-grounded assistant "
+            "analyzing a WhatsApp conversation.\n\n"
 
             f"{context_note}\n\n"
 
-            "IMPORTANT RULES:\n\n"
+            "YOUR TASK: Answer the user's question using ONLY explicit "
+            "evidence from the context messages below. You must report "
+            "what the messages literally say, not what you interpret "
+            "they imply.\n\n"
 
-            "1. Use ONLY information contained in the context.\n\n"
+            "STRICT GROUNDING RULES:\n\n"
 
-            "2. Treat messages that directly mention the subject of "
-            "the user's question as strong evidence, even when the "
-            "surrounding chronological messages are unrelated.\n\n"
+            "1. Use ONLY information explicitly present in the context. "
+            "Do NOT add any knowledge from outside the context.\n\n"
 
-            "3. Synthesize evidence across ALL retrieved sections. "
-            "Do not judge relevance based only on one chronological "
-            "section.\n\n"
+            "2. Before using any message as evidence, classify it:\n"
+            "   - STATEMENT: Someone states a fact ('I was at the football ground')\n"
+            "   - QUESTION: Someone asks something ('Tennis ni hai?')\n"
+            "   - REQUEST: Someone asks someone to do something ('Tennis ball leke aaiyo')\n"
+            "   - MENTION: A topic is referenced without action ('Tum konsi sports loge?')\n"
+            "   Only STATEMENTS can support factual claims. Questions, requests, "
+            "and mentions can only support that the topic was discussed or mentioned.\n\n"
 
-            "4. Distinguish direct evidence from reasonable "
-            "interpretation.\n\n"
+            "3. NEVER convert a question into a confirmed event.\n"
+            "   'Tennis ni hai?' does NOT mean 'Tennis was not available' or "
+            "'They played tennis.' It means someone asked about tennis.\n\n"
 
-            "5. If multiple messages refer to the same topic, combine "
-            "them into a concise summary instead of discussing each "
-            "message in isolation.\n\n"
+            "4. NEVER convert a request or suggestion into a completed action.\n"
+            "   'Tennis ball leke aaiyo' does NOT mean 'They played tennis.' "
+            "It means someone requested a tennis ball.\n\n"
 
-            "6. Do not require a long or detailed conversation before "
-            "acknowledging a topic. A direct message about a topic is "
-            "valid evidence that the topic was discussed.\n\n"
+            "5. NEVER infer that people participated in an activity just because "
+            "they appear in related messages. Proximity in conversation does not "
+            "prove joint participation.\n\n"
 
-            "7. Do not invent names, dates, events, motivations, "
-            "or statements that are not supported by the context.\n\n"
+            "6. NEVER infer plans, intentions, motivations, relationships, or "
+            "future actions unless the context EXPLICITLY states them.\n\n"
 
-            "8. Do not assume that every message in an expanded "
-            "chronological section is relevant. Focus on messages "
-            "that actually help answer the question.\n\n"
+            "7. NEVER say someone 'expressed' a sentiment unless they literally "
+            "stated it. A question is not an expression of opinion.\n\n"
 
-            "9. If the evidence supports only a limited conclusion, "
-            "give that limited conclusion rather than saying there "
-            "was no discussion.\n\n"
+            "8. When the user asks 'What did we discuss about X?', report WHAT "
+            "was explicitly mentioned about X, not what people intended to do. "
+            "Prefer phrasing like:\n"
+            "   - 'X was mentioned in the conversation'\n"
+            "   - 'Someone asked about X'\n"
+            "   - 'Someone requested X'\n"
+            "   - 'X was referred to'\n"
+            "   Do NOT use phrasing like:\n"
+            "   - 'They planned to do X'\n"
+            "   - 'They discussed plans for X'\n"
+            "   - 'X was not available'\n"
+            "   - 'They played X together'\n\n"
 
-            "10. Treat an explicit statement as evidence, but do not "
-            "convert a mention into an action.\n\n"
+            "9. If evidence supports only a limited answer, give that limited "
+            "answer. Do not say 'there was no discussion' if any relevant "
+            "messages exist.\n\n"
 
-            "11. Do not infer that two people did something together "
-            "unless the context explicitly supports that conclusion.\n\n"
+            "10. If multiple messages mention a topic, synthesize them but "
+            "preserve the distinction between statements, questions, and "
+            "requests.\n\n"
 
-            "12. Distinguish between direct evidence, a mention, and "
-            "an indirect reference. For example: 'We played tennis' "
-            "is direct evidence; 'There is a tennis court' is only a "
-            "mention; and 'Football ground mein tha' is an indirect "
-            "reference.\n\n"
+            "11. Preserve uncertainty. If the source is uncertain, your answer "
+            "must also be uncertain.\n\n"
 
-            "13. When evidence is ambiguous, use cautious wording such "
-            "as 'football was mentioned' rather than 'they played "
-            "football.'\n\n"
+            "12. Do not invent names, dates, events, actions, or conclusions.\n\n"
 
-            "14. If the context genuinely contains no useful evidence "
-            "for the question, say that the available context is "
-            "insufficient.\n\n"
+            "13. Do not assume that every message in a chronological section "
+            "is relevant. Focus only on messages that directly relate to the "
+            "question.\n\n"
+
+            "WORKED EXAMPLES:\n\n"
+
+            "Example context messages:\n"
+            "  'Tum konsi sports loge?'\n"
+            "  'Badminton = tennis'\n"
+            "  'Football ground mein tha'\n"
+            "  'Tennis ball leke aaiyo'\n"
+            "  'Tennis ni hai?'\n\n"
+
+            "Question: 'What did we discuss about sports?'\n\n"
+
+            "CORRECT answer: 'Sports explicitly mentioned in the retrieved "
+            "conversation include badminton, tennis, and football. Someone "
+            "asked which sports to pick. A tennis ball was requested. There "
+            "was a question about tennis availability. A football ground "
+            "was mentioned.'\n\n"
+
+            "WRONG answer: 'They discussed plans to play badminton and "
+            "football together. Tennis was not available. They planned "
+            "to play sports.' (This is wrong because it converts questions "
+            "into conclusions and infers plans that are not stated.)\n\n"
 
             "CONTEXT:\n"
             f"{context}\n\n"
 
             f"USER QUESTION:\n"
             f"{state['original_question']}\n\n"
+
+            "Remember: Report only what the messages explicitly say. "
+            "Use hedged language like 'X was mentioned' or 'someone asked "
+            "about X' instead of asserting actions or plans.\n\n"
 
             "ANSWER:"
         )
@@ -1436,10 +1471,10 @@ def ask(
         sources
         rewrites_used
         scope
+        query_spec
     """
 
     if not question or not question.strip():
-
         raise ValueError(
             "Question cannot be empty."
         )
@@ -1447,62 +1482,39 @@ def ask(
     graph = build_graph()
 
     initial_state: GraphState = {
-
-        "question":
-            question.strip(),
-
-        "original_question":
-            question.strip(),
-
-        "documents":
-            [],
-
-        "generation":
-            "",
-
-        "rewrite_count":
-            0,
-
-        "grounded":
-            False,
-
-        "df":
-            df,
-
-        "scope":
-            "",
-
-        "primary_intent":
-            "",
-
-        "secondary_intents":
-            [],
+        "question": question.strip(),
+        "original_question": question.strip(),
+        "documents": [],
+        "generation": "",
+        "rewrite_count": 0,
+        "grounded": False,
+        "df": df,
+        "scope": "",
+        "primary_intent": "",
+        "secondary_intents": [],
+        "query_spec": None,
     }
 
+    # Run the LangGraph pipeline
     result = graph.invoke(
         initial_state
     )
 
     return {
+        "answer": result["generation"],
 
-        "answer":
-            result["generation"],
+        "grounded": result["grounded"],
 
-        "grounded":
-            result["grounded"],
+        "sources": [
+            document.metadata
+            for document in result["documents"]
+        ],
 
-        "sources":
-            [
-                document.metadata
-                for document
-                in result["documents"]
-            ],
+        "rewrites_used": result["rewrite_count"],
 
-        "rewrites_used":
-            result["rewrite_count"],
+        "scope": result["scope"],
 
-        "scope":
-            result["scope"],
+        "query_spec": result.get("query_spec"),
     }
 
 

@@ -38,6 +38,225 @@ class QuerySpec:
     constraints: List[str] = field(
         default_factory=list
     )
+    
+ 
+ 
+ 
+ 
+def _clean_extracted_phrase(
+    phrase: str | None,
+) -> str | None:
+    """
+    Clean a phrase extracted from the natural-language query.
+
+    This function is deliberately domain-agnostic.
+    It removes grammatical residue rather than topic vocabulary.
+    """
+
+    if not phrase:
+        return None
+
+    phrase = phrase.strip()
+
+    # Remove surrounding punctuation.
+    phrase = phrase.strip(" \t\n\r.,!?;:")
+
+    # Remove leading grammatical/prepositional residue.
+    phrase = re.sub(
+        r"^(?:about|on|regarding|concerning|related to)\s+",
+        "",
+        phrase,
+        flags=re.IGNORECASE,
+    )
+
+    # Remove trailing punctuation again after normalization.
+    phrase = phrase.strip(" \t\n\r.,!?;:")
+
+    # Normalize whitespace.
+    phrase = re.sub(
+        r"\s+",
+        " ",
+        phrase,
+    ).strip()
+
+    return phrase or None
+
+
+def _extract_speaker(
+    text: str,
+) -> str | None:
+    """
+    Extract a named speaker from constructions such as:
+
+        What did Udit say about money?
+        What did Rahul mention?
+        What did Priya write?
+
+    This does not assume any particular person's name.
+    """
+
+    patterns = [
+        r"\bwhat did\s+([a-z0-9_]+)\s+"
+        r"(?:say|mention|tell|write)\b",
+
+        r"\bwhat has\s+([a-z0-9_]+)\s+"
+        r"(?:said|mentioned|written)\b",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if match:
+            return match.group(1).strip()
+
+    return None
+
+
+def _extract_target(
+    text: str,
+    speaker: str | None = None,
+) -> str | None:
+    """
+    Extract the semantic object/topic of a query.
+
+    This is grammatical extraction only.
+
+    It must NOT contain domain-specific vocabulary such as:
+        sports
+        travel
+        money
+        laptop
+        football
+        etc.
+
+    Examples:
+
+        What did we discuss about travel?
+            -> travel
+
+        What did Udit say about money?
+            -> money
+
+        What sports are explicitly mentioned?
+            -> sports
+
+        What laptop was EXODIA considering buying?
+            -> laptop
+    """
+
+    patterns = [
+
+        # -----------------------------------------------------
+        # "What did ... discuss/talk about X?"
+        # -----------------------------------------------------
+
+        r"\bwhat did\s+(?:we|you|they)\s+"
+        r"(?:discuss|talk)\s+about\s+(.+?)\??$",
+
+        # -----------------------------------------------------
+        # "What did PERSON say/mention/write about X?"
+        # -----------------------------------------------------
+
+        r"\bwhat did\s+[a-z0-9_]+\s+"
+        r"(?:say|mention|write|tell)\s+"
+        r"about\s+(.+?)\??$",
+
+        # -----------------------------------------------------
+        # "What is/are X?"
+        #
+        # We deliberately only capture the noun phrase after
+        # "what", not the entire remainder of the question.
+        # -----------------------------------------------------
+
+        r"\bwhat\s+([a-z][a-z0-9_-]*)"
+        r"\s+(?:is|are|was|were)\b",
+
+        # -----------------------------------------------------
+        # "What X was/were ...?"
+        #
+        # Example:
+        #   What laptop was EXODIA considering buying?
+        #
+        # Captures "laptop", not the remainder.
+        # -----------------------------------------------------
+
+        r"\bwhat\s+([a-z][a-z0-9_-]*)"
+        r"\s+(?:was|were|is|are)\b",
+
+        # -----------------------------------------------------
+        # "Which X ...?"
+        # -----------------------------------------------------
+
+        r"\bwhich\s+([a-z][a-z0-9_-]*)"
+        r"\s+(?:was|were|is|are|did|does|do|has|have)\b",
+
+        # -----------------------------------------------------
+        # "What X are mentioned/discussed?"
+        # -----------------------------------------------------
+
+        r"\bwhat\s+([a-z][a-z0-9_-]*)"
+        r"\s+(?:are|were|is|was)\s+"
+        r"(?:mentioned|discussed|included|present)\b",
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        candidate = _clean_extracted_phrase(
+            match.group(1)
+        )
+
+        if not candidate:
+            continue
+
+        # If a speaker was detected, never return the speaker
+        # itself as the semantic target.
+        if speaker and candidate == speaker.lower():
+            continue
+
+        return candidate
+
+    return None   
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
 
 def build_query_spec(query: str) -> QuerySpec:
     """
@@ -81,21 +300,16 @@ def build_query_spec(query: str) -> QuerySpec:
         constraints.append("explicit")
 
     # --------------------------------------------------------
-    # Speaker-specific constraint
-    #
-    # Only treat a word as a speaker when the grammatical
-    # structure indicates a named subject.
+    # Speaker extraction
     # --------------------------------------------------------
 
-    speaker_match = re.search(
-        r"\bwhat did\s+([a-z0-9_]+)\s+(?:say|mention|tell|write|talk)\b",
-        text,
-    )
+    speaker = _extract_speaker(text)
 
-    if speaker_match:
+    if speaker:
         entities.append(
-            speaker_match.group(1)
+            speaker
         )
+
         constraints.append("speaker_specific")
 
     # --------------------------------------------------------
@@ -135,55 +349,13 @@ def build_query_spec(query: str) -> QuerySpec:
         answer_type = "analytic"
 
     # --------------------------------------------------------
-    # Generic target extraction
-    #
-    # For now we only extract the object of common semantic
-    # question constructions. No topic vocabulary is used.
+    # Generic semantic target extraction
     # --------------------------------------------------------
 
-    target_patterns = [
-        r"\bwhat did (?:we|you|they)\s+(?:discuss|talk about)\s+(.+)$",
-        r"\bwhat did\s+[a-z0-9_]+\s+(?:say|mention|tell|write)\s+about\s+(.+)$",
-        r"\bwhat .*?\s+about\s+(.+)$",
-        r"\bwhat .*?\s+(?:mentioned|discussed)\s+(.+)$",
-    ]
-
-    for pattern in target_patterns:
-
-        match = re.search(
-            pattern,
-            text,
-        )
-
-        if match:
-
-            candidate = match.group(1).strip()
-
-            if candidate:
-                target = candidate
-                break
-
-    # --------------------------------------------------------
-    # Remove entity from target when the query explicitly
-    # identifies a speaker.
-    # --------------------------------------------------------
-
-    if target and entities:
-
-        for entity in entities:
-
-            target = re.sub(
-                rf"\b{re.escape(entity)}\b",
-                "",
-                target,
-            ).strip()
-
-    if target:
-        target = re.sub(
-            r"\s+",
-            " ",
-            target,
-        ).strip()
+    target = _extract_target(
+        text,
+        speaker=speaker,
+    )
 
     # --------------------------------------------------------
     # Aggregation constraint
