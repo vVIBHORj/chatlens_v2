@@ -87,6 +87,7 @@ Requirements:
 # Imports
 # =====================================================================
 
+import re
 from typing import List, Optional, TypedDict
 from datetime import datetime
 
@@ -567,11 +568,23 @@ def retrieve(
 
     for candidate in candidates[:MAX_HYBRID_CANDIDATES]:
 
+        clean_message = candidate.message or ""
+        while True:
+            stripped = re.sub(
+                r"^\[(?:message_id|ID)\s*=?\s*\d+\]\s*\[[^\]]+\]\s*[^:]*:\s*",
+                "",
+                clean_message,
+                count=1,
+            )
+            if stripped == clean_message:
+                break
+            clean_message = stripped
+
         content = (
             f"[ID {candidate.message_id}] "
             f"[{candidate.timestamp}] "
             f"{candidate.sender or ''}: "
-            f"{candidate.message or ''}"
+            f"{clean_message}"
         )
 
         documents.append(
