@@ -1,6 +1,8 @@
 import os
 import tempfile
 import time
+import hashlib
+from typing import Any, Optional, Tuple, List
 
 import pandas as pd
 import plotly.express as px
@@ -209,6 +211,9 @@ if "last_result" not in st.session_state:
 if "answer_time" not in st.session_state:
     st.session_state.answer_time = None
 
+if "processed_file_hash" not in st.session_state:
+    st.session_state.processed_file_hash = None
+
 
 # ============================================================
 # SIDEBAR
@@ -249,112 +254,168 @@ with st.sidebar:
 
 
 # ============================================================
-# PROCESS FILE
+# INGESTION HELPERS
 # ============================================================
 
-if uploaded is not None and st.session_state.df is None:
+def ingest_chat_file(
+    file_path: str,
+    database_path: str = "./chat_data.db",
+    persist_dir: str = "./chroma_db",
+    save_fn=save_messages,
+    vectorstore_fn=build_vectorstore,
+):
+    """
+    Parse raw WhatsApp export, enrich records, persist to SQLite,
+    and build Chroma vector store.
+    """
+    messages = parse_whatsapp_export(file_path)
+    enriched = enrich_messages(messages)
+    df = to_dataframe(enriched)
 
-    start_processing = time.perf_counter()
-    messages = []
-    df = pd.DataFrame()
-    ingestion_error = None
+    if len(messages) > 0 and not df.empty:
+        save_fn(enriched, database_path=database_path, reset=True)
+        vectorstore_fn(enriched, persist_dir=persist_dir)
+
+    return messages, enriched, df
+
+
+def handle_upload(
+    file_bytes: bytes,
+    session_state: Any,
+    database_path: str = "./chat_data.db",
+    persist_dir: str = "./chroma_db",
+    save_fn=save_messages,
+    vectorstore_fn=build_vectorstore,
+    status_callback=None,
+) -> Tuple[bool, Optional[str], Optional[pd.DataFrame], int]:
+    """
+    Coordinate upload lifecycle with content-hash fingerprinting:
+    - Avoids re-processing identical file contents on rerun.
+    - Resets active session state before processing new file to prevent
+      stale data leakage.
+    - Only updates processed_file_hash when ingestion succeeds.
+    - Keeps session_state blocked if ingestion fails, enabling retry.
+    """
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    # If already successfully processed this exact file content, do not rebuild
+    if session_state.get("processed_file_hash") == file_hash and session_state.get("df") is not None:
+        return True, "already_processed", session_state.get("df"), len(session_state.get("df"))
+
+    # A new or retried file has arrived: clear active session data immediately
+    # so stale data is never exposed while processing or on failure
+    session_state["df"] = None
+    session_state["vectorstore_ready"] = False
+    session_state["last_result"] = None
+    session_state["last_question"] = ""
 
     with tempfile.NamedTemporaryFile(
         delete=False,
         suffix=".txt"
     ) as tmp:
-
-        tmp.write(uploaded.read())
+        tmp.write(file_bytes)
         tmp_path = tmp.name
 
     try:
+        if status_callback:
+            status_callback("Processing WhatsApp export and updating search indexes...")
+
+        messages, enriched, df = ingest_chat_file(
+            tmp_path,
+            database_path=database_path,
+            persist_dir=persist_dir,
+            save_fn=save_fn,
+            vectorstore_fn=vectorstore_fn,
+        )
+
+        if len(messages) == 0:
+            return False, "No messages could be parsed from this file.", None, 0
+
+        if df.empty or "sender" not in df.columns:
+            return False, "No text messages were found in the export.", None, 0
+
+        if df["sender"].nunique() < 1:
+            return False, "No identifiable participants were found.", None, 0
+
+        # Ingestion succeeded: update state and fingerprint
+        session_state["df"] = df
+        session_state["vectorstore_ready"] = True
+        session_state["processed_file_hash"] = file_hash
+
+        return True, None, df, len(df)
+
+    except Exception as e:
+        session_state["df"] = None
+        session_state["vectorstore_ready"] = False
+        # Note: session_state["processed_file_hash"] is NOT updated, enabling retry
+        return False, str(e), None, 0
+
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+# ============================================================
+# PROCESS FILE
+# ============================================================
+
+if uploaded is not None:
+
+    file_bytes = uploaded.getvalue()
+    file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+    if st.session_state.processed_file_hash != file_hash:
+
+        start_processing = time.perf_counter()
 
         with st.status(
             "Analyzing your conversation...",
             expanded=True
         ) as status:
 
-            st.write("📄 Parsing WhatsApp export...")
-
-            messages = parse_whatsapp_export(tmp_path)
-
-            st.write("🧹 Enriching messages...")
-
-            enriched = enrich_messages(messages)
-
-            df = to_dataframe(enriched)
-
-            if len(messages) > 0 and not df.empty:
-
-                st.write("💾 Updating message database...")
-
-                save_messages(enriched, reset=True)
-
-                st.write("🧠 Building semantic search index...")
-
-                build_vectorstore(enriched)
-
-                st.session_state.vectorstore_ready = True
+            success, error_msg, df, msg_count = handle_upload(
+                file_bytes=file_bytes,
+                session_state=st.session_state,
+                status_callback=lambda msg: st.write(f"📄 {msg}"),
+            )
 
             processing_time = (
                 time.perf_counter() - start_processing
             )
 
-            status.update(
-                label="Analysis ready",
-                state="complete",
-            )
+            if success:
 
-    except Exception as e:
+                status.update(
+                    label="Analysis ready",
+                    state="complete",
+                )
 
-        ingestion_error = e
-        st.session_state.vectorstore_ready = False
+                st.success(
+                    f"✨ Processed {msg_count:,} messages from "
+                    f"{df['sender'].nunique()} participants "
+                    f"in {processing_time:.2f}s."
+                )
+
+            else:
+
+                status.update(
+                    label="Analysis failed",
+                    state="error",
+                )
+
+                st.error(
+                    f"Failed to process and index conversation: {error_msg}"
+                )
+
+else:
+
+    # If the user cleared the file uploader, reset the session state
+    if st.session_state.processed_file_hash is not None:
         st.session_state.df = None
-
-    finally:
-
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-
-    # --------------------------------------------
-    # VALIDATION
-    # --------------------------------------------
-
-    if ingestion_error is not None:
-
-        st.error(
-            f"Failed to process and index conversation: {ingestion_error}"
-        )
-
-    elif len(messages) == 0:
-
-        st.error(
-            "No messages could be parsed from this file. "
-            "Make sure it is a WhatsApp 'Export chat → Without media' "
-            ".txt file."
-        )
-
-    elif df.empty or "sender" not in df.columns:
-
-        st.error(
-            "No text messages were found in the export."
-        )
-
-    elif df["sender"].nunique() < 1:
-
-        st.error(
-            "No identifiable participants were found."
-        )
-
-    else:
-
-        st.session_state.df = df
-
-        st.success(
-            f"✨ Processed {len(df):,} messages from "
-            f"{df['sender'].nunique()} participants "
-            f"in {processing_time:.2f}s."
-        )
+        st.session_state.vectorstore_ready = False
+        st.session_state.processed_file_hash = None
+        st.session_state.last_result = None
+        st.session_state.last_question = ""
 
 
 # ============================================================

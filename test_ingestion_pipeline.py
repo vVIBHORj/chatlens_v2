@@ -6,15 +6,18 @@ import pandas as pd
 
 from parser import parse_whatsapp_export, ChatMessage
 from enrich import enrich_messages, to_dataframe, EnrichedMessage
-from chat_database import save_messages, get_connection
+from chat_database import save_messages, get_connection, get_message
 from vectorstore import build_message_documents, build_conversation_chunks
+from app import ingest_chat_file, handle_upload
 
 
 def test_app_import_succeeds():
-    """Verify app.py imports successfully without missing symbols or errors."""
+    """Verify app.py imports successfully and exposes verified ingestion helpers."""
     import app
     assert hasattr(app, "build_vectorstore")
     assert hasattr(app, "save_messages")
+    assert hasattr(app, "ingest_chat_file")
+    assert hasattr(app, "handle_upload")
 
 
 def test_synthetic_export_parsed_and_enriched(tmp_path: Path):
@@ -156,39 +159,245 @@ def test_vectorstore_document_chunking_offline():
     assert chunk_docs[0].metadata["start_message_id"] == 0
 
 
-def test_failure_handling_leaves_flag_false():
-    """Verify that a vectorstore or database failure causes vectorstore_ready to remain False."""
-    session_state = {"vectorstore_ready": False, "df": None}
+def test_retrieval_mapping_across_synthetic_datasets(tmp_path: Path):
+    """Verify how message IDs map to SQLite records across datasets and demonstrate misalignment risk."""
+    chat_a = (
+        "01/01/2026, 08:00 - Dr. Thorne: Gravity wave amplitude detected.\n"
+        "01/01/2026, 08:05 - Dr. Cooper: Laser interferometer calibrated.\n"
+    )
+    chat_b = (
+        "02/02/2026, 09:00 - Marina: Coral reef bleaching survey completed.\n"
+        "02/02/2026, 09:05 - Jacques: Deep sea temperature sensors deployed.\n"
+    )
+    file_a = tmp_path / "chat_a.txt"
+    file_b = tmp_path / "chat_b.txt"
+    file_a.write_text(chat_a, encoding="utf-8")
+    file_b.write_text(chat_b, encoding="utf-8")
+
+    enriched_a = enrich_messages(parse_whatsapp_export(str(file_a)))
+    enriched_b = enrich_messages(parse_whatsapp_export(str(file_b)))
+
+    test_db = str(tmp_path / "mapping_test.db")
+
+    # 1. Ingest Dataset A
+    save_messages(enriched_a, database_path=test_db, reset=True)
+    chroma_candidate_id = 0
+    row_a = get_message(chroma_candidate_id, database_path=test_db)
+    assert row_a is not None
+    assert row_a["sender"] == "Dr. Thorne"
+    assert "Gravity wave" in row_a["message"]
+
+    # 2. Replace with Dataset B
+    save_messages(enriched_b, database_path=test_db, reset=True)
+
+    # 3. In SQLite, message ID 0 now resolves to Dataset B's first message
+    row_b = get_message(chroma_candidate_id, database_path=test_db)
+    assert row_b is not None
+    assert row_b["sender"] == "Marina"
+    assert "Coral reef" in row_b["message"]
+    assert "Dr. Thorne" not in row_b["sender"]
+
+
+# ============================================================================
+# REAL INGESTION & UPLOAD LIFECYCLE TESTS (EXERCISING APP.PY LOGIC)
+# ============================================================================
+
+def test_upload_lifecycle_different_exports_same_session(tmp_path: Path):
+    """Verify upload A succeeds, then a different upload B is processed in the same session."""
+    test_db = str(tmp_path / "lifecycle.db")
+    session_state = {}
+    mock_vs = MagicMock()
+
+    chat_a_bytes = b"10/10/2026, 10:00 - Alice: Alpha mission launch.\n"
+    chat_b_bytes = b"11/11/2026, 11:00 - Bruno: Beta telemetry received.\n"
+
+    # Upload A
+    success_a, err_a, df_a, count_a = handle_upload(
+        file_bytes=chat_a_bytes,
+        session_state=session_state,
+        database_path=test_db,
+        vectorstore_fn=mock_vs,
+    )
+    assert success_a is True
+    assert err_a is None
+    assert count_a == 1
+    assert session_state["vectorstore_ready"] is True
+    assert session_state["df"] is not None
+    assert "Alice" in session_state["df"]["sender"].values
+    hash_a = session_state["processed_file_hash"]
+    assert hash_a is not None
+
+    # Upload B in the SAME session
+    success_b, err_b, df_b, count_b = handle_upload(
+        file_bytes=chat_b_bytes,
+        session_state=session_state,
+        database_path=test_db,
+        vectorstore_fn=mock_vs,
+    )
+    assert success_b is True
+    assert err_b is None
+    assert count_b == 1
+    assert session_state["vectorstore_ready"] is True
+    assert "Bruno" in session_state["df"]["sender"].values
+    assert "Alice" not in session_state["df"]["sender"].values
+    hash_b = session_state["processed_file_hash"]
+    assert hash_b != hash_a
+
+    # SQLite confirms Alice was purged and replaced by Bruno
+    conn = get_connection(test_db)
+    rows = conn.execute("SELECT sender FROM messages").fetchall()
+    conn.close()
+    assert len(rows) == 1
+    assert rows[0]["sender"] == "Bruno"
+
+
+def test_repeated_reruns_same_file_do_not_rebuild(tmp_path: Path):
+    """Verify repeated reruns with the same file do not rebuild stores unnecessarily."""
+    test_db = str(tmp_path / "rerun.db")
+    session_state = {}
+    mock_save = MagicMock(side_effect=lambda msgs, **kwargs: save_messages(msgs, database_path=test_db, reset=True))
+    mock_vs = MagicMock()
+
+    chat_bytes = b"10/10/2026, 10:00 - Alice: Unchanged conversation content.\n"
+
+    # First run: processes file
+    success1, err1, df1, count1 = handle_upload(
+        file_bytes=chat_bytes,
+        session_state=session_state,
+        database_path=test_db,
+        save_fn=mock_save,
+        vectorstore_fn=mock_vs,
+    )
+    assert success1 is True
+    assert mock_save.call_count == 1
+    assert mock_vs.call_count == 1
+
+    # Second run (Streamlit rerun with unchanged upload)
+    success2, err2, df2, count2 = handle_upload(
+        file_bytes=chat_bytes,
+        session_state=session_state,
+        database_path=test_db,
+        save_fn=mock_save,
+        vectorstore_fn=mock_vs,
+    )
+    assert success2 is True
+    assert err2 == "already_processed"
+    # Verification: neither store build was invoked again
+    assert mock_save.call_count == 1
+    assert mock_vs.call_count == 1
+
+
+def test_different_content_same_filename_treated_as_different_upload(tmp_path: Path):
+    """Verify two different file contents sharing the same filename are distinguished by SHA-256."""
+    test_db = str(tmp_path / "same_filename.db")
+    session_state = {}
+    mock_vs = MagicMock()
+
+    # Content 1 and Content 2 both represent exports that a user might save as "chat.txt"
+    content_1 = b"01/01/2026, 12:00 - User1: Content from conversation 1.\n"
+    content_2 = b"02/02/2026, 12:00 - User2: Completely different content from conversation 2.\n"
+
+    success1, _, _, _ = handle_upload(
+        file_bytes=content_1,
+        session_state=session_state,
+        database_path=test_db,
+        vectorstore_fn=mock_vs,
+    )
+    assert success1 is True
+    assert "User1" in session_state["df"]["sender"].values
+
+    # Ingest Content 2
+    success2, _, _, _ = handle_upload(
+        file_bytes=content_2,
+        session_state=session_state,
+        database_path=test_db,
+        vectorstore_fn=mock_vs,
+    )
+    assert success2 is True
+    assert "User2" in session_state["df"]["sender"].values
+    assert "User1" not in session_state["df"]["sender"].values
+
+
+def test_sqlite_persistence_failure_blocks_qa_and_prevents_stale_data(tmp_path: Path):
+    """Verify that if SQLite persistence fails, ingestion reports failure and blocks Q&A."""
+    session_state = {"df": "old_data_marker", "vectorstore_ready": True, "processed_file_hash": "old_hash"}
     
-    enriched = [
-        EnrichedMessage(
-            id=1,
-            timestamp=pd.Timestamp("2026-01-01 10:00:00"),
-            sender="User",
-            message="Hello",
-            message_type="text",
-            sentiment_compound=0.0,
-            sentiment_label="neutral",
-            is_question=False,
-            message_length=5,
-            response_time_minutes=None,
-            reply_time_minutes=None,
-        )
-    ]
+    mock_failing_save = MagicMock(side_effect=sqlite3.OperationalError("Simulated disk error"))
+    mock_vs = MagicMock()
 
-    # Simulate ingestion failure in vectorstore
-    ingestion_error = None
-    try:
-        with patch("vectorstore.build_vectorstore", side_effect=RuntimeError("Ollama connection failed")):
-            from vectorstore import build_vectorstore
-            build_vectorstore(enriched)
-            session_state["vectorstore_ready"] = True
-    except Exception as e:
-        ingestion_error = e
-        session_state["vectorstore_ready"] = False
-        session_state["df"] = None
+    chat_bytes = b"10/10/2026, 10:00 - NewUser: Trying to upload.\n"
 
-    assert ingestion_error is not None
-    assert str(ingestion_error) == "Ollama connection failed"
+    success, err, df, count = handle_upload(
+        file_bytes=chat_bytes,
+        session_state=session_state,
+        save_fn=mock_failing_save,
+        vectorstore_fn=mock_vs,
+    )
+
+    assert success is False
+    assert "Simulated disk error" in err
+    # Key safety check: Q&A is blocked, old data was purged from session, and ready flag is False
+    assert session_state["df"] is None
+    assert session_state["vectorstore_ready"] is False
+    # vectorstore_fn should NOT have been invoked
+    assert mock_vs.call_count == 0
+
+
+def test_vectorstore_failure_after_sqlite_blocks_qa(tmp_path: Path):
+    """Verify that if vectorstore build fails after SQLite, ingestion reports failure and blocks Q&A."""
+    test_db = str(tmp_path / "vs_fail.db")
+    session_state = {"df": "old_data_marker", "vectorstore_ready": True}
+
+    mock_failing_vs = MagicMock(side_effect=RuntimeError("Ollama service unavailable"))
+
+    chat_bytes = b"10/10/2026, 10:00 - NewUser: Trying to upload.\n"
+
+    success, err, df, count = handle_upload(
+        file_bytes=chat_bytes,
+        session_state=session_state,
+        database_path=test_db,
+        vectorstore_fn=mock_failing_vs,
+    )
+
+    assert success is False
+    assert "Ollama service unavailable" in err
+    # Key safety check: Q&A is blocked and ready flag is False
+    assert session_state["df"] is None
+    assert session_state["vectorstore_ready"] is False
+
+
+def test_failed_upload_can_be_retried_in_same_session(tmp_path: Path):
+    """Verify that a failed upload does not lock out subsequent retries in the same session."""
+    test_db = str(tmp_path / "retry.db")
+    session_state = {}
+
+    chat_bytes = b"10/10/2026, 10:00 - RetryUser: Attempting upload.\n"
+
+    # Attempt 1: Fails
+    mock_fail_vs = MagicMock(side_effect=RuntimeError("Transient network failure"))
+    success1, err1, _, _ = handle_upload(
+        file_bytes=chat_bytes,
+        session_state=session_state,
+        database_path=test_db,
+        vectorstore_fn=mock_fail_vs,
+    )
+    assert success1 is False
     assert session_state["vectorstore_ready"] is False
     assert session_state["df"] is None
+    # Fingerprint was NOT updated, allowing retry
+    assert session_state.get("processed_file_hash") is None
+
+    # Attempt 2: User retries (or service recovers) with SAME file content
+    mock_ok_vs = MagicMock()
+    success2, err2, df2, count2 = handle_upload(
+        file_bytes=chat_bytes,
+        session_state=session_state,
+        database_path=test_db,
+        vectorstore_fn=mock_ok_vs,
+    )
+    assert success2 is True
+    assert err2 is None
+    assert session_state["vectorstore_ready"] is True
+    assert session_state["df"] is not None
+    assert session_state["processed_file_hash"] is not None
+    assert "RetryUser" in session_state["df"]["sender"].values
