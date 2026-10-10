@@ -1055,98 +1055,58 @@ def generate(
     else:
 
         prompt = (
-            "You are an ultra-conservative, evidence-grounded assistant "
-            "analyzing a WhatsApp conversation.\n\n"
+            "You are an evidence-grounded AI assistant answering a user's question "
+            "about an archived WhatsApp conversation. You are summarizing the archive, "
+            "NOT continuing or participating in the chat.\n\n"
 
             f"{context_note}\n\n"
 
-            "YOUR TASK: Answer the user's question using ONLY explicit "
-            "evidence from the context messages below. You must report "
-            "what the messages literally say, not what you interpret "
-            "they imply.\n\n"
+            "YOUR TASK: Provide a concise, natural-language summary in the assistant's "
+            "voice (typically 1–3 sentences) that directly answers the question using ONLY "
+            "explicit evidence from the context messages. Synthesize only relevant messages "
+            "whose relevance is directly supported. Never output a raw transcript line or message dump "
+            "as the entire answer, and never prefix the answer with a list of IDs.\n\n"
 
             "STRICT GROUNDING RULES:\n\n"
 
             "1. Use ONLY information explicitly present in the context. "
-            "Do NOT add any knowledge from outside the context.\n\n"
+            "Do NOT add any knowledge or assumptions from outside the context.\n\n"
 
-            "2. Before using any message as evidence, classify it:\n"
-            "   - STATEMENT: Someone states a fact ('I was at the football ground')\n"
-            "   - QUESTION: Someone asks something ('Tennis ni hai?')\n"
-            "   - REQUEST: Someone asks someone to do something ('Tennis ball leke aaiyo')\n"
-            "   - MENTION: A topic is referenced without action ('Tum konsi sports loge?')\n"
-            "   Only STATEMENTS can support factual claims. Questions, requests, "
-            "and mentions can only support that the topic was discussed or mentioned.\n\n"
+            "2. Distinguish message types carefully:\n"
+            "   - STATEMENT: Direct assertion of fact\n"
+            "   - QUESTION: An inquiry or asking about something\n"
+            "   - REQUEST / SUGGESTION: Asking or suggesting an action\n"
+            "   - LOCATION / VENUE: Referencing a place or location\n"
+            "   - POSSIBILITY: Speculation or something conditional\n"
+            "   Only direct STATEMENTS can support factual claims. Questions, requests, "
+            "locations, and possibilities must never be reported as confirmed events, activities, "
+            "or completed actions.\n\n"
 
-            "3. NEVER convert a question into a confirmed event.\n"
-            "   'Tennis ni hai?' does NOT mean 'Tennis was not available' or "
-            "'They played tennis.' It means someone asked about tennis.\n\n"
+            "3. Never convert a question, request, or suggestion into evidence that the event or "
+            "activity actually happened. Do not claim someone played an activity merely because "
+            "a message mentions a court, ball, venue, or playing.\n\n"
 
-            "4. NEVER convert a request or suggestion into a completed action.\n"
-            "   'Tennis ball leke aaiyo' does NOT mean 'They played tennis.' "
-            "It means someone requested a tennis ball.\n\n"
+            "4. Never interpret a location containing a topic word as proof that the topic itself was discussed "
+            "or that an associated activity occurred. Mentioning a venue or location (e.g., a ground, court, store, "
+            "or office) only proves that the location was named, not that an associated event, activity, or plan took place.\n\n"
 
-            "5. NEVER infer that people participated in an activity just because "
-            "they appear in related messages. Proximity in conversation does not "
-            "prove joint participation.\n\n"
+            "5. Treat cryptic, contradictory, slang-heavy, or ambiguous messages conservatively. Preserve their literal "
+            "phrasing and ambiguity rather than inventing an interpretation. If a message is an unexplained equation, "
+            "shorthand, or unclear slang, report it neutrally without asserting an unverified meaning.\n\n"
 
-            "6. NEVER infer plans, intentions, motivations, relationships, or "
-            "future actions unless the context EXPLICITLY states them.\n\n"
+            "6. Avoid broad, overreaching introductory claims such as 'they discussed various topics including X, Y, Z' "
+            "unless each item was genuinely discussed. Do not feel obliged to mention every retrieved message; "
+            "summarize only the specific points directly supported and relevant to the question.\n\n"
 
-            "7. NEVER say someone 'expressed' a sentiment unless they literally "
-            "stated it. A question is not an expression of opinion.\n\n"
+            "7. Use INLINE citations placed immediately after the specific claim they support (e.g., 'An inquiry was made "
+            "about X [ID 12], and Y was requested [ID 34]'). Cite ONLY the smallest relevant set of message IDs directly "
+            "supporting each claim. NEVER list or clump message IDs at the beginning or end of the answer.\n\n"
 
-            "8. When the user asks 'What did we discuss about X?', report WHAT "
-            "was explicitly mentioned about X, not what people intended to do. "
-            "Prefer phrasing like:\n"
-            "   - 'X was mentioned in the conversation'\n"
-            "   - 'Someone asked about X'\n"
-            "   - 'Someone requested X'\n"
-            "   - 'X was referred to'\n"
-            "   Do NOT use phrasing like:\n"
-            "   - 'They planned to do X'\n"
-            "   - 'They discussed plans for X'\n"
-            "   - 'X was not available'\n"
-            "   - 'They played X together'\n\n"
+            "8. If the retrieved evidence supports only a limited conclusion (such as inquiries or mentions rather than "
+            "actual activities or plans), state that limitation concisely instead of filling gaps with assumptions.\n\n"
 
-            "9. If evidence supports only a limited answer, give that limited "
-            "answer. Do not say 'there was no discussion' if any relevant "
-            "messages exist.\n\n"
-
-            "10. If multiple messages mention a topic, synthesize them but "
-            "preserve the distinction between statements, questions, and "
-            "requests.\n\n"
-
-            "11. Preserve uncertainty. If the source is uncertain, your answer "
-            "must also be uncertain.\n\n"
-
-            "12. Do not invent names, dates, events, actions, or conclusions.\n\n"
-
-            "13. Do not assume that every message in a chronological section "
-            "is relevant. Focus only on messages that directly relate to the "
-            "question.\n\n"
-
-            "WORKED EXAMPLES:\n\n"
-
-            "Example context messages:\n"
-            "  'Tum konsi sports loge?'\n"
-            "  'Badminton = tennis'\n"
-            "  'Football ground mein tha'\n"
-            "  'Tennis ball leke aaiyo'\n"
-            "  'Tennis ni hai?'\n\n"
-
-            "Question: 'What did we discuss about sports?'\n\n"
-
-            "CORRECT answer: 'Sports explicitly mentioned in the retrieved "
-            "conversation include badminton, tennis, and football. Someone "
-            "asked which sports to pick. A tennis ball was requested. There "
-            "was a question about tennis availability. A football ground "
-            "was mentioned.'\n\n"
-
-            "WRONG answer: 'They discussed plans to play badminton and "
-            "football together. Tennis was not available. They planned "
-            "to play sports.' (This is wrong because it converts questions "
-            "into conclusions and infers plans that are not stated.)\n\n"
+            "9. Never infer participants, plans, intentions, relationships, or future actions unless the context explicitly "
+            "states them.\n\n"
 
             "CONTEXT:\n"
             f"{context}\n\n"
@@ -1154,9 +1114,8 @@ def generate(
             f"USER QUESTION:\n"
             f"{state['original_question']}\n\n"
 
-            "Remember: Report only what the messages explicitly say. "
-            "Use hedged language like 'X was mentioned' or 'someone asked "
-            "about X' instead of asserting actions or plans.\n\n"
+            "Remember: Write a natural 1–3 sentence assistant summary with INLINE [ID 123] citations placed immediately "
+            "after each claim. Never list IDs at the beginning. Summarize only supported, relevant points.\n\n"
 
             "ANSWER:"
         )
@@ -1213,8 +1172,10 @@ def check_grounded(
         "You are a strict factual groundedness checker for a WhatsApp "
         "conversation analysis system.\n\n"
 
-        "Your job is to determine whether EVERY substantive claim in the "
-        "ANSWER is directly supported by the supplied CONTEXT.\n\n"
+        "The ANSWER below is an AI assistant's factual summary of the archived "
+        "conversation (not a reply to a WhatsApp message). Your job is to determine "
+        "whether EVERY substantive claim in the ANSWER is directly supported by the "
+        "supplied CONTEXT.\n\n"
 
         "Rules:\n"
         "1. Check the answer claim-by-claim, not just whether the general "

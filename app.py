@@ -9,7 +9,8 @@ import streamlit as st
 
 from parser import parse_whatsapp_export
 from enrich import enrich_messages, to_dataframe
-from vectorstore import build_daily_chunks, build_vectorstore
+from chat_database import save_messages
+from vectorstore import build_vectorstore
 from analytics import (
     sender_summary,
     weekly_trend,
@@ -254,6 +255,9 @@ with st.sidebar:
 if uploaded is not None and st.session_state.df is None:
 
     start_processing = time.perf_counter()
+    messages = []
+    df = pd.DataFrame()
+    ingestion_error = None
 
     with tempfile.NamedTemporaryFile(
         delete=False,
@@ -280,16 +284,15 @@ if uploaded is not None and st.session_state.df is None:
 
             df = to_dataframe(enriched)
 
-            st.write("🧠 Building semantic search index...")
-
             if len(messages) > 0 and not df.empty:
 
-                docs = build_daily_chunks(enriched)
+                st.write("💾 Updating message database...")
 
-                build_vectorstore(
-                    docs,
-                    reset=True
-                )
+                save_messages(enriched, reset=True)
+
+                st.write("🧠 Building semantic search index...")
+
+                build_vectorstore(enriched)
 
                 st.session_state.vectorstore_ready = True
 
@@ -302,6 +305,12 @@ if uploaded is not None and st.session_state.df is None:
                 state="complete",
             )
 
+    except Exception as e:
+
+        ingestion_error = e
+        st.session_state.vectorstore_ready = False
+        st.session_state.df = None
+
     finally:
 
         if os.path.exists(tmp_path):
@@ -311,7 +320,13 @@ if uploaded is not None and st.session_state.df is None:
     # VALIDATION
     # --------------------------------------------
 
-    if len(messages) == 0:
+    if ingestion_error is not None:
+
+        st.error(
+            f"Failed to process and index conversation: {ingestion_error}"
+        )
+
+    elif len(messages) == 0:
 
         st.error(
             "No messages could be parsed from this file. "
