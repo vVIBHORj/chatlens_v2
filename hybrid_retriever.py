@@ -512,10 +512,14 @@ def calculate_evidence_score(
 
     has_semantic = (
         candidate.semantic_rank is not None
+        or "semantic_message" in candidate.sources
+        or candidate.semantic_evidence > 0.0
     )
 
     has_lexical = (
         candidate.lexical_rank is not None
+        or "lexical" in candidate.sources
+        or candidate.lexical_evidence > 0.0
     )
 
     if has_semantic and has_lexical:
@@ -525,9 +529,20 @@ def calculate_evidence_score(
     # 4. Message quality
     # ---------------------------------------------------------
 
-    score += (
-        candidate.message_quality * 0.10
+    # Message quality scales evidence for actual candidates, but must not
+    # create artificial evidence points for candidates lacking any retrieval
+    # evidence or meaningful query matches.
+    has_evidence = (
+        has_semantic
+        or has_lexical
+        or bool(candidate.matched_terms)
+        or bool(query_matches)
     )
+
+    if has_evidence:
+        score += (
+            candidate.message_quality * 0.10
+        )
 
     return round(
         min(score, 1.0),
