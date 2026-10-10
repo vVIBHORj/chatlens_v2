@@ -185,89 +185,29 @@ def extract_query_terms(query: str) -> List[str]:
     return terms
 
 # ============================================================
-# QUERY EXPANSION
+# QUERY EXPANSION (CONVERSATION-AGNOSTIC PASS-THROUGH)
 # ============================================================
 
-QUERY_EXPANSIONS = {
-    "girlfriend": [
-        "girlfriend",
-        "girl",
-        "bandi",
-        "wali",
-        "meri wali",
-        "relationship",
-        "dating",
-        "partner",
-    ],
-    "boyfriend": [
-        "boyfriend",
-        "ladka",
-        "banda",
-        "wala",
-        "mera wala",
-        "relationship",
-        "dating",
-        "partner",
-    ],
-    "friend": [
-        "friend",
-        "dost",
-        "yaar",
-        "buddy",
-    ],
-    "sports": [
-        "sports",
-        "sport",
-        "game",
-        "khel",
-        "tennis",
-        "badminton",
-        "cricket",
-        "football",
-        "basketball",
-    ],
-    "laptop": [
-        "laptop",
-        "notebook",
-        "computer",
-        "asus",
-        "hp",
-        "omen",
-        "lenovo",
-        "dell",
-        "acer",
-    ],
-}
+QUERY_EXPANSIONS: Dict[str, List[str]] = {}
 
 
 def expand_query_terms(
     query_terms: List[str],
 ) -> List[str]:
     """
-    Expand important query concepts into terms that may
-    actually appear in the conversation.
+    Return unique query terms in original order.
 
-    Original query terms are always preserved.
+    Default retrieval is conversation-agnostic: no hardcoded topic,
+    relationship, or language-specific synonyms are appended.
     """
+    if not query_terms:
+        return []
 
     expanded_terms = []
 
     for term in query_terms:
-
         if term not in expanded_terms:
             expanded_terms.append(term)
-
-        normalized = term.lower().strip()
-
-        expansions = QUERY_EXPANSIONS.get(
-            normalized,
-            [],
-        )
-
-        for expansion in expansions:
-
-            if expansion not in expanded_terms:
-                expanded_terms.append(expansion)
 
     return expanded_terms
 
@@ -277,33 +217,12 @@ def build_semantic_query(
     query_terms: List[str],
 ) -> str:
     """
-    Build a compact semantic-search query.
+    Build the semantic-search query.
 
-    Keeps the original user query intact while adding
-    only a small number of high-value expanded concepts.
+    Default retrieval is conversation-agnostic: passes through the
+    original user query intact without appending hardcoded expansion terms.
     """
-
-    semantic_terms = []
-
-    for term in query_terms:
-        normalized = term.lower().strip()
-
-        expansions = QUERY_EXPANSIONS.get(
-            normalized,
-            [],
-        )
-
-        for expansion in expansions[:4]:
-            if expansion not in semantic_terms:
-                semantic_terms.append(expansion)
-
-    if not semantic_terms:
-        return query
-
-    return (
-        f"{query} "
-        + " ".join(semantic_terms)
-    )
+    return query
 # ============================================================
 # TEXT NORMALIZATION
 # ============================================================
