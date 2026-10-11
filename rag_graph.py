@@ -87,8 +87,9 @@ Requirements:
 # Imports
 # =====================================================================
 
+import json
 import re
-from typing import List, Optional, TypedDict
+from typing import List, Optional, TypedDict, Dict, Tuple, Any
 from datetime import datetime
 
 import pandas as pd
@@ -125,6 +126,8 @@ SEMANTIC_TOP_K = 10
 KEYWORD_TOP_K = 10
 
 MAX_HYBRID_CANDIDATES = 20
+
+GRADE_BATCH_SIZE = 10
 
 CONTEXT_BEFORE = 10
 
@@ -646,49 +649,246 @@ def retrieve(
     }
 
 # =====================================================================
+# Relevance Grading Helpers
+# =====================================================================
+
+GRADE_PROMPT_TEMPLATE = (
+    "You are a conservative relevance grader for a WhatsApp chat archive retrieval system.\n"
+    "Assess whether each retrieved candidate contains information relevant to answering the user's question, "
+    "or could plausibly serve as helpful conversational context.\n\n"
+    "User Question:\n"
+    "{question}\n\n"
+    "Retrieved Candidates:\n"
+    "{candidates_text}\n\n"
+    "Evaluation Guidelines:\n"
+    "1. Evaluate each candidate individually.\n"
+    "2. Candidates may be single messages or conversation transcript chunks.\n"
+    "3. Conversational chats are informal: short replies (e.g., 'yes', '9pm', 'sure'), typos, emojis, "
+    "slang, and indirect statements may be relevant context.\n"
+    "4. Do NOT reject a candidate solely because of zero lexical keyword overlap, short length, or emojis.\n"
+    "5. If a candidate is clearly and unambiguously about a completely unrelated topic, mark 'irrelevant'.\n"
+    "6. If a candidate is helpful or directly answers the question, mark 'relevant'.\n"
+    "7. If you are uncertain or the context is ambiguous, mark 'uncertain'.\n"
+    "8. Do not invent probabilities or numeric scores.\n\n"
+    "Output MUST be a valid JSON array of objects with keys:\n"
+    '- "candidate": integer candidate number (1, 2, ...)\n'
+    '- "decision": exactly "relevant", "irrelevant", or "uncertain"\n'
+    '- "reason": brief explanation (1 sentence)\n\n'
+    "JSON Response:\n"
+)
+
+
+def format_candidate_for_grader(idx: int, document: Document) -> str:
+    """Format a candidate document for the grader prompt preserving evidence type."""
+    source = document.metadata.get("source", "unknown")
+    if source == "conversation_chunk":
+        chunk_id = document.metadata.get("chunk_id", "unknown")
+        header = f"[Candidate {idx}] (Conversation Transcript Chunk ID: {chunk_id})"
+    elif source == "hybrid_search":
+        msg_id = document.metadata.get("message_id", "unknown")
+        header = f"[Candidate {idx}] (Single Message ID: {msg_id})"
+    else:
+        header = f"[Candidate {idx}] (Evidence Source: {source})"
+
+    return f"{header}\n{document.page_content.strip()}"
+
+
+def parse_grader_response(
+    raw_text: str,
+    candidate_indices: List[int],
+) -> Dict[int, Tuple[str, str]]:
+    """
+    Parse and validate structured grader JSON output.
+    Fails open by returning ('uncertain', ...) for missing, malformed, or invalid entries.
+    """
+    results: Dict[int, Tuple[str, str]] = {
+        idx: ("uncertain", "parsing_fallback") for idx in candidate_indices
+    }
+
+    if not raw_text or not raw_text.strip():
+        return results
+
+    text = raw_text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    parsed_list = None
+    start = text.find("[")
+    end = text.rfind("]")
+    if start != -1 and end != -1 and end > start:
+        try:
+            parsed_list = json.loads(text[start : end + 1])
+        except Exception:
+            parsed_list = None
+    else:
+        obj_start = text.find("{")
+        obj_end = text.rfind("}")
+        if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+            try:
+                single_obj = json.loads(text[obj_start : obj_end + 1])
+                if isinstance(single_obj, dict):
+                    parsed_list = [single_obj]
+            except Exception:
+                parsed_list = None
+
+    if isinstance(parsed_list, list):
+        for item in parsed_list:
+            if not isinstance(item, dict):
+                continue
+            cand_raw = item.get("candidate")
+            try:
+                cand_idx = int(cand_raw)
+            except (ValueError, TypeError):
+                cand_idx = None
+
+            decision_raw = str(item.get("decision", "")).strip().lower()
+            if decision_raw in ("relevant", "irrelevant", "uncertain"):
+                decision = decision_raw
+            else:
+                decision = "uncertain"
+
+            reason = str(item.get("reason", "")).strip() or "No reason provided"
+
+            if cand_idx in results:
+                results[cand_idx] = (decision, reason)
+    else:
+        # Regex fallback for malformed JSON containing candidate objects
+        pattern = re.compile(
+            r'\{[^{}]*?"candidate"\s*:\s*(\d+)[^{}]*?"decision"\s*:\s*"([a-zA-Z_]+)"[^{}]*\}',
+            re.DOTALL,
+        )
+        for match in pattern.finditer(text):
+            try:
+                cand_idx = int(match.group(1))
+                dec_val = match.group(2).strip().lower()
+                decision = dec_val if dec_val in ("relevant", "irrelevant", "uncertain") else "uncertain"
+                if cand_idx in results:
+                    results[cand_idx] = (decision, "regex_extracted")
+            except Exception:
+                pass
+
+    return results
+
+
+def grade_candidate_batch(
+    question: str,
+    batch_docs: List[Document],
+    grader_llm: Optional[Any] = None,
+) -> List[Tuple[Document, str, str]]:
+    """
+    Grade a bounded batch of candidates using LLM in a single structured prompt.
+    Returns list of tuples: (document, decision, reason).
+    """
+    if not batch_docs:
+        return []
+
+    active_llm = grader_llm if grader_llm is not None else llm
+    indices = list(range(1, len(batch_docs) + 1))
+    formatted_chunks = [
+        format_candidate_for_grader(idx, doc)
+        for idx, doc in zip(indices, batch_docs)
+    ]
+    candidates_text = "\n\n---\n\n".join(formatted_chunks)
+    prompt = GRADE_PROMPT_TEMPLATE.format(
+        question=question,
+        candidates_text=candidates_text,
+    )
+
+    try:
+        response = active_llm.invoke(prompt)
+        raw_output = response.content if hasattr(response, "content") else str(response)
+        parsed_decisions = parse_grader_response(raw_output, indices)
+    except Exception as e:
+        parsed_decisions = {
+            idx: ("uncertain", f"grader_exception: {e}")
+            for idx in indices
+        }
+
+    graded_batch = []
+    for idx, doc in zip(indices, batch_docs):
+        decision, reason = parsed_decisions.get(idx, ("uncertain", "missing_index"))
+        graded_batch.append((doc, decision, reason))
+
+    return graded_batch
+
+
+# =====================================================================
 # Grade retrieved documents
 # =====================================================================
 
 def grade_documents(
     state: GraphState,
+    grader_llm: Optional[Any] = None,
 ) -> GraphState:
     """
-    Keep the full hybrid retrieval candidate pool.
+    Conservatively grade retrieved documents using bounded LLM batch evaluation.
 
-    Retrieval is recall-first:
-    semantic and keyword retrieval identify candidates,
-    while the LLM should reason over the retrieved context
-    instead of acting as a hard recall filter.
+    Rules:
+    - Retains relevant and uncertain candidates.
+    - Removes only candidates confidently determined to be irrelevant.
+    - Fails open on parsing errors, timeouts, or LLM exceptions.
+    - Preserves message candidates and transcript chunks as distinct evidence types.
     """
+    documents = state.get("documents", [])
+    if not documents:
+        print("\nNo retrieved candidates to grade.")
+        return {
+            **state,
+            "documents": [],
+        }
 
-    documents = state["documents"]
-
+    question = state.get("original_question") or state.get("question", "")
     print(
-        "\nSkipping LLM relevance grading."
+        f"\nConservative relevance grading: evaluating {len(documents)} "
+        f"candidates in batches of up to {GRADE_BATCH_SIZE}..."
     )
 
+    kept_documents: List[Document] = []
+    rejected_count = 0
+
+    # Process in bounded batches
+    for batch_start in range(0, len(documents), GRADE_BATCH_SIZE):
+        batch = documents[batch_start : batch_start + GRADE_BATCH_SIZE]
+        graded_results = grade_candidate_batch(question, batch, grader_llm=grader_llm)
+
+        for doc, decision, reason in graded_results:
+            new_metadata = dict(doc.metadata)
+            new_metadata["relevance_decision"] = decision
+            new_metadata["relevance_reason"] = reason
+
+            updated_doc = Document(
+                page_content=doc.page_content,
+                metadata=new_metadata,
+            )
+
+            if decision == "irrelevant":
+                rejected_count += 1
+                source = new_metadata.get("source", "unknown")
+                item_id = new_metadata.get("message_id") or new_metadata.get("chunk_id") or "?"
+                print(
+                    f"  [REJECTED] {source} ID={item_id}: {reason}"
+                )
+            else:
+                kept_documents.append(updated_doc)
+                source = new_metadata.get("source", "unknown")
+                item_id = new_metadata.get("message_id") or new_metadata.get("chunk_id") or "?"
+                print(
+                    f"  [{decision.upper()}] {source} ID={item_id}: {reason}"
+                )
+
     print(
-        f"Retrieved candidates kept: "
-        f"{len(documents)}"
+        f"Relevance grading summary: kept {len(kept_documents)}/"
+        f"{len(documents)} candidates ({rejected_count} rejected as irrelevant)."
     )
-
-    for index, document in enumerate(
-        documents,
-        start=1,
-    ):
-        source = document.metadata.get(
-            "source",
-            "unknown",
-        )
-
-        print(
-            f"  Candidate {index}: "
-            f"[{source}]"
-        )
 
     return {
         **state,
-        "documents": documents,
+        "documents": kept_documents,
     }
 
 
@@ -701,17 +901,22 @@ def decide_to_generate(
 ) -> str:
     """
     Decide what happens after document grading.
+
+    Routing rules:
+    - If rewrite limit has been reached, proceed to generation (handles
+      insufficient context gracefully).
+    - If at least one relevant or uncertain candidate remains, proceed
+      to context expansion and generation.
+    - If all candidates were rejected as irrelevant (or retrieval was empty)
+      and rewrites remain, route to query rewriting.
     """
+    documents = state.get("documents", [])
+    rewrite_count = state.get("rewrite_count", 0)
 
-    if state["documents"]:
-
+    if rewrite_count >= MAX_REWRITES:
         return "generate"
 
-    if (
-        state["rewrite_count"]
-        >= MAX_REWRITES
-    ):
-
+    if documents:
         return "generate"
 
     return "rewrite_query"
@@ -730,7 +935,7 @@ def rewrite_query(
     """
 
     original_question = (
-        state["question"]
+        state.get("original_question") or state["question"]
     )
 
     prompt = (
