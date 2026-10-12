@@ -89,7 +89,8 @@ Requirements:
 
 import json
 import re
-from typing import List, Optional, TypedDict, Dict, Tuple, Any
+from dataclasses import dataclass
+from typing import List, Optional, TypedDict, Dict, Tuple, Any, Set
 from datetime import datetime
 
 import pandas as pd
@@ -147,7 +148,7 @@ llm = ChatOllama(
 # =====================================================================
 # Graph state
 # =====================================================================
-class GraphState(TypedDict):
+class GraphState(TypedDict, total=False):
     question: str
     original_question: str
 
@@ -156,6 +157,7 @@ class GraphState(TypedDict):
     generation: str
     rewrite_count: int
     grounded: bool
+    semantic_grounded: bool
 
     df: Optional[pd.DataFrame]
 
@@ -165,6 +167,11 @@ class GraphState(TypedDict):
     secondary_intents: List[str]
 
     query_spec: Optional[QuerySpec]
+
+    citation_validation: Optional[Dict[str, Any]]
+    valid_citation_ids: Optional[List[int]]
+    invalid_citation_ids: Optional[List[int]]
+    available_citation_ids: Optional[List[int]]
 
 # =====================================================================
 # Scope classification
@@ -1346,32 +1353,240 @@ def generate(
 
 
 # =====================================================================
+# Citation Integrity Validation
+# =====================================================================
+
+@dataclass
+class CitationValidationResult:
+    has_citations: bool
+    all_cited_valid: bool
+    cited_ids: List[int]
+    valid_cited_ids: List[int]
+    invalid_cited_ids: List[int]
+    available_ids: List[int]
+    malformed_citations: List[str]
+    missing_citations: bool
+    details: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "has_citations": self.has_citations,
+            "all_cited_valid": self.all_cited_valid,
+            "cited_ids": list(self.cited_ids),
+            "valid_cited_ids": list(self.valid_cited_ids),
+            "invalid_cited_ids": list(self.invalid_cited_ids),
+            "available_ids": list(self.available_ids),
+            "malformed_citations": list(self.malformed_citations),
+            "missing_citations": self.missing_citations,
+            "details": self.details,
+        }
+
+
+def extract_available_message_ids(documents: List[Document]) -> Set[int]:
+    """
+    Extract all message IDs actually present in the evidence documents supplied to generation.
+
+    Derives IDs from the formatted text of individual messages and chronological context lines,
+    cross-checked with individual message metadata.
+    Does NOT infer message IDs from metadata ranges or chunk IDs.
+    """
+    available_ids: Set[int] = set()
+    if not documents:
+        return available_ids
+
+    # Regex patterns for message prefixes in candidate documents:
+    # 1. "[ID 123]" used in hybrid search and chronological context
+    # 2. "[message_id=123]" used in conversation chunks
+    id_pattern = re.compile(r"\[(?:ID|message_id)\s*=?\s*(\d+)\]", re.IGNORECASE)
+
+    for doc in documents:
+        # Extract from actual document text
+        if doc and hasattr(doc, "page_content") and doc.page_content:
+            for match in id_pattern.finditer(doc.page_content):
+                try:
+                    available_ids.add(int(match.group(1)))
+                except (ValueError, TypeError):
+                    pass
+
+        # Metadata cross-check for single message candidates only
+        # Strictly exclude conversation chunks to avoid treating chunk_id as message_id
+        if doc and hasattr(doc, "metadata") and doc.metadata:
+            if doc.metadata.get("source") != "conversation_chunk":
+                msg_id = doc.metadata.get("message_id")
+                if msg_id is not None:
+                    try:
+                        available_ids.add(int(msg_id))
+                    except (ValueError, TypeError):
+                        pass
+
+    return available_ids
+
+
+def extract_answer_citations(answer: str) -> Tuple[List[int], List[str]]:
+    """
+    Extract citation IDs and identify malformed citations from the generated answer.
+    Returns:
+        (cited_ids, malformed_citations)
+    """
+    if not answer or not isinstance(answer, str):
+        return [], []
+
+    cited_ids: List[int] = []
+    malformed_citations: List[str] = []
+
+    # 1. Match all brackets that start with ID or id: e.g. [ID ...]
+    id_bracket_pattern = re.compile(r"\[ID\s*([^\]]*)\]", re.IGNORECASE)
+    for match in id_bracket_pattern.finditer(answer):
+        raw_inside = match.group(1).strip()
+        full_bracket = match.group(0)
+
+        if not raw_inside:
+            malformed_citations.append(full_bracket)
+            continue
+
+        # Split by comma or whitespace, ignoring optional "ID" repetition (e.g. [ID 10, ID 12])
+        tokens = [t.strip() for t in re.split(r"[\s,]+", raw_inside) if t.strip()]
+        has_valid_num = False
+        is_malformed = False
+
+        for token in tokens:
+            if token.upper() == "ID":
+                continue
+            if token.isdigit():
+                val = int(token)
+                if val not in cited_ids:
+                    cited_ids.append(val)
+                has_valid_num = True
+            else:
+                is_malformed = True
+
+        if is_malformed or not has_valid_num:
+            malformed_citations.append(full_bracket)
+
+    # 2. Check for other non-message citation formats (e.g. [chunk_123], [message_id=45])
+    non_id_pattern = re.compile(r"\[(?:chunk|episode|message_id)[^\]]*\]", re.IGNORECASE)
+    for match in non_id_pattern.finditer(answer):
+        full_token = match.group(0)
+        if full_token not in malformed_citations:
+            malformed_citations.append(full_token)
+
+    return cited_ids, malformed_citations
+
+
+def validate_citations(
+    answer: str,
+    documents: List[Document],
+    scope: str = "specific",
+) -> CitationValidationResult:
+    """
+    Deterministically validate citation integrity against evidence documents.
+
+    - Extracts supported message IDs from actual evidence text and metadata.
+    - Extracts [ID <integer>] citations from the generated answer.
+    - Identifies any cited IDs absent from the active context.
+    - Distinguishes message IDs from chunk IDs.
+    - Handles missing metadata and malformed syntax without crashing.
+    """
+    if not isinstance(documents, list):
+        documents = []
+
+    available_ids_set = extract_available_message_ids(documents)
+    available_ids = sorted(list(available_ids_set))
+
+    cited_ids, malformed_citations = extract_answer_citations(answer)
+
+    has_citations = len(cited_ids) > 0 or len(malformed_citations) > 0
+
+    valid_cited_ids = [cid for cid in cited_ids if cid in available_ids_set]
+    invalid_cited_ids = [cid for cid in cited_ids if cid not in available_ids_set]
+
+    # For specific retrieval queries, citations are expected; report missing citations
+    missing_citations = (scope != "broad" and not has_citations and len(available_ids) > 0)
+
+    all_cited_valid = (
+        has_citations
+        and len(invalid_cited_ids) == 0
+        and len(malformed_citations) == 0
+    )
+
+    if not has_citations:
+        if missing_citations:
+            details = "No citations provided in answer for specific retrieval query."
+        else:
+            details = "No citations provided."
+    elif len(invalid_cited_ids) > 0 or len(malformed_citations) > 0:
+        details = (
+            f"Citation validation failed: {len(invalid_cited_ids)} invalid IDs "
+            f"({invalid_cited_ids}), {len(malformed_citations)} malformed citations ({malformed_citations})."
+        )
+    else:
+        details = f"All {len(valid_cited_ids)} citations are valid ({valid_cited_ids})."
+
+    return CitationValidationResult(
+        has_citations=has_citations,
+        all_cited_valid=all_cited_valid,
+        cited_ids=cited_ids,
+        valid_cited_ids=valid_cited_ids,
+        invalid_cited_ids=invalid_cited_ids,
+        available_ids=available_ids,
+        malformed_citations=malformed_citations,
+        missing_citations=missing_citations,
+        details=details,
+    )
+
+
+# =====================================================================
 # Groundedness check
 # =====================================================================
 
 def check_grounded(
     state: GraphState,
+    grounding_llm: Optional[Any] = None,
 ) -> GraphState:
     """
     Check whether the generated answer is supported by the retrieved
-    context.
+    context, integrating deterministic mechanical citation validation
+    with semantic claim support.
     """
 
-    documents = state["documents"]
+    documents = state.get("documents", [])
+    answer = state.get("generation", "")
+    scope = state.get("scope", "specific")
+
+    # 1. Deterministic mechanical citation validation
+    citation_res = validate_citations(
+        answer=answer,
+        documents=documents,
+        scope=scope,
+    )
+
+    print("\n" + "=" * 70)
+    print("CITATION INTEGRITY VALIDATION")
+    print("=" * 70)
+    print(f"Status: {citation_res.details}")
+    print(f"Cited IDs: {citation_res.cited_ids}")
+    print(f"Valid cited IDs: {citation_res.valid_cited_ids}")
+    print(f"Invalid cited IDs: {citation_res.invalid_cited_ids}")
+    print(f"Available message IDs in context: {citation_res.available_ids}")
+    if citation_res.malformed_citations:
+        print(f"Malformed citations: {citation_res.malformed_citations}")
+    print("=" * 70)
 
     if not documents:
-
         return {
             **state,
             "grounded": False,
+            "semantic_grounded": False,
+            "citation_validation": citation_res.to_dict(),
+            "valid_citation_ids": citation_res.valid_cited_ids,
+            "invalid_citation_ids": citation_res.invalid_cited_ids,
+            "available_citation_ids": citation_res.available_ids,
         }
 
     context = "\n\n---\n\n".join(
         document.page_content
         for document in documents
     )
-
-    answer = state["generation"]
 
     prompt = (
         "You are a strict factual groundedness checker for a WhatsApp "
@@ -1429,9 +1644,10 @@ def check_grounded(
         "Decision:"
     )
 
-    try:
+    active_llm = grounding_llm if grounding_llm is not None else llm
 
-        response = llm.invoke(
+    try:
+        response = active_llm.invoke(
             prompt
         ).content.strip().lower()
 
@@ -1439,17 +1655,37 @@ def check_grounded(
             f"[GROUNDEDNESS CHECK] Raw response: {response!r}"
         )
 
-        grounded = response.startswith(
+        semantic_grounded = response.startswith(
             "yes"
         )
 
     except Exception:
+        semantic_grounded = False
 
-        grounded = False
+    # 3. Final grounded calculation
+    has_invalid_citations = (
+        len(citation_res.invalid_cited_ids) > 0
+        or len(citation_res.malformed_citations) > 0
+    )
+
+    if has_invalid_citations:
+        if semantic_grounded:
+            print(
+                "[GROUNDEDNESS CHECK] Overriding semantic 'yes' to ungrounded "
+                f"due to invalid or malformed citations: {citation_res.invalid_cited_ids} {citation_res.malformed_citations}"
+            )
+        final_grounded = False
+    else:
+        final_grounded = semantic_grounded
 
     return {
         **state,
-        "grounded": grounded,
+        "grounded": final_grounded,
+        "semantic_grounded": semantic_grounded,
+        "citation_validation": citation_res.to_dict(),
+        "valid_citation_ids": citation_res.valid_cited_ids,
+        "invalid_citation_ids": citation_res.invalid_cited_ids,
+        "available_citation_ids": citation_res.available_ids,
     }
 
 
@@ -1667,11 +1903,16 @@ def ask(
         "generation": "",
         "rewrite_count": 0,
         "grounded": False,
+        "semantic_grounded": False,
         "df": df,
         "scope": "",
         "primary_intent": "",
         "secondary_intents": [],
         "query_spec": None,
+        "citation_validation": None,
+        "valid_citation_ids": [],
+        "invalid_citation_ids": [],
+        "available_citation_ids": [],
     }
 
     # Run the LangGraph pipeline
@@ -1694,6 +1935,14 @@ def ask(
         "scope": result["scope"],
 
         "query_spec": result.get("query_spec"),
+
+        "citation_validation": result.get("citation_validation"),
+
+        "valid_citation_ids": result.get("valid_citation_ids", []),
+
+        "invalid_citation_ids": result.get("invalid_citation_ids", []),
+
+        "available_citation_ids": result.get("available_citation_ids", []),
     }
 
 

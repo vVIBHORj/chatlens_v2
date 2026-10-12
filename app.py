@@ -355,6 +355,66 @@ def handle_upload(
             os.unlink(tmp_path)
 
 
+def get_citation_diagnostics(result: dict) -> dict:
+    """
+    Extract citation integrity diagnostic details safely from a pipeline result.
+    Handles absent or older result fields safely without crashing.
+    """
+    if not isinstance(result, dict):
+        return {
+            "is_grounded": False,
+            "has_invalid_citations": False,
+            "invalid_ids": [],
+            "malformed_refs": [],
+            "missing_citations": False,
+            "valid_ids": [],
+            "warning_message": None,
+        }
+
+    citation_val = result.get("citation_validation")
+    if not isinstance(citation_val, dict):
+        citation_val = {}
+
+    invalid_ids = list(result.get("invalid_citation_ids") or citation_val.get("invalid_cited_ids") or [])
+    malformed_refs = list(citation_val.get("malformed_citations") or [])
+    missing_cits = bool(citation_val.get("missing_citations", False))
+    is_broad = result.get("scope") == "broad"
+    valid_ids = list(result.get("valid_citation_ids") or citation_val.get("valid_cited_ids") or [])
+
+    has_invalid_citations = bool(invalid_ids or malformed_refs)
+
+    # An answer is only labeled verified if grounded is true AND there are no invalid citations
+    raw_grounded = bool(result.get("grounded", False))
+    is_grounded = raw_grounded and not has_invalid_citations
+
+    warning_message = None
+    if has_invalid_citations:
+        items = []
+        if invalid_ids:
+            items.append(f"**Invalid citation IDs:** {', '.join(f'[ID {cid}]' for cid in invalid_ids)}")
+        if malformed_refs:
+            items.append(f"**Malformed references:** {', '.join(str(r) for r in malformed_refs)}")
+        warning_message = (
+            "⚠️ **Citation Integrity Warning:** This answer contains citation IDs or references "
+            "not present in the evidence supplied to generation.\n\n"
+            + "\n\n".join(f"- {it}" for it in items)
+        )
+    elif not is_broad and missing_cits:
+        warning_message = (
+            "⚠️ **Missing Citations:** This specific retrieval answer does not include inline message citations `[ID <n>]`."
+        )
+
+    return {
+        "is_grounded": is_grounded,
+        "has_invalid_citations": has_invalid_citations,
+        "invalid_ids": invalid_ids,
+        "malformed_refs": malformed_refs,
+        "missing_citations": missing_cits if not is_broad else False,
+        "valid_ids": valid_ids,
+        "warning_message": warning_message,
+    }
+
+
 # ============================================================
 # PROCESS FILE
 # ============================================================
@@ -696,11 +756,13 @@ if st.session_state.df is not None:
 
             m1, m2, m3 = st.columns(3)
 
+            diag = get_citation_diagnostics(result)
+
             with m1:
 
                 scope_label = (
                     "Whole conversation"
-                    if result["scope"] == "broad"
+                    if result.get("scope") == "broad"
                     else "Retrieved excerpts"
                 )
 
@@ -711,16 +773,14 @@ if st.session_state.df is not None:
 
             with m2:
 
-                grounded = result["grounded"]
-
                 st.metric(
                     "Grounding",
-                    "Verified" if grounded else "Uncertain",
+                    "Verified" if diag["is_grounded"] else "Uncertain",
                 )
 
             with m3:
 
-                elapsed = st.session_state.answer_time
+                elapsed = st.session_state.get("answer_time", 0.0)
 
                 st.metric(
                     "⏱ Answer time",
@@ -731,18 +791,27 @@ if st.session_state.df is not None:
 
             st.caption(
                 f"⚡ The complete question-answer cycle took "
-                f"**{st.session_state.answer_time:.2f} seconds** "
+                f"**{st.session_state.get('answer_time', 0.0):.2f} seconds** "
                 f"including retrieval and local LLM generation."
             )
 
+            # Citation diagnostics warning
+            if diag["warning_message"]:
+                st.warning(diag["warning_message"])
+
             # Sources
 
+            sources = result.get("sources", [])
             with st.expander(
-                f"🔎 Sources used ({len(result['sources'])})"
+                f"🔎 Sources used ({len(sources)})"
             ):
+                if diag["valid_ids"]:
+                    st.caption(
+                        f"✓ Validated inline citations: {', '.join(f'[ID {cid}]' for cid in diag['valid_ids'])}"
+                    )
 
                 for i, source in enumerate(
-                    result["sources"],
+                    sources,
                     start=1
                 ):
 
@@ -752,7 +821,7 @@ if st.session_state.df is not None:
 
                     st.write(source)
 
-                    if i < len(result["sources"]):
+                    if i < len(sources):
                         st.divider()
 
         else:
