@@ -134,6 +134,14 @@ CONTEXT_BEFORE = 10
 
 CONTEXT_AFTER = 10
 
+SEMANTIC_CONTEXT_BEFORE = 3
+
+SEMANTIC_CONTEXT_AFTER = 1
+
+SEMANTIC_EXPANSION_MAX_WORDS = 6
+
+SEMANTIC_EXPANSION_MAX_CHARS = 35
+
 
 # =====================================================================
 # LLM
@@ -992,51 +1000,187 @@ def rewrite_query(
 # Expand relevant documents
 # =====================================================================
 
+# =====================================================================
+# Message body extraction & semantic expansion decision
+# =====================================================================
+
+def extract_message_body(text: str) -> str:
+    """
+    Extract the clean message text from a formatted transcript line or content.
+    Strips leading [ID ...] or [message_id=...], [timestamp], and 'Sender: ' prefixes.
+    """
+    if not text:
+        return ""
+    cleaned = text.strip()
+    cleaned = re.sub(
+        r"^\[(?:ID|message_id)\s*=?\s*\d+\]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^\[[^\]]+\]\s*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"^[^:\n]+:\s*",
+        "",
+        cleaned,
+    )
+    return cleaned.strip()
+
+
+def should_expand_semantic_anchor(document: Document) -> bool:
+    """
+    Determine whether a retrieved anchor message in semantic RAG needs
+    chronological context expansion.
+
+    Single message candidates that are short conversational replies or
+    elliptical fragments (e.g. 'Sub-level 4.', '9pm', 'Yes') lack standalone
+    topic context and require preceding messages to be interpreted.
+
+    Conversation chunks already contain multi-message dialogue and are not expanded.
+    Self-contained factual messages with complete sentence structure are preserved
+    as standalone anchors to avoid introducing conversational distractor noise.
+    """
+    metadata = document.metadata or {}
+    if metadata.get("source") == "conversation_chunk":
+        return False
+
+    message_id = metadata.get("message_id")
+    if message_id is None:
+        return False
+
+    body = extract_message_body(document.page_content)
+    if not body:
+        return False
+
+    words = body.split()
+    if len(words) <= SEMANTIC_EXPANSION_MAX_WORDS or len(body) <= SEMANTIC_EXPANSION_MAX_CHARS:
+        return True
+
+    return False
+
+
+# =====================================================================
+# Expand relevant documents
+# =====================================================================
+
 def expand_context(
     state: GraphState,
+    database_path: Optional[str] = None,
 ) -> GraphState:
     """
     Expand retrieved message anchors using chronological neighbors
     when appropriate.
 
-    Topic-synthesis semantic queries should preserve the retrieved
-    anchors without expanding every anchor, because broad topic
-    questions benefit from evidence across multiple retrieved points
-    rather than large amounts of surrounding conversational noise.
+    For semantic topic queries (primary_intent == 'semantic_rag'):
+    - Short conversational replies and elliptical fragments (e.g. 'Sub-level 4.', '9pm')
+      are selectively expanded with a bounded chronological window to recover
+      their conversational antecedents and enable accurate citation.
+    - Self-contained factual messages and multi-message conversation chunks
+      are preserved as standalone anchors without unnecessary surrounding noise.
+
+    For contextual queries (e.g. primary_intent == 'context'):
+    - Retrieved anchors are expanded with the standard CONTEXT_BEFORE / CONTEXT_AFTER window.
     """
 
     expanded_documents = []
-
     primary_intent = state.get("primary_intent")
+    db_path = database_path or state.get("database_path")
+
+    def format_rows(rows: List[Any]) -> List[str]:
+        lines = []
+        for row in rows:
+            timestamp = row["timestamp"]
+            try:
+                dt = datetime.fromisoformat(timestamp)
+                timestamp_text = dt.strftime("%d/%m/%Y %I:%M %p")
+            except Exception:
+                timestamp_text = timestamp or ""
+            sender = row["sender"] or ""
+            message = row["message"] or ""
+            lines.append(
+                f"[ID {row['id']}] [{timestamp_text}] {sender}: {message}"
+            )
+        return lines
+
+    def make_expanded_doc(document: Document, rows: List[Any], before: int, after: int) -> Document:
+        lines = format_rows(rows)
+        anchor_text = document.page_content
+        expanded_transcript = (
+            "[RETRIEVED ANCHOR]\n"
+            f"{anchor_text}\n\n"
+            "[CHRONOLOGICAL CONTEXT]\n"
+            + "\n".join(lines)
+        )
+        new_metadata = dict(document.metadata)
+        new_metadata["context_expanded"] = True
+        new_metadata["context_messages_before"] = before
+        new_metadata["context_messages_after"] = after
+        new_metadata["context_method"] = "chronological"
+        new_metadata["context_start_message_id"] = rows[0]["id"]
+        new_metadata["context_end_message_id"] = rows[-1]["id"]
+        return Document(
+            page_content=expanded_transcript,
+            metadata=new_metadata,
+        )
+
+    def make_unexpanded_doc(document: Document) -> Document:
+        new_metadata = dict(document.metadata)
+        new_metadata["context_expanded"] = False
+        new_metadata["context_method"] = "retrieved_anchor"
+        anchor_text = document.page_content
+        if not anchor_text.startswith("[RETRIEVED ANCHOR]"):
+            page_content = f"[RETRIEVED ANCHOR]\n{anchor_text}"
+        else:
+            page_content = anchor_text
+        return Document(
+            page_content=page_content,
+            metadata=new_metadata,
+        )
 
     # -------------------------------------------------------------
     # Semantic topic questions
     # -------------------------------------------------------------
 
     if primary_intent == "semantic_rag":
+        expanded_count = 0
+        unexpanded_count = 0
 
-        for document in state["documents"][:20]:
+        for document in state.get("documents", [])[:20]:
+            if should_expand_semantic_anchor(document):
+                message_id = document.metadata.get("message_id")
+                try:
+                    kwargs = {
+                        "before": SEMANTIC_CONTEXT_BEFORE,
+                        "after": SEMANTIC_CONTEXT_AFTER,
+                    }
+                    if db_path is not None:
+                        kwargs["database_path"] = db_path
+                    rows = get_chronological_context(int(message_id), **kwargs)
+                except Exception as e:
+                    print(
+                        f"[CONTEXT EXPANSION ERROR] Failed to fetch chronological context for message_id={message_id}: {e}"
+                    )
+                    rows = []
 
-            new_metadata = dict(
-                document.metadata
-            )
-
-            new_metadata["context_expanded"] = False
-            new_metadata["context_method"] = "retrieved_anchor"
-
-            expanded_documents.append(
-                Document(
-                    page_content=(
-                        "[RETRIEVED ANCHOR]\n"
-                        f"{document.page_content}"
-                    ),
-                    metadata=new_metadata,
-                )
-            )
+                if rows:
+                    expanded_documents.append(
+                        make_expanded_doc(document, rows, SEMANTIC_CONTEXT_BEFORE, SEMANTIC_CONTEXT_AFTER)
+                    )
+                    expanded_count += 1
+                else:
+                    expanded_documents.append(make_unexpanded_doc(document))
+                    unexpanded_count += 1
+            else:
+                expanded_documents.append(make_unexpanded_doc(document))
+                unexpanded_count += 1
 
         print(
-            f"\nContext expansion skipped for semantic topic query: "
-            f"{len(expanded_documents)} retrieved documents preserved."
+            f"\nContext expansion for semantic query: {expanded_count} expanded, "
+            f"{unexpanded_count} preserved as standalone anchors."
         )
 
         return {
@@ -1045,153 +1189,51 @@ def expand_context(
         }
 
     # -------------------------------------------------------------
-    # Other query types
+    # Other query types (e.g. CONTEXT)
     # -------------------------------------------------------------
 
-    for document in state["documents"][:10]:
+    for document in state.get("documents", [])[:10]:
+        message_id = document.metadata.get("message_id")
+        source = document.metadata.get("source")
 
-        message_id = document.metadata.get(
-            "message_id"
-        )
+        rows = []
+        try:
+            kwargs = {
+                "before": CONTEXT_BEFORE,
+                "after": CONTEXT_AFTER,
+            }
+            if db_path is not None:
+                kwargs["database_path"] = db_path
 
-        # ---------------------------------------------------------
-        # Conversation chunk
-        # ---------------------------------------------------------
-
-        if document.metadata.get("source") == "conversation_chunk":
-
-            start_id = document.metadata.get(
-                "start_message_id"
+            if source == "conversation_chunk":
+                start_id = document.metadata.get("start_message_id")
+                end_id = document.metadata.get("end_message_id")
+                if start_id is not None and end_id is not None:
+                    rows = get_chronological_context(int(start_id), **kwargs)
+            elif message_id is not None:
+                rows = get_chronological_context(int(message_id), **kwargs)
+        except Exception as e:
+            print(
+                f"[CONTEXT EXPANSION ERROR] Failed to fetch context for document: {e}"
             )
+            rows = []
 
-            end_id = document.metadata.get(
-                "end_message_id"
+        if rows:
+            expanded_documents.append(
+                make_expanded_doc(document, rows, CONTEXT_BEFORE, CONTEXT_AFTER)
             )
-
-            if start_id is None or end_id is None:
-                expanded_documents.append(document)
-                continue
-
-            rows = get_chronological_context(
-                int(start_id),
-                before=CONTEXT_BEFORE,
-                after=CONTEXT_AFTER,
-            )
-
-        # ---------------------------------------------------------
-        # Hybrid message result
-        # ---------------------------------------------------------
-
-        elif message_id is not None:
-
-            rows = get_chronological_context(
-                int(message_id),
-                before=CONTEXT_BEFORE,
-                after=CONTEXT_AFTER,
-            )
-
         else:
-
-            expanded_documents.append(document)
-            continue
-
-        if not rows:
-            expanded_documents.append(document)
-            continue
-
-        # ---------------------------------------------------------
-        # Format chronological transcript
-        # ---------------------------------------------------------
-
-        lines = []
-
-        for row in rows:
-
-            timestamp = row["timestamp"]
-
-            try:
-                dt = datetime.fromisoformat(
-                    timestamp
-                )
-
-                timestamp_text = dt.strftime(
-                    "%d/%m/%Y %I:%M %p"
-                )
-
-            except Exception:
-
-                timestamp_text = (
-                    timestamp or ""
-                )
-
-            sender = row["sender"] or ""
-            message = row["message"] or ""
-
-            lines.append(
-                f"[ID {row['id']}] "
-                f"[{timestamp_text}] "
-                f"{sender}: "
-                f"{message}"
-            )
-
-        anchor_text = document.page_content
-
-        expanded_transcript = (
-            "[RETRIEVED ANCHOR]\n"
-            f"{anchor_text}\n\n"
-            "[CHRONOLOGICAL CONTEXT]\n"
-            + "\n".join(lines)
-        )
-
-        # ---------------------------------------------------------
-        # Preserve retrieval metadata
-        # ---------------------------------------------------------
-
-        new_metadata = dict(
-            document.metadata
-        )
-
-        new_metadata[
-            "context_expanded"
-        ] = True
-
-        new_metadata[
-            "context_messages_before"
-        ] = CONTEXT_BEFORE
-
-        new_metadata[
-            "context_messages_after"
-        ] = CONTEXT_AFTER
-
-        new_metadata[
-            "context_method"
-        ] = "chronological"
-
-        new_metadata[
-            "context_start_message_id"
-        ] = rows[0]["id"]
-
-        new_metadata[
-            "context_end_message_id"
-        ] = rows[-1]["id"]
-
-        expanded_documents.append(
-            Document(
-                page_content=expanded_transcript,
-                metadata=new_metadata,
-            )
-        )
+            expanded_documents.append(make_unexpanded_doc(document))
 
     print(
-        f"\nContext expansion: "
-        f"{len(expanded_documents)} "
-        f"documents expanded chronologically."
+        f"\nContext expansion: {len(expanded_documents)} documents processed."
     )
 
     return {
         **state,
         "documents": expanded_documents,
     }
+
 
 
 # =====================================================================

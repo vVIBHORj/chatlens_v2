@@ -725,6 +725,23 @@ def detect_secondary_intents(query: str) -> List[QueryIntent]:
     
     
 
+def _is_discussion_inquiry(text: str) -> bool:
+    """
+    Identify inquiries asking what participants in the chat discussed, mentioned,
+    said, compared, or decided. These are factual retrieval requests about the
+    conversation archive, not requests for the assistant to perform whole-chat
+    analytical aggregation or profiling.
+    """
+    patterns = [
+        r"\b(?:did|what did|where did|who did|how did)\s+.*\b(?:discuss|mention|say|tell|compare|decide|write|agree)\b",
+        r"\bwhere in\b.*\b(?:compare|mention|discuss|find)\b",
+        r"\bwhat\s+(?:was|were)\s+decided\b",
+        r"\bwhat\s+happened\b",
+        r"\bwhat\s+(?:is|was)\s+the\s+score\b",
+    ]
+    return any(re.search(p, text) for p in patterns)
+
+
 def detect_query_intent(query: str) -> QueryIntent:
     """
     Detect the broad analytical intent of a user query.
@@ -757,20 +774,30 @@ def detect_query_intent(query: str) -> QueryIntent:
         return QueryIntent.CONTEXT
 
     # --------------------------------------------------------
+    # Discussion / message-content inquiries
+    # Questions asking what participants discussed, said, compared,
+    # or decided are factual retrieval queries seeking archive evidence.
+    # --------------------------------------------------------
+
+    if _is_discussion_inquiry(text):
+        return QueryIntent.SEMANTIC_RAG
+
+    # --------------------------------------------------------
     # Comparison questions
     # --------------------------------------------------------
 
     comparison_patterns = [
-        r"\bcompare\b",
-        r"\bcomparison\b",
-        r"\bbetween .* and\b",
-        r"\bversus\b",
-        r"\bvs\b",
-        r"\bmore than\b",
-        r"\bless than\b",
-        r"\bincreased\b",
-        r"\bdecreased\b",
+        r"^\s*compare\b",
+        r"\bcan you compare\b",
+        r"\bplease compare\b",
+        r"\bcompare\s+(?:who|activity|messaging|communication|messages|volume|sentiment|response|periods)\b",
+        r"\bcomparison\s+of\s+(?:our|the)?\s*(?:chat|conversation|activity|messaging|communication|messages|periods|trends?)\b",
+        r"\btopics?\s+have\s+(?:increased|decreased)\b",
+        r"\bincreased\s+over\s+time\b",
+        r"\bdecreased\s+over\s+time\b",
         r"\bchange between\b",
+        r"\b(?:activity|communication|messaging|messages|sentiment|volume|trends?)\b.*\bbetween\b.*\band\b",
+        r"\bdifference\b.*\bbetween\b.*\band\b.*\bin\s+(?:activity|communication|messaging|messages|sentiment)\b",
     ]
 
     if any(
@@ -814,8 +841,12 @@ def detect_query_intent(query: str) -> QueryIntent:
         r"\bwhen did\b",
         r"\bwhat time\b",
         r"\bday of the week\b",
-        r"\bfrequency\b",
-        r"\bperiods\b",
+        r"\b(?:message|messaging|chat|chatting|text|texting|conversation|communication|activity)\s+frequency\b",
+        r"\bfrequency\s+of\s+(?:messages?|chats?|texts?|conversation|communication|activity)\b",
+        r"\bfrequency\s+(?:over|across)\s+time\b",
+        r"\bhow\s+frequently\s+do\s+(?:we|they)\s+(?:chat|talk|message|text)\b",
+        r"\b(?:activity|trends?|patterns?|messaging|communication|volume|chatting)\s+(?:across|over|in|between)\s+(?:different\s+)?periods\b",
+        r"\bacross\s+(?:different\s+)?periods\b",
         r"\bhow has .* changed\b",
         r"\bbetween january\b",
         r"\bbetween february\b",
