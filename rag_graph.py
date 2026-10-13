@@ -180,6 +180,7 @@ class GraphState(TypedDict, total=False):
     valid_citation_ids: Optional[List[int]]
     invalid_citation_ids: Optional[List[int]]
     available_citation_ids: Optional[List[int]]
+    grader_status: Optional[str]
 
 # =====================================================================
 # Scope classification
@@ -711,13 +712,15 @@ def format_candidate_for_grader(idx: int, document: Document) -> str:
 def parse_grader_response(
     raw_text: str,
     candidate_indices: List[int],
-) -> Dict[int, Tuple[str, str]]:
+) -> Dict[int, Tuple[str, str, str]]:
     """
     Parse and validate structured grader JSON output.
-    Fails open by returning ('uncertain', ...) for missing, malformed, or invalid entries.
+    Returns mapping from candidate index to (decision, reason, grader_status)
+    where grader_status is 'success' or 'failure'.
+    Fails open by returning ('uncertain', 'parsing_fallback', 'failure') for missing or unparseable entries.
     """
-    results: Dict[int, Tuple[str, str]] = {
-        idx: ("uncertain", "parsing_fallback") for idx in candidate_indices
+    results: Dict[int, Tuple[str, str, str]] = {
+        idx: ("uncertain", "parsing_fallback", "failure") for idx in candidate_indices
     }
 
     if not raw_text or not raw_text.strip():
@@ -770,7 +773,7 @@ def parse_grader_response(
             reason = str(item.get("reason", "")).strip() or "No reason provided"
 
             if cand_idx in results:
-                results[cand_idx] = (decision, reason)
+                results[cand_idx] = (decision, reason, "success")
     else:
         # Regex fallback for malformed JSON containing candidate objects
         pattern = re.compile(
@@ -783,7 +786,7 @@ def parse_grader_response(
                 dec_val = match.group(2).strip().lower()
                 decision = dec_val if dec_val in ("relevant", "irrelevant", "uncertain") else "uncertain"
                 if cand_idx in results:
-                    results[cand_idx] = (decision, "regex_extracted")
+                    results[cand_idx] = (decision, "regex_extracted", "success")
             except Exception:
                 pass
 
@@ -794,10 +797,10 @@ def grade_candidate_batch(
     question: str,
     batch_docs: List[Document],
     grader_llm: Optional[Any] = None,
-) -> List[Tuple[Document, str, str]]:
+) -> List[Tuple[Document, str, str, str]]:
     """
     Grade a bounded batch of candidates using LLM in a single structured prompt.
-    Returns list of tuples: (document, decision, reason).
+    Returns list of tuples: (document, decision, reason, grader_status).
     """
     if not batch_docs:
         return []
@@ -820,14 +823,16 @@ def grade_candidate_batch(
         parsed_decisions = parse_grader_response(raw_output, indices)
     except Exception as e:
         parsed_decisions = {
-            idx: ("uncertain", f"grader_exception: {e}")
+            idx: ("uncertain", f"grader_exception: {e}", "failure")
             for idx in indices
         }
 
     graded_batch = []
     for idx, doc in zip(indices, batch_docs):
-        decision, reason = parsed_decisions.get(idx, ("uncertain", "missing_index"))
-        graded_batch.append((doc, decision, reason))
+        decision, reason, grader_status = parsed_decisions.get(
+            idx, ("uncertain", "missing_index", "failure")
+        )
+        graded_batch.append((doc, decision, reason, grader_status))
 
     return graded_batch
 
@@ -847,6 +852,7 @@ def grade_documents(
     - Retains relevant and uncertain candidates.
     - Removes only candidates confidently determined to be irrelevant.
     - Fails open on parsing errors, timeouts, or LLM exceptions.
+    - Distinguishes grader failure from successful uncertain decisions in metadata and state.
     - Preserves message candidates and transcript chunks as distinct evidence types.
     """
     documents = state.get("documents", [])
@@ -855,6 +861,7 @@ def grade_documents(
         return {
             **state,
             "documents": [],
+            "grader_status": "success",
         }
 
     question = state.get("original_question") or state.get("question", "")
@@ -865,16 +872,25 @@ def grade_documents(
 
     kept_documents: List[Document] = []
     rejected_count = 0
+    any_failure = False
+    any_success = False
 
     # Process in bounded batches
     for batch_start in range(0, len(documents), GRADE_BATCH_SIZE):
         batch = documents[batch_start : batch_start + GRADE_BATCH_SIZE]
         graded_results = grade_candidate_batch(question, batch, grader_llm=grader_llm)
 
-        for doc, decision, reason in graded_results:
+        for doc, decision, reason, grader_status in graded_results:
+            if grader_status == "failure":
+                any_failure = True
+            else:
+                any_success = True
+
             new_metadata = dict(doc.metadata)
             new_metadata["relevance_decision"] = decision
             new_metadata["relevance_reason"] = reason
+            new_metadata["grader_status"] = grader_status
+            new_metadata["grader_failure"] = (grader_status == "failure")
 
             updated_doc = Document(
                 page_content=doc.page_content,
@@ -892,19 +908,30 @@ def grade_documents(
                 kept_documents.append(updated_doc)
                 source = new_metadata.get("source", "unknown")
                 item_id = new_metadata.get("message_id") or new_metadata.get("chunk_id") or "?"
+                status_note = f" (grader_{grader_status})" if grader_status == "failure" else ""
                 print(
-                    f"  [{decision.upper()}] {source} ID={item_id}: {reason}"
+                    f"  [{decision.upper()}{status_note}] {source} ID={item_id}: {reason}"
                 )
+
+    if any_failure and any_success:
+        overall_grader_status = "degraded"
+    elif any_failure:
+        overall_grader_status = "failed"
+    else:
+        overall_grader_status = "success"
 
     print(
         f"Relevance grading summary: kept {len(kept_documents)}/"
-        f"{len(documents)} candidates ({rejected_count} rejected as irrelevant)."
+        f"{len(documents)} candidates ({rejected_count} rejected as irrelevant, "
+        f"status={overall_grader_status})."
     )
 
     return {
         **state,
         "documents": kept_documents,
+        "grader_status": overall_grader_status,
     }
+
 
 
 # =====================================================================
@@ -1955,6 +1982,7 @@ def ask(
         "valid_citation_ids": [],
         "invalid_citation_ids": [],
         "available_citation_ids": [],
+        "grader_status": None,
     }
 
     # Run the LangGraph pipeline
@@ -1985,6 +2013,8 @@ def ask(
         "invalid_citation_ids": result.get("invalid_citation_ids", []),
 
         "available_citation_ids": result.get("available_citation_ids", []),
+
+        "grader_status": result.get("grader_status"),
     }
 
 
