@@ -478,3 +478,176 @@ def test_citation_validation_continues_rejecting_invented_id():
     assert result["grounded"] is False
     assert result["invalid_citation_ids"] == [12]
 
+
+# =====================================================================
+# 15. Generation prompt abstention forbids dummy citations and contains no placeholder examples
+# =====================================================================
+
+def test_generation_prompt_abstention_forbids_dummy_citation_and_no_placeholder_examples():
+    doc0 = Document(
+        page_content="[ID 0] Alice: The weather is sunny today.",
+        metadata={"source": "hybrid_search", "message_id": 0},
+    )
+    state = make_test_state(answer="", documents=[doc0])
+    state["original_question"] = "What is the secret passcode?"
+
+    prompt = build_generation_prompt(state, documents=[doc0])
+
+    # Must contain clear abstention instructions
+    assert "information was not found" in prompt
+    assert "In an abstention, do NOT output any citation brackets" in prompt
+    assert "include no citation brackets" in prompt
+
+    # Must NOT contain instructional placeholder numbers that LLMs copy
+    assert "[ID 123]" not in prompt
+    assert "[ID 12]" not in prompt
+    assert "[ID 34]" not in prompt
+
+
+# =====================================================================
+# 16. Semantic claim grounding rejects claim misattributed to another context ID
+# =====================================================================
+
+def test_claim_attribution_semantic_grounding_rejects_misattributed_id():
+    doc0 = Document(
+        page_content="[ID 0] Vance: The shield operates at 450 GHz.",
+        metadata={"source": "hybrid_search", "message_id": 0},
+    )
+    doc1 = Document(
+        page_content="[ID 1] Thorne: Vessel departure at dawn.",
+        metadata={"source": "hybrid_search", "message_id": 1},
+    )
+
+    # Answer asserts the shield frequency but attributes it to [ID 1] (Thorne's departure message)
+    misattributed_answer = "[ID 1] The primary deflector shield operates at 450 GHz."
+
+    # 1. Mechanical validation sees that ID 1 is present in context
+    val = validate_citations(misattributed_answer, [doc0, doc1])
+    assert val.all_cited_valid is True
+    assert val.valid_cited_ids == [1]
+    assert val.invalid_cited_ids == []
+
+    # 2. Semantic grounding checker evaluates whether message 1 actually supports the claim
+    # Simulated semantic grader checking claim against cited ID 1 and finding no support -> 'no'
+    state = make_test_state(answer=misattributed_answer, documents=[doc0, doc1])
+    mock_semantic_llm = make_mock_llm("no")
+    grounded_result = check_grounded(state, grounding_llm=mock_semantic_llm)
+
+    assert grounded_result["semantic_grounded"] is False
+    assert grounded_result["grounded"] is False
+
+
+# =====================================================================
+# 17. Generation prompt profile query preserves no-citation policy
+# =====================================================================
+
+def test_generation_prompt_profile_query_preserves_no_citation_policy():
+    profile_doc = Document(
+        page_content="Total messages: 450. Most active participant: Alice (300 messages).",
+        metadata={"source": "whole_conversation_profile"},
+    )
+    state = make_test_state(answer="", documents=[profile_doc], scope="broad")
+    state["original_question"] = "Who sends the most messages?"
+
+    prompt = build_generation_prompt(state, documents=[profile_doc])
+
+    assert "statistical profile without individual message IDs" in prompt
+    assert "Do not output message ID citations" in prompt
+    assert extract_available_message_ids([profile_doc]) == set()
+
+
+# =====================================================================
+# 18. Directly supported factual claim with correct citation verifies grounded
+# =====================================================================
+
+def test_groundedness_directly_supported_fact_with_citation():
+    doc0 = Document(
+        page_content="[ID 0] Commander Vance: The primary deflector shield operates at a frequency of 450 gigahertz.",
+        metadata={"source": "hybrid_search", "message_id": 0},
+    )
+    supported_answer = "The primary deflector shield operates at a frequency of 450 gigahertz, as stated in [ID 0]."
+    state = make_test_state(answer=supported_answer, documents=[doc0])
+
+    mock_llm = make_mock_llm("The claim is directly stated in message [ID 0].\nDecision: yes")
+    result = check_grounded(state, grounding_llm=mock_llm)
+
+    assert result["grounded"] is True
+    assert result["semantic_grounded"] is True
+    assert result["valid_citation_ids"] == [0]
+    assert result["invalid_citation_ids"] == []
+
+
+# =====================================================================
+# 19. Semantically valid paraphrase with correct citation verifies grounded
+# =====================================================================
+
+def test_groundedness_semantic_paraphrase_with_citation():
+    doc1 = Document(
+        page_content="[ID 1] Dr. Thorne: The vessel's departure from lunar orbit commences at dawn tomorrow.",
+        metadata={"source": "hybrid_search", "message_id": 1},
+    )
+    paraphrased_answer = "The spaceship leaves the moon at dawn tomorrow, as stated in [ID 1]."
+    state = make_test_state(answer=paraphrased_answer, documents=[doc1])
+
+    mock_llm = make_mock_llm("The statement is a direct paraphrase of vessel departure from lunar orbit in [ID 1].\nDecision: yes")
+    result = check_grounded(state, grounding_llm=mock_llm)
+
+    assert result["grounded"] is True
+    assert result["semantic_grounded"] is True
+    assert result["valid_citation_ids"] == [1]
+    assert result["invalid_citation_ids"] == []
+
+
+# =====================================================================
+# 20. Short contextual reply supported by chronological context verifies grounded
+# =====================================================================
+
+def test_groundedness_short_reply_supported_by_chronological_context():
+    doc_expanded = Document(
+        page_content=(
+            "[ID 3] Marcus: Storage Pod 7.\n\n"
+            "[CHRONOLOGICAL CONTEXT]\n"
+            "[ID 2] Elena: Where did the engineering team store the secondary plasma conduits?\n"
+            "[ID 3] Marcus: Storage Pod 7."
+        ),
+        metadata={"source": "hybrid_search", "message_id": 3, "context_expanded": True},
+    )
+    short_reply_answer = "Storage Pod 7 is where the engineering team stored the secondary plasma conduits [ID 3]."
+    state = make_test_state(answer=short_reply_answer, documents=[doc_expanded])
+
+    mock_llm = make_mock_llm("Marcus's reply 'Storage Pod 7' directly answers Elena's question in chronological context.\nDecision: yes")
+    result = check_grounded(state, grounding_llm=mock_llm)
+
+    assert result["grounded"] is True
+    assert result["semantic_grounded"] is True
+    assert result["valid_citation_ids"] == [3]
+
+
+# =====================================================================
+# 21. Grader failure preserves downstream citation and grounding checks
+# =====================================================================
+
+def test_grader_failure_preserves_citation_and_grounding_checks():
+    doc0 = Document(
+        page_content="[ID 0] Vance: Shield frequency is 450 GHz.",
+        metadata={"source": "hybrid_search", "message_id": 0, "grader_status": "failure"},
+    )
+    # 1. When cited citation is valid and claim is supported
+    valid_answer = "The shield operates at 450 GHz [ID 0]."
+    state_valid = make_test_state(answer=valid_answer, documents=[doc0])
+    state_valid["grader_status"] = "failed"
+
+    mock_llm_yes = make_mock_llm("Assessment: Claim is directly supported by message 0.\nDecision: yes")
+    res_valid = check_grounded(state_valid, grounding_llm=mock_llm_yes)
+    assert res_valid["grounded"] is True
+    assert res_valid["valid_citation_ids"] == [0]
+
+    # 2. When cited citation is invalid despite grader failure, citation check still forces ungrounded
+    invalid_answer = "The shield operates at 450 GHz [ID 99]."
+    state_invalid = make_test_state(answer=invalid_answer, documents=[doc0])
+    state_invalid["grader_status"] = "failed"
+
+    res_invalid = check_grounded(state_invalid, grounding_llm=mock_llm_yes)
+    assert res_invalid["grounded"] is False
+    assert res_invalid["invalid_citation_ids"] == [99]
+

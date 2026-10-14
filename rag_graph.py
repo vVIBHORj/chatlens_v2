@@ -1358,8 +1358,9 @@ def build_generation_prompt(
             "rather than a small retrieved excerpt."
         )
         citation_rule = (
-            "7. The context below is a statistical profile without message IDs. "
-            "Do not output message ID citations."
+            "7. STATISTICAL PROFILE CONTEXT:\n"
+            "   - The context below is a statistical profile without individual message IDs. "
+            "Do not output message ID citations or bracketed numbers."
         )
         citation_reminder = "Do not output message ID citations."
     else:
@@ -1373,34 +1374,40 @@ def build_generation_prompt(
         if permitted_ids:
             ids_str = ", ".join(str(mid) for mid in permitted_ids)
             citation_rule = (
-                "7. CITATION INTEGRITY & EXPLICIT ID RESTRICTIONS:\n"
-                "   - Cite ONLY message IDs explicitly present in the supplied evidence. "
-                "Never invent, infer, or extrapolate a message ID.\n"
-                f"   - Permitted citation IDs in this context: [{ids_str}]. "
-                "Any citation outside this permitted list is strictly invalid.\n"
-                "   - Cite the specific message IDs supporting each factual claim using INLINE brackets "
-                "placed immediately after the specific claim (e.g., 'An inquiry was made about X [ID 12], "
-                "and Y was stored in Pod 7 [ID 34]').\n"
-                "   - Cite ONLY the smallest relevant set of message IDs directly supporting each claim. "
-                "NEVER list or clump message IDs at the beginning or end of the answer.\n"
-                "   - If the evidence does not support an answer, state that the information was not found "
-                "or is insufficient instead of fabricating a citation."
+                "7. CITATION INTEGRITY & PRECISE EVIDENCE ATTRIBUTION:\n"
+                "   - Strict Claim-to-Message Attribution: Cite a message ID ONLY if that specific message's own text "
+                "directly contains and supports the factual claim. Do NOT cite a message merely because it appears in the "
+                "same conversation chunk, adjacent context, or permitted list. Verify that the message ID attached to the "
+                "specific statement directly matches what you are citing.\n"
+                "   - Permitted IDs Only: Cite ONLY message IDs explicitly present in the supplied evidence. "
+                "Never invent, infer, or extrapolate a message ID. "
+                f"Permitted citation IDs in this context: [{ids_str}]. Any citation outside this permitted list is strictly invalid.\n"
+                "   - Inline Placement & Syntax: Place each citation in inline brackets immediately after the specific factual claim it supports. "
+                "Every citation MUST be enclosed in square brackets formatted as [ID <number>], for example [ID 0]. "
+                "Always include the letters 'ID ' before the number inside brackets (do not write [0]; always write [ID 0]). "
+                "Cite ONLY the smallest relevant set of message IDs directly supporting each claim. "
+                "NEVER list, clump, or prefix message IDs at the beginning of the answer or before a sentence.\n"
+                "   - Explicit Abstention Without Citations: If the supplied evidence does not contain information to answer the question, "
+                "respond clearly in natural language and state that the information was not found in the conversation. "
+                "In an abstention, do NOT output any citation brackets, message IDs, or placeholder citations."
             )
             citation_reminder = (
-                f"Cite ONLY permitted message IDs from [{ids_str}] that directly support your claims. "
-                "Never invent, infer, or extrapolate message IDs. If the evidence does not support an answer, "
-                "state that the information was not found instead of fabricating a citation."
+                f"Cite ONLY the exact message ID whose text directly supports each claim, chosen strictly from [{ids_str}]. "
+                "Format every citation inside brackets as [ID <number>] placed directly after the claim it supports. "
+                "Verify the message ID belongs to the actual supporting statement, not an adjacent message. "
+                "Never start your answer with an ID. "
+                "If the evidence does not contain the answer, state that the information was not found in a natural sentence and include no citation brackets."
             )
         else:
             citation_rule = (
-                "7. CITATION INTEGRITY & EXPLICIT ID RESTRICTIONS:\n"
-                "   - No individual message IDs are present in the supplied evidence. Do not output any message ID citations.\n"
+                "7. CITATION INTEGRITY & PRECISE EVIDENCE ATTRIBUTION:\n"
+                "   - No individual message IDs are present in the supplied evidence. Do not output any message citations.\n"
                 "   - If the evidence does not support an answer, state that the information was not found "
-                "instead of fabricating a citation."
+                "without adding any citation brackets or placeholders."
             )
             citation_reminder = (
                 "No message IDs are present in the evidence; do not cite any message IDs. "
-                "If the evidence does not support an answer, state that the information was not found."
+                "If the evidence does not support an answer, state that the information was not found without any citation brackets."
             )
 
     prompt = (
@@ -1461,8 +1468,9 @@ def build_generation_prompt(
         "USER QUESTION:\n"
         f"{question}\n\n"
 
-        f"Remember: Write a natural 1–3 sentence assistant summary with INLINE [ID 123] citations placed immediately "
-        f"after each claim. Never list IDs at the beginning. Summarize only supported, relevant points. {citation_reminder}\n\n"
+        f"Remember: Write a natural 1–3 sentence assistant summary. Place inline citations formatted as [ID <number>] directly "
+        f"after each supported factual claim (using the actual supporting message ID). Never list IDs at the beginning. "
+        f"Summarize only supported, relevant points. {citation_reminder}\n\n"
 
         "ANSWER:"
     )
@@ -1713,50 +1721,20 @@ def check_grounded(
 
     prompt = (
         "You are a strict factual groundedness checker for a WhatsApp "
-        "conversation analysis system.\n\n"
+        "conversation analysis system.\n"
+        "Determine whether the substantive claims and citations in the ANSWER are supported by the supplied CONTEXT.\n\n"
 
-        "The ANSWER below is an AI assistant's factual summary of the archived "
-        "conversation (not a reply to a WhatsApp message). Your job is to determine "
-        "whether EVERY substantive claim in the ANSWER is directly supported by the "
-        "supplied CONTEXT.\n\n"
-
-        "Rules:\n"
-        "1. Check the answer claim-by-claim, not just whether the general "
-        "topic appears in the context.\n\n"
-
-        "2. A claim is supported only if the context explicitly states it "
-        "or it is an extremely direct paraphrase of what the context says.\n\n"
-
-        "3. Do NOT treat semantic similarity as factual evidence.\n\n"
-
-        "4. Do NOT infer actions, intentions, plans, relationships, "
-        "participants, or events that are not explicitly stated.\n\n"
-
-        "5. A message mentioning a sport does not prove that someone "
-        "played that sport.\n\n"
-
-        "6. A message mentioning a person does not prove that the person "
-        "participated in the event being discussed.\n\n"
-
-        "7. A message about a possibility or question does not prove that "
-        "the event actually happened.\n\n"
-
-        "8. If even ONE substantive claim in the answer is unsupported, "
-        "return 'no'.\n\n"
-
-        "9. Ignore minor wording differences, grammar mistakes, and "
-        "harmless paraphrasing when checking factual support.\n\n"
-
-        "Examples:\n"
-        "- Context: 'Tennis ni hai?' -> 'They played tennis' = no.\n"
-        "- Context: 'Football ground mein tha' -> 'They played football' = no.\n"
-        "- Context: 'Tum konsi sports loge?' -> 'Sports were discussed' = yes.\n"
-        "- Context: 'Tennis ball leke aaiyo' -> 'They discussed tennis' = yes.\n"
-        "- Context: 'Khelo to bata dena' -> 'They played together' = no.\n\n"
-
-        "Answer with exactly one word:\n"
-        "'yes' = EVERY substantive claim in the answer is supported\n"
-        "'no' = AT LEAST ONE substantive claim is unsupported\n\n"
+        "Evaluation Guidelines:\n"
+        "1. Supported Claims: A claim is supported if the context explicitly states it, "
+        "or if it is a direct paraphrase of facts stated in the context (e.g., 'vessel departure from lunar orbit' "
+        "supports 'spaceship leaves the moon').\n"
+        "2. Chronological Context: Questions and adjacent messages in context establish what short replies refer to.\n"
+        "3. Unsupported Claims: If the answer asserts events, numbers, participants, or actions that are contradicted "
+        "by context or not mentioned, mark 'no'. Do not infer completed actions from mere venue or topic mentions.\n"
+        "4. Citation Attribution: When the answer cites [ID X], verify that the message labelled [ID X] in context "
+        "actually contains or directly supports that claim. If the fact is in a different message, mark 'no'.\n"
+        "5. Explicit Abstentions: If the answer states that the requested information was not found in the conversation, "
+        "mark 'yes' if the context indeed lacks that information.\n\n"
 
         f"CONTEXT:\n"
         f"{context}\n\n"
@@ -1764,23 +1742,26 @@ def check_grounded(
         f"ANSWER:\n"
         f"{answer}\n\n"
 
-        "Decision:"
+        "Assess each substantive claim and citation against the context in 1-2 sentences, then state your final decision as exactly 'Decision: yes' or 'Decision: no'.\n"
+        "Assessment:"
     )
 
     active_llm = grounding_llm if grounding_llm is not None else llm
 
     try:
-        response = active_llm.invoke(
-            prompt
-        ).content.strip().lower()
+        raw_response = active_llm.invoke(prompt)
+        text = raw_response.content.strip() if hasattr(raw_response, "content") else str(raw_response).strip()
 
         print(
-            f"[GROUNDEDNESS CHECK] Raw response: {response!r}"
+            f"[GROUNDEDNESS CHECK] Raw response:\n{text}"
         )
 
-        semantic_grounded = response.startswith(
-            "yes"
-        )
+        decision_match = re.search(r"decision\s*:\s*(yes|no)", text, re.IGNORECASE)
+        if decision_match:
+            semantic_grounded = (decision_match.group(1).lower() == "yes")
+        else:
+            cleaned_first = text.strip().lower()
+            semantic_grounded = cleaned_first.startswith("yes") or "decision: yes" in cleaned_first
 
     except Exception:
         semantic_grounded = False

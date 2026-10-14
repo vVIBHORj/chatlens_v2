@@ -88,6 +88,11 @@ class IsolatedSmokeEnvironment:
         self.orig_vec_load_chunk = vectorstore.load_chunk_vectorstore
 
     def setup(self):
+        try:
+            import chromadb.api.client
+            chromadb.api.client.SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
         t0 = time.time()
         # 1. Write synthetic chat
         self.chat_file.write_text(SYNTHETIC_CHAT_CONTENT, encoding="utf-8")
@@ -145,6 +150,13 @@ class IsolatedSmokeEnvironment:
         hybrid_retriever.load_chunk_vectorstore = self.orig_load_chunk
         vectorstore.load_message_vectorstore = self.orig_vec_load_msg
         vectorstore.load_chunk_vectorstore = self.orig_vec_load_chunk
+
+        # Clear Chroma system cache before deleting directory
+        try:
+            import chromadb.api.client
+            chromadb.api.client.SharedSystemClient.clear_system_cache()
+        except Exception:
+            pass
 
         # Remove temporary directories
         shutil.rmtree(self.tmp_dir, ignore_errors=True)
