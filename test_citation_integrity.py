@@ -7,6 +7,8 @@ from rag_graph import (
     extract_available_message_ids,
     extract_answer_citations,
     check_grounded,
+    build_generation_prompt,
+    generate,
     CitationValidationResult,
     GraphState,
 )
@@ -348,3 +350,131 @@ def test_citation_case_10_semantic_yes_overridden_by_invalid_citation():
     assert result["semantic_grounded"] is True
     assert result["grounded"] is False
     assert result["invalid_citation_ids"] == [999]
+
+
+# =====================================================================
+# 11. Generation prompt receives correct permitted IDs for synthetic evidence
+# =====================================================================
+
+def test_generation_prompt_permitted_ids_synthetic_evidence():
+    doc0 = Document(
+        page_content="[ID 0] Commander Vance: The primary deflector shield operates at 450 GHz.",
+        metadata={"source": "hybrid_search", "message_id": 0},
+    )
+    doc1 = Document(
+        page_content="[ID 1] Dr. Thorne: Vessel departure commences at dawn.",
+        metadata={"source": "hybrid_search", "message_id": 1},
+    )
+    doc2 = Document(
+        page_content="[ID 2] Elena: Secondary plasma conduits stored in Pod 7.",
+        metadata={"source": "hybrid_search", "message_id": 2},
+    )
+
+    state = make_test_state(answer="", documents=[doc0, doc1, doc2])
+    state["original_question"] = "What frequency does the primary deflector shield operate at?"
+
+    prompt = build_generation_prompt(state, documents=[doc0, doc1, doc2])
+
+    # 1. Permitted IDs must match the evidence IDs
+    available_ids = extract_available_message_ids([doc0, doc1, doc2])
+    assert available_ids == {0, 1, 2}
+    assert "Permitted citation IDs in this context: [0, 1, 2]" in prompt
+
+    # 2. Strict instructions against fabrication must be present
+    assert "Never invent, infer, or extrapolate a message ID" in prompt
+    assert "state that the information was not found" in prompt
+
+    # 3. generate() invokes LLM with the constructed prompt containing permitted IDs
+    mock_llm = make_mock_llm("The shield operates at 450 GHz [ID 0].")
+    gen_result = generate(state, generation_llm=mock_llm)
+
+    mock_llm.invoke.assert_called_once()
+    called_prompt = mock_llm.invoke.call_args[0][0]
+    assert "Permitted citation IDs in this context: [0, 1, 2]" in called_prompt
+    assert gen_result["generation"] == "The shield operates at 450 GHz [ID 0]."
+
+
+# =====================================================================
+# 12. Chunk evidence exposes actual embedded message IDs, not chunk_id
+# =====================================================================
+
+def test_generation_prompt_chunk_evidence_embedded_ids_not_chunk_id():
+    chunk_doc = Document(
+        page_content=(
+            "[message_id=5] Marcus: Cafeteria soup.\n"
+            "[message_id=6] Elena: Submit maintenance log."
+        ),
+        metadata={
+            "source": "conversation_chunk",
+            "chunk_id": 999,
+            "start_id": 5,
+            "end_id": 6,
+        },
+    )
+
+    state = make_test_state(answer="", documents=[chunk_doc])
+    prompt = build_generation_prompt(state, documents=[chunk_doc])
+
+    available_ids = extract_available_message_ids([chunk_doc])
+    assert available_ids == {5, 6}
+    assert 999 not in available_ids
+
+    # Permitted IDs must list embedded message IDs 5, 6 and NOT chunk_id 999
+    assert "[5, 6]" in prompt
+    assert "999" not in prompt
+
+
+# =====================================================================
+# 13. Empty or missing evidence does not cause fabricated permitted IDs
+# =====================================================================
+
+def test_generation_prompt_empty_evidence_no_fabricated_ids():
+    state_empty = make_test_state(answer="", documents=[])
+    state_empty["original_question"] = "What is the passcode?"
+
+    prompt_empty = build_generation_prompt(state_empty, documents=[])
+
+    assert extract_available_message_ids([]) == set()
+    assert "insufficient" in prompt_empty.lower()
+    # No permitted ID list should be fabricated
+    assert "Permitted citation IDs" not in prompt_empty
+
+    # Documents with only whitespace/empty page content
+    empty_doc = Document(page_content="   ", metadata={})
+    prompt_blank = build_generation_prompt(state_empty, documents=[empty_doc])
+    assert "insufficient" in prompt_blank.lower()
+    assert "Permitted citation IDs" not in prompt_blank
+
+
+# =====================================================================
+# 14. Existing citation validation continues to reject an invented ID
+# =====================================================================
+
+def test_citation_validation_continues_rejecting_invented_id():
+    # Context has IDs [0, 1, 2, 3, 4, 5, 6]
+    docs = [
+        Document(
+            page_content=f"[ID {i}] Participant: Message {i}",
+            metadata={"source": "hybrid_search", "message_id": i},
+        )
+        for i in range(7)
+    ]
+    available_ids = extract_available_message_ids(docs)
+    assert available_ids == {0, 1, 2, 3, 4, 5, 6}
+
+    # Answer invents [ID 12]
+    answer_with_hallucination = "The primary deflector shield operates at 450 GHz [ID 12]."
+    val = validate_citations(answer_with_hallucination, docs)
+
+    assert val.all_cited_valid is False
+    assert val.invalid_cited_ids == [12]
+    assert 12 not in val.available_ids
+
+    # check_grounded must mark grounded=False even if semantic checker returns 'yes'
+    state = make_test_state(answer=answer_with_hallucination, documents=docs)
+    mock_llm = make_mock_llm("yes")
+    result = check_grounded(state, grounding_llm=mock_llm)
+
+    assert result["grounded"] is False
+    assert result["invalid_citation_ids"] == [12]
+

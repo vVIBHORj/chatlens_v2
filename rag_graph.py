@@ -1264,11 +1264,219 @@ def expand_context(
 
 
 # =====================================================================
+# Citation ID Extraction for Evidence Context
+# =====================================================================
+
+def extract_available_message_ids(documents: List[Document]) -> Set[int]:
+    """
+    Extract all message IDs actually present in the evidence documents supplied to generation.
+
+    Derives IDs from the formatted text of individual messages and chronological context lines,
+    cross-checked with individual message metadata.
+    Does NOT infer message IDs from metadata ranges or chunk IDs.
+    """
+    available_ids: Set[int] = set()
+    if not documents:
+        return available_ids
+
+    # Regex patterns for message prefixes in candidate documents:
+    # 1. "[ID 123]" used in hybrid search and chronological context
+    # 2. "[message_id=123]" used in conversation chunks
+    id_pattern = re.compile(r"\[(?:ID|message_id)\s*=?\s*(\d+)\]", re.IGNORECASE)
+
+    for doc in documents:
+        # Extract from actual document text
+        if doc and hasattr(doc, "page_content") and doc.page_content:
+            for match in id_pattern.finditer(doc.page_content):
+                try:
+                    available_ids.add(int(match.group(1)))
+                except (ValueError, TypeError):
+                    pass
+
+        # Metadata cross-check for single message candidates only
+        # Strictly exclude conversation chunks to avoid treating chunk_id as message_id
+        if doc and hasattr(doc, "metadata") and doc.metadata:
+            if doc.metadata.get("source") != "conversation_chunk":
+                msg_id = doc.metadata.get("message_id")
+                if msg_id is not None:
+                    try:
+                        available_ids.add(int(msg_id))
+                    except (ValueError, TypeError):
+                        pass
+
+    return available_ids
+
+
+# =====================================================================
+# Build generation prompt
+# =====================================================================
+
+def build_generation_prompt(
+    state: GraphState,
+    documents: Optional[List[Document]] = None,
+) -> str:
+    """
+    Construct the generation prompt for LLM answer synthesis, explicitly restricting
+    permitted citation IDs to those present in the provided evidence.
+    """
+    docs = documents if documents is not None else state.get("documents", [])
+
+    context = "\n\n---\n\n".join(
+        doc.page_content
+        for doc in docs
+        if doc and hasattr(doc, "page_content") and doc.page_content
+    )
+
+    is_profile = any(
+        doc.metadata.get("source") == "whole_conversation_profile"
+        for doc in docs
+        if doc and hasattr(doc, "metadata") and doc.metadata
+    )
+
+    question = state.get("original_question") or state.get("question", "")
+
+    # -------------------------------------------------------------
+    # No context
+    # -------------------------------------------------------------
+    if not context.strip():
+        return (
+            "You are answering a question about a WhatsApp conversation.\n\n"
+            "There is no reliable retrieved context available.\n\n"
+            f"Question:\n"
+            f"{question}\n\n"
+            "Do not invent an answer. Clearly say that the "
+            "available chat context is insufficient."
+        )
+
+    # -------------------------------------------------------------
+    # Context note and citation constraints
+    # -------------------------------------------------------------
+    if is_profile:
+        context_note = (
+            "The context below is a whole-conversation statistical "
+            "profile covering the participants and the conversation "
+            "rather than a small retrieved excerpt."
+        )
+        citation_rule = (
+            "7. The context below is a statistical profile without message IDs. "
+            "Do not output message ID citations."
+        )
+        citation_reminder = "Do not output message ID citations."
+    else:
+        context_note = (
+            "The context below contains conversation messages retrieved "
+            "because they may be relevant to the user's question. Some "
+            "messages are exact retrieved anchors and some are nearby "
+            "chronological context. Nearby messages may be unrelated."
+        )
+        permitted_ids = sorted(extract_available_message_ids(docs))
+        if permitted_ids:
+            ids_str = ", ".join(str(mid) for mid in permitted_ids)
+            citation_rule = (
+                "7. CITATION INTEGRITY & EXPLICIT ID RESTRICTIONS:\n"
+                "   - Cite ONLY message IDs explicitly present in the supplied evidence. "
+                "Never invent, infer, or extrapolate a message ID.\n"
+                f"   - Permitted citation IDs in this context: [{ids_str}]. "
+                "Any citation outside this permitted list is strictly invalid.\n"
+                "   - Cite the specific message IDs supporting each factual claim using INLINE brackets "
+                "placed immediately after the specific claim (e.g., 'An inquiry was made about X [ID 12], "
+                "and Y was stored in Pod 7 [ID 34]').\n"
+                "   - Cite ONLY the smallest relevant set of message IDs directly supporting each claim. "
+                "NEVER list or clump message IDs at the beginning or end of the answer.\n"
+                "   - If the evidence does not support an answer, state that the information was not found "
+                "or is insufficient instead of fabricating a citation."
+            )
+            citation_reminder = (
+                f"Cite ONLY permitted message IDs from [{ids_str}] that directly support your claims. "
+                "Never invent, infer, or extrapolate message IDs. If the evidence does not support an answer, "
+                "state that the information was not found instead of fabricating a citation."
+            )
+        else:
+            citation_rule = (
+                "7. CITATION INTEGRITY & EXPLICIT ID RESTRICTIONS:\n"
+                "   - No individual message IDs are present in the supplied evidence. Do not output any message ID citations.\n"
+                "   - If the evidence does not support an answer, state that the information was not found "
+                "instead of fabricating a citation."
+            )
+            citation_reminder = (
+                "No message IDs are present in the evidence; do not cite any message IDs. "
+                "If the evidence does not support an answer, state that the information was not found."
+            )
+
+    prompt = (
+        "You are an evidence-grounded AI assistant answering a user's question "
+        "about an archived WhatsApp conversation. You are summarizing the archive, "
+        "NOT continuing or participating in the chat.\n\n"
+
+        f"{context_note}\n\n"
+
+        "YOUR TASK: Provide a concise, natural-language summary in the assistant's "
+        "voice (typically 1–3 sentences) that directly answers the question using ONLY "
+        "explicit evidence from the context messages. Synthesize only relevant messages "
+        "whose relevance is directly supported. Never output a raw transcript line or message dump "
+        "as the entire answer, and never prefix the answer with a list of IDs.\n\n"
+
+        "STRICT GROUNDING RULES:\n\n"
+
+        "1. Use ONLY information explicitly present in the context. "
+        "Do NOT add any knowledge or assumptions from outside the context.\n\n"
+
+        "2. Distinguish message types carefully:\n"
+        "   - STATEMENT: Direct assertion of fact\n"
+        "   - QUESTION: An inquiry or asking about something\n"
+        "   - REQUEST / SUGGESTION: Asking or suggesting an action\n"
+        "   - LOCATION / VENUE: Referencing a place or location\n"
+        "   - POSSIBILITY: Speculation or something conditional\n"
+        "   Only direct STATEMENTS can support factual claims. Questions, requests, "
+        "locations, and possibilities must never be reported as confirmed events, activities, "
+        "or completed actions.\n\n"
+
+        "3. Never convert a question, request, or suggestion into evidence that the event or "
+        "activity actually happened. Do not claim someone played an activity merely because "
+        "a message mentions a court, ball, venue, or playing.\n\n"
+
+        "4. Never interpret a location containing a topic word as proof that the topic itself was discussed "
+        "or that an associated activity occurred. Mentioning a venue or location (e.g., a ground, court, store, "
+        "or office) only proves that the location was named, not that an associated event, activity, or plan took place.\n\n"
+
+        "5. Treat cryptic, contradictory, slang-heavy, or ambiguous messages conservatively. Preserve their literal "
+        "phrasing and ambiguity rather than inventing an interpretation. If a message is an unexplained equation, "
+        "shorthand, or unclear slang, report it neutrally without asserting an unverified meaning.\n\n"
+
+        "6. Avoid broad, overreaching introductory claims such as 'they discussed various topics including X, Y, Z' "
+        "unless each item was genuinely discussed. Do not feel obliged to mention every retrieved message; "
+        "summarize only the specific points directly supported and relevant to the question.\n\n"
+
+        f"{citation_rule}\n\n"
+
+        "8. If the retrieved evidence supports only a limited conclusion (such as inquiries or mentions rather than "
+        "actual activities or plans), state that limitation concisely instead of filling gaps with assumptions.\n\n"
+
+        "9. Never infer participants, plans, intentions, relationships, or future actions unless the context explicitly "
+        "states them.\n\n"
+
+        "CONTEXT:\n"
+        f"{context}\n\n"
+
+        "USER QUESTION:\n"
+        f"{question}\n\n"
+
+        f"Remember: Write a natural 1–3 sentence assistant summary with INLINE [ID 123] citations placed immediately "
+        f"after each claim. Never list IDs at the beginning. Summarize only supported, relevant points. {citation_reminder}\n\n"
+
+        "ANSWER:"
+    )
+
+    return prompt
+
+
+# =====================================================================
 # Generate answer
 # =====================================================================
 
 def generate(
     state: GraphState,
+    generation_llm: Optional[Any] = None,
 ) -> GraphState:
     """
     Generate the final answer using the original question and the
@@ -1288,127 +1496,13 @@ def generate(
     print(context)
     print("=" * 70)
 
-    is_profile = any(
-        document.metadata.get("source")
-        == "whole_conversation_profile"
-        for document in documents
-    )
-
-    # -------------------------------------------------------------
-    # Context description
-    # -------------------------------------------------------------
-
-    if is_profile:
-
-        context_note = (
-            "The context below is a whole-conversation statistical "
-            "profile covering the participants and the conversation "
-            "rather than a small retrieved excerpt."
-        )
-
-    else:
-
-        context_note = (
-            "The context below contains conversation messages retrieved "
-            "because they may be relevant to the user's question. Some "
-            "messages are exact retrieved anchors and some are nearby "
-            "chronological context. Nearby messages may be unrelated."
-        )
-
-    # -------------------------------------------------------------
-    # No context
-    # -------------------------------------------------------------
-
-    if not context.strip():
-
-        prompt = (
-            "You are answering a question about a WhatsApp conversation.\n\n"
-
-            "There is no reliable retrieved context available.\n\n"
-
-            f"Question:\n"
-            f"{state['original_question']}\n\n"
-
-            "Do not invent an answer. Clearly say that the "
-            "available chat context is insufficient."
-        )
-
-    else:
-
-        prompt = (
-            "You are an evidence-grounded AI assistant answering a user's question "
-            "about an archived WhatsApp conversation. You are summarizing the archive, "
-            "NOT continuing or participating in the chat.\n\n"
-
-            f"{context_note}\n\n"
-
-            "YOUR TASK: Provide a concise, natural-language summary in the assistant's "
-            "voice (typically 1–3 sentences) that directly answers the question using ONLY "
-            "explicit evidence from the context messages. Synthesize only relevant messages "
-            "whose relevance is directly supported. Never output a raw transcript line or message dump "
-            "as the entire answer, and never prefix the answer with a list of IDs.\n\n"
-
-            "STRICT GROUNDING RULES:\n\n"
-
-            "1. Use ONLY information explicitly present in the context. "
-            "Do NOT add any knowledge or assumptions from outside the context.\n\n"
-
-            "2. Distinguish message types carefully:\n"
-            "   - STATEMENT: Direct assertion of fact\n"
-            "   - QUESTION: An inquiry or asking about something\n"
-            "   - REQUEST / SUGGESTION: Asking or suggesting an action\n"
-            "   - LOCATION / VENUE: Referencing a place or location\n"
-            "   - POSSIBILITY: Speculation or something conditional\n"
-            "   Only direct STATEMENTS can support factual claims. Questions, requests, "
-            "locations, and possibilities must never be reported as confirmed events, activities, "
-            "or completed actions.\n\n"
-
-            "3. Never convert a question, request, or suggestion into evidence that the event or "
-            "activity actually happened. Do not claim someone played an activity merely because "
-            "a message mentions a court, ball, venue, or playing.\n\n"
-
-            "4. Never interpret a location containing a topic word as proof that the topic itself was discussed "
-            "or that an associated activity occurred. Mentioning a venue or location (e.g., a ground, court, store, "
-            "or office) only proves that the location was named, not that an associated event, activity, or plan took place.\n\n"
-
-            "5. Treat cryptic, contradictory, slang-heavy, or ambiguous messages conservatively. Preserve their literal "
-            "phrasing and ambiguity rather than inventing an interpretation. If a message is an unexplained equation, "
-            "shorthand, or unclear slang, report it neutrally without asserting an unverified meaning.\n\n"
-
-            "6. Avoid broad, overreaching introductory claims such as 'they discussed various topics including X, Y, Z' "
-            "unless each item was genuinely discussed. Do not feel obliged to mention every retrieved message; "
-            "summarize only the specific points directly supported and relevant to the question.\n\n"
-
-            "7. Use INLINE citations placed immediately after the specific claim they support (e.g., 'An inquiry was made "
-            "about X [ID 12], and Y was requested [ID 34]'). Cite ONLY the smallest relevant set of message IDs directly "
-            "supporting each claim. NEVER list or clump message IDs at the beginning or end of the answer.\n\n"
-
-            "8. If the retrieved evidence supports only a limited conclusion (such as inquiries or mentions rather than "
-            "actual activities or plans), state that limitation concisely instead of filling gaps with assumptions.\n\n"
-
-            "9. Never infer participants, plans, intentions, relationships, or future actions unless the context explicitly "
-            "states them.\n\n"
-
-            "CONTEXT:\n"
-            f"{context}\n\n"
-
-            f"USER QUESTION:\n"
-            f"{state['original_question']}\n\n"
-
-            "Remember: Write a natural 1–3 sentence assistant summary with INLINE [ID 123] citations placed immediately "
-            "after each claim. Never list IDs at the beginning. Summarize only supported, relevant points.\n\n"
-
-            "ANSWER:"
-        )
+    prompt = build_generation_prompt(state, documents=documents)
+    active_llm = generation_llm if generation_llm is not None else llm
 
     try:
-
-        answer = llm.invoke(
-            prompt
-        ).content.strip()
-
+        response = active_llm.invoke(prompt)
+        answer = response.content.strip() if hasattr(response, "content") else str(response).strip()
     except Exception as e:
-
         answer = (
             "I was unable to generate the answer "
             f"because the local language model returned "
@@ -1449,46 +1543,6 @@ class CitationValidationResult:
             "missing_citations": self.missing_citations,
             "details": self.details,
         }
-
-
-def extract_available_message_ids(documents: List[Document]) -> Set[int]:
-    """
-    Extract all message IDs actually present in the evidence documents supplied to generation.
-
-    Derives IDs from the formatted text of individual messages and chronological context lines,
-    cross-checked with individual message metadata.
-    Does NOT infer message IDs from metadata ranges or chunk IDs.
-    """
-    available_ids: Set[int] = set()
-    if not documents:
-        return available_ids
-
-    # Regex patterns for message prefixes in candidate documents:
-    # 1. "[ID 123]" used in hybrid search and chronological context
-    # 2. "[message_id=123]" used in conversation chunks
-    id_pattern = re.compile(r"\[(?:ID|message_id)\s*=?\s*(\d+)\]", re.IGNORECASE)
-
-    for doc in documents:
-        # Extract from actual document text
-        if doc and hasattr(doc, "page_content") and doc.page_content:
-            for match in id_pattern.finditer(doc.page_content):
-                try:
-                    available_ids.add(int(match.group(1)))
-                except (ValueError, TypeError):
-                    pass
-
-        # Metadata cross-check for single message candidates only
-        # Strictly exclude conversation chunks to avoid treating chunk_id as message_id
-        if doc and hasattr(doc, "metadata") and doc.metadata:
-            if doc.metadata.get("source") != "conversation_chunk":
-                msg_id = doc.metadata.get("message_id")
-                if msg_id is not None:
-                    try:
-                        available_ids.add(int(msg_id))
-                    except (ValueError, TypeError):
-                        pass
-
-    return available_ids
 
 
 def extract_answer_citations(answer: str) -> Tuple[List[int], List[str]]:
