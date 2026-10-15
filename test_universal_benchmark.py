@@ -137,75 +137,206 @@ def test_deterministic_metrics_calculation():
     assert summary.infrastructure_error_count == 0
 
 
-def test_chunk_end_id_misattribution_distinction():
-    """
-    Verifies that the benchmark identifies a cited message that is mechanically valid
-    (present in context) but NOT supporting evidence (BM-01 chunk-end issue).
-    """
-    c1 = BENCHMARK_CASES[0]  # Expected supporting ID is [0] (database port)
-    # Model cites ID 4 (Vikram's caching) which is in context, but not supporting evidence
+def test_one_required_supporting_id_cited_correctly():
+    """Case 1: One required supporting ID cited correctly satisfies strict pass contract."""
+    c1 = BENCHMARK_CASES[0]  # Expected: [0]
     res = CaseExecutionResult(
         case=c1,
+        retrieved_message_ids=[0],
+        available_context_ids=[0, 8],
+        valid_citation_ids=[0],
+        invalid_citation_ids=[],
+        answer="The database port is 5433 [ID 0].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
+    assert res.attribution_precision == 1.0
+    assert res.attribution_recall == 1.0
+    assert res.e2e_passed is True
+    assert res.partial_e2e_passed is True
+
+
+def test_one_of_two_required_supporting_ids_cited_other_omitted():
+    """Case 2: One of two required supporting IDs cited (other omitted) fails complete E2E pass."""
+    c5 = BENCHMARK_CASES[4]  # Expected: [6, 7] (multi-message synthesis)
+    res = CaseExecutionResult(
+        case=c5,
+        retrieved_message_ids=[6, 7],
+        available_context_ids=[6, 7],
+        valid_citation_ids=[7],
+        invalid_citation_ids=[],
+        answer="Release 2.4 sign-off was approved by QA lead [ID 7].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
+    assert res.attribution_precision == 1.0
+    assert res.attribution_recall == 0.5
+    # Strict contract: complete E2E pass requires ALL required evidence IDs (recall == 1.0)
+    assert res.e2e_passed is False
+    # Partial pass is acknowledged
+    assert res.partial_e2e_passed is True
+
+
+def test_both_required_ids_cited_correctly():
+    """Case 3: Both required supporting IDs cited correctly passes complete E2E contract."""
+    c5 = BENCHMARK_CASES[4]  # Expected: [6, 7]
+    res = CaseExecutionResult(
+        case=c5,
+        retrieved_message_ids=[6, 7],
+        available_context_ids=[6, 7],
+        valid_citation_ids=[6, 7],
+        invalid_citation_ids=[],
+        answer="Release 2.4 is scheduled for Tuesday 3 AM [ID 6] and QA approved sign-off [ID 7].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
+    assert res.attribution_precision == 1.0
+    assert res.attribution_recall == 1.0
+    assert res.e2e_passed is True
+    assert res.partial_e2e_passed is True
+
+
+def test_valid_in_context_but_irrelevant_id_cited():
+    """Case 4: A valid-in-context but irrelevant ID cited fails attribution and E2E pass."""
+    c1 = BENCHMARK_CASES[0]  # Expected: [0]
+    res = CaseExecutionResult(
+        case=c1,
+        retrieved_message_ids=[0],
         available_context_ids=[0, 1, 2, 3, 4],
-        valid_citation_ids=[4],
+        valid_citation_ids=[4],  # ID 4 is in context, but unrelated
         invalid_citation_ids=[],
         answer="Database port for the replica cluster is configured to 5433 [ID 4].",
         grounded=True,
         citations_valid=True,
     )
     evaluate_case_metrics(res)
-    # Mechanically valid because ID 4 is in context
-    assert res.citation_validity_rate == 1.0
-    # But attribution precision and recall are ZERO
-    assert res.attribution_precision == 0.0
+    assert res.citation_validity_rate == 1.0  # Mechanically valid
+    assert res.attribution_precision == 0.0   # But 0% supporting
     assert res.attribution_recall == 0.0
-    # Therefore E2E passed MUST be False despite grounded=True
     assert res.e2e_passed is False
+    assert res.partial_e2e_passed is False
 
 
-def test_abstention_with_citations_fails_abstention_check():
-    """
-    Verifies that an abstention that appends citations (e.g. [ID 4]) is rejected
-    as an improper abstention rather than passing as clean abstention.
-    """
-    c6 = BENCHMARK_CASES[5]  # Absent answer: expected []
+def test_mixture_of_relevant_and_irrelevant_ids():
+    """Case 5: A mixture of relevant and irrelevant IDs cited fails strict attribution precision."""
+    c1 = BENCHMARK_CASES[0]  # Expected: [0]
+    res = CaseExecutionResult(
+        case=c1,
+        retrieved_message_ids=[0],
+        available_context_ids=[0, 1, 2, 3, 4],
+        valid_citation_ids=[0, 4],  # 0 is supporting, 4 is unrelated
+        invalid_citation_ids=[],
+        answer="Database port is 5433 [ID 0], discussed during caching update [ID 4].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
+    assert res.attribution_precision == 0.5  # Only 1 of 2 cited is supporting
+    assert res.attribution_recall == 1.0
+    # Complete E2E pass requires precision == 1.0 (no unrelated citations mixed in)
+    assert res.e2e_passed is False
+    assert res.partial_e2e_passed is False
+
+
+def test_duplicate_citations_handling():
+    """Case 6: Duplicate citations (e.g. [ID 0, ID 0]) do not distort precision or validity."""
+    c1 = BENCHMARK_CASES[0]  # Expected: [0]
+    res = CaseExecutionResult(
+        case=c1,
+        retrieved_message_ids=[0],
+        available_context_ids=[0],
+        valid_citation_ids=[0, 0],
+        invalid_citation_ids=[],
+        answer="The database port is 5433 [ID 0] as confirmed in [ID 0].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
+    assert res.citation_validity_rate == 1.0
+    assert res.attribution_precision == 1.0
+    assert res.attribution_recall == 1.0
+    assert res.e2e_passed is True
+
+
+def test_unanswerable_case_with_no_citations():
+    """Case 7: An unanswerable case with no citations passes clean abstention contract."""
+    c6 = BENCHMARK_CASES[5]  # Expected: []
     res = CaseExecutionResult(
         case=c6,
-        available_context_ids=[0, 1, 2, 3, 4],
-        valid_citation_ids=[4],
+        retrieved_message_ids=[],
+        available_context_ids=[],
+        valid_citation_ids=[],
         invalid_citation_ids=[],
-        answer="The root password for the production bastion host was not discussed in the chat. [ID 4]",
+        answer="The root password for the production bastion host was not found in the chat.",
         grounded=False,
         citations_valid=True,
     )
     evaluate_case_metrics(res)
-    # Must NOT be marked as a correct abstention because it cited an ID
+    assert res.correct_abstention is True
+    assert res.grounding_category == "TN"
+    assert res.attribution_precision == 1.0
+    assert res.attribution_recall == 1.0
+    assert res.e2e_passed is True
+
+
+def test_unanswerable_case_with_citation():
+    """Case 8: An unanswerable case that cites an ID fails clean abstention."""
+    c6 = BENCHMARK_CASES[5]  # Expected: []
+    res = CaseExecutionResult(
+        case=c6,
+        available_context_ids=[4],
+        valid_citation_ids=[4],
+        invalid_citation_ids=[],
+        answer="The root password was not discussed in the chat [ID 4].",
+        grounded=False,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
     assert res.correct_abstention is False
-    assert res.e2e_passed is False
     assert res.grounding_category == "FP"
+    assert res.attribution_precision == 0.0
+    assert res.e2e_passed is False
 
 
-def test_infrastructure_errors_isolated_from_quality_metrics():
-    """
-    Verifies that infrastructure exceptions (like Chroma segment reader crash)
-    are separated and do not pollute the model grounding confusion matrix as FN.
-    """
-    c_err = BENCHMARK_CASES[10]  # BM-11
+def test_infrastructure_exception_handling():
+    """Case 9: An infrastructure exception is isolated and does not count as a quality success."""
+    c_err = BENCHMARK_CASES[10]
     res = CaseExecutionResult(
         case=c_err,
         exceptions=["Internal error: Error creating hnsw segment reader: Nothing found on disk"],
     )
     evaluate_case_metrics(res)
     assert res.e2e_passed is False
+    assert res.partial_e2e_passed is False
     assert res.grounding_category == "ERROR"
-    assert res.retrieval_recall_at_k == 0.0
+    assert res.anchor_retrieval_recall_at_k == 0.0
+    assert res.context_availability_recall_at_k == 0.0
 
     summary = aggregate_benchmark_metrics([res])
     assert summary.infrastructure_error_count == 1
+    assert summary.e2e_pass_rate == 0.0
     assert summary.fn_count == 0
     assert summary.fp_count == 0
-    assert summary.tp_count == 0
-    assert summary.tn_count == 0
+
+
+def test_retrieval_metrics_distinction():
+    """Verify distinction between direct-anchor recall and evidence/context availability recall."""
+    c5 = BENCHMARK_CASES[4]  # Expected: [6, 7]
+    res = CaseExecutionResult(
+        case=c5,
+        retrieved_message_ids=[6],                 # Direct anchor has Msg 6
+        retrieved_chunk_ids=[1],                  # Chunk covers 5-9
+        expanded_neighbor_ids=[],
+        available_context_ids=[5, 6, 7, 8, 9],    # Evidence available to generation has both 6 & 7
+    )
+    evaluate_case_metrics(res)
+    # Direct-anchor retrieval retrieved only 1 of 2 expected anchors
+    assert res.anchor_retrieval_recall_at_k == 0.5
+    # Context availability recall (available to generation via chunk) has both
+    assert res.context_availability_recall_at_k == 1.0
 
 
 def test_deterministic_offline_pipeline_execution(tech_ops_env):

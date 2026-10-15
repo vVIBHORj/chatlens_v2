@@ -377,14 +377,19 @@ class CaseExecutionResult:
     latency_seconds: float = 0.0
     exceptions: List[str] = field(default_factory=list)
 
-    # Deterministic metrics per case
-    retrieval_recall_at_k: float = 0.0
+    # Retrieval metrics
+    anchor_retrieval_recall_at_k: float = 0.0
+    context_availability_recall_at_k: float = 0.0
+    retrieval_recall_at_k: float = 0.0  # Context availability recall alias
+
+    # Citation & attribution metrics
     citation_validity_rate: float = 0.0
     attribution_precision: float = 0.0
     attribution_recall: float = 0.0
     correct_abstention: bool = False
     distractor_avoided: bool = True
     grounding_category: str = ""  # TP, TN, FP, FN, ERROR
+    partial_e2e_passed: bool = False
     e2e_passed: bool = False
 
 
@@ -392,9 +397,12 @@ class CaseExecutionResult:
 class BenchmarkSummaryMetrics:
     total_cases: int = 0
     passed_cases: int = 0
+    partial_passed_cases: int = 0
     infrastructure_error_count: int = 0
     e2e_pass_rate: float = 0.0
-    mean_retrieval_recall: float = 0.0
+    mean_anchor_retrieval_recall: float = 0.0
+    mean_context_availability_recall: float = 0.0
+    mean_retrieval_recall: float = 0.0  # Context availability recall alias
     citation_id_validity_rate: float = 0.0
     mean_attribution_precision: float = 0.0
     mean_attribution_recall: float = 0.0
@@ -412,11 +420,15 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
     expected = set(case.expected_supporting_ids)
     cited = set(res.valid_citation_ids)
     available = set(res.available_context_ids)
+    anchor_ids = set(res.retrieved_message_ids)
 
     # 0. Infrastructure exception handling
     if res.exceptions:
         res.grounding_category = "ERROR"
         res.e2e_passed = False
+        res.partial_e2e_passed = False
+        res.anchor_retrieval_recall_at_k = 0.0
+        res.context_availability_recall_at_k = 0.0
         res.retrieval_recall_at_k = 0.0
         res.citation_validity_rate = 0.0
         res.attribution_precision = 0.0
@@ -425,12 +437,18 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
         res.distractor_avoided = False
         return res
 
-    # 1. Retrieval recall at k (against evidence available to generation)
+    # 1. Retrieval recall distinctions
     if expected:
-        hits = len(expected.intersection(available))
-        res.retrieval_recall_at_k = hits / len(expected)
+        anchor_hits = len(expected.intersection(anchor_ids))
+        res.anchor_retrieval_recall_at_k = anchor_hits / len(expected)
+
+        avail_hits = len(expected.intersection(available))
+        res.context_availability_recall_at_k = avail_hits / len(expected)
+        res.retrieval_recall_at_k = res.context_availability_recall_at_k
     else:
         # For absent answers, retrieval is satisfied if no hallucinated evidence is expected
+        res.anchor_retrieval_recall_at_k = 1.0
+        res.context_availability_recall_at_k = 1.0
         res.retrieval_recall_at_k = 1.0
 
     # 2. Citation-ID validity rate (evaluated on unique cited IDs)
@@ -440,7 +458,9 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
     if total_unique_cited > 0:
         res.citation_validity_rate = len(unique_valid) / total_unique_cited
     else:
-        # If no citations were made, validity is 1.0 for absent cases, 0.0 for answerable
+        # If no citations were made:
+        # For unanswerable queries: 1.0 (clean abstention)
+        # For answerable queries: 0.0 (missing required citations)
         res.citation_validity_rate = 1.0 if not case.expected_answerable else 0.0
 
     # 3. Citation attribution precision & recall against known supporting messages
@@ -450,6 +470,7 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
             res.attribution_precision = correct_citations / len(cited)
             res.attribution_recall = correct_citations / len(expected)
         else:
+            # Answerable case with no citations: precision and recall are strictly 0.0
             res.attribution_precision = 0.0
             res.attribution_recall = 0.0
     else:
@@ -490,23 +511,49 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
 
     # 7. End-to-end pass condition
     if case.expected_answerable:
+        # Complete E2E pass contract:
+        # - Context evidence available
+        # - Mechanical citation validity (no invalid IDs and at least 1 citation)
+        # - No distractors cited
+        # - Semantic groundedness check passed
+        # - Attribution precision must be 1.0 (EVERY cited ID must belong to expected supporting set)
+        # - Attribution recall must be 1.0 (ALL expected supporting IDs must be cited)
         res.e2e_passed = (
-            res.retrieval_recall_at_k > 0.0
+            len(res.exceptions) == 0
+            and res.context_availability_recall_at_k > 0.0
+            and res.citations_valid
             and len(res.invalid_citation_ids) == 0
+            and len(res.valid_citation_ids) > 0
             and res.distractor_avoided
             and res.grounded
-            and res.attribution_precision > 0.0
+            and res.attribution_precision == 1.0
+            and res.attribution_recall == 1.0
+        )
+        # Partial pass: valid citations and at least partial attribution (recall > 0)
+        res.partial_e2e_passed = (
+            len(res.exceptions) == 0
+            and res.context_availability_recall_at_k > 0.0
+            and res.citations_valid
+            and len(res.invalid_citation_ids) == 0
+            and len(res.valid_citation_ids) > 0
+            and res.distractor_avoided
+            and res.grounded
+            and res.attribution_precision == 1.0
             and res.attribution_recall > 0.0
-            and len(res.exceptions) == 0
         )
     else:
+        # Unanswerable E2E pass contract:
+        # - Clean abstention
+        # - No valid or invalid citations
+        # - True Negative grounding classification
         res.e2e_passed = (
-            res.correct_abstention
+            len(res.exceptions) == 0
+            and res.correct_abstention
             and len(res.invalid_citation_ids) == 0
             and len(res.valid_citation_ids) == 0
             and res.grounding_category == "TN"
-            and len(res.exceptions) == 0
         )
+        res.partial_e2e_passed = res.e2e_passed
 
     return res
 
@@ -517,12 +564,17 @@ def aggregate_benchmark_metrics(results: List[CaseExecutionResult]) -> Benchmark
         return BenchmarkSummaryMetrics()
 
     passed = sum(1 for r in results if r.e2e_passed)
+    partial_passed = sum(1 for r in results if r.partial_e2e_passed)
     infra_errors = sum(1 for r in results if len(r.exceptions) > 0)
 
     # Retrieval recall averaged specifically over answerable cases without infra errors
     answerable_cases = [r for r in results if r.case.expected_answerable and not r.exceptions]
-    mean_recall = (
-        sum(r.retrieval_recall_at_k for r in answerable_cases) / len(answerable_cases)
+    mean_anchor_recall = (
+        sum(r.anchor_retrieval_recall_at_k for r in answerable_cases) / len(answerable_cases)
+        if answerable_cases else 1.0
+    )
+    mean_avail_recall = (
+        sum(r.context_availability_recall_at_k for r in answerable_cases) / len(answerable_cases)
         if answerable_cases else 1.0
     )
 
@@ -557,9 +609,12 @@ def aggregate_benchmark_metrics(results: List[CaseExecutionResult]) -> Benchmark
     return BenchmarkSummaryMetrics(
         total_cases=total,
         passed_cases=passed,
+        partial_passed_cases=partial_passed,
         infrastructure_error_count=infra_errors,
         e2e_pass_rate=passed / total,
-        mean_retrieval_recall=mean_recall,
+        mean_anchor_retrieval_recall=mean_anchor_recall,
+        mean_context_availability_recall=mean_avail_recall,
+        mean_retrieval_recall=mean_avail_recall,
         citation_id_validity_rate=mean_validity,
         mean_attribution_precision=mean_prec,
         mean_attribution_recall=mean_att_recall,
