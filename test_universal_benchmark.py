@@ -77,7 +77,7 @@ def test_deterministic_metrics_calculation():
     c1 = BENCHMARK_CASES[0]  # Direct fact: expected [0]
     r1 = CaseExecutionResult(
         case=c1,
-        retrieved_ids=[0, 8],
+        retrieved_message_ids=[0, 8],
         available_context_ids=[0, 8],
         valid_citation_ids=[0],
         invalid_citation_ids=[],
@@ -94,11 +94,11 @@ def test_deterministic_metrics_calculation():
     assert r1.grounding_category == "TP"
     assert r1.e2e_passed is True
 
-    # Case B: Absent answer case with correct abstention
+    # Case B: Absent answer case with clean abstention (zero citations)
     c6 = BENCHMARK_CASES[5]  # Absent answer: expected []
     r6 = CaseExecutionResult(
         case=c6,
-        retrieved_ids=[],
+        retrieved_message_ids=[],
         available_context_ids=[],
         valid_citation_ids=[],
         invalid_citation_ids=[],
@@ -114,7 +114,7 @@ def test_deterministic_metrics_calculation():
     # Case C: Hallucinated citation ID
     r_bad = CaseExecutionResult(
         case=c1,
-        retrieved_ids=[0],
+        retrieved_message_ids=[0],
         available_context_ids=[0],
         valid_citation_ids=[],
         invalid_citation_ids=[999],
@@ -134,6 +134,78 @@ def test_deterministic_metrics_calculation():
     assert summary.tn_count == 1
     assert summary.fp_count == 0
     assert summary.fn_count == 1
+    assert summary.infrastructure_error_count == 0
+
+
+def test_chunk_end_id_misattribution_distinction():
+    """
+    Verifies that the benchmark identifies a cited message that is mechanically valid
+    (present in context) but NOT supporting evidence (BM-01 chunk-end issue).
+    """
+    c1 = BENCHMARK_CASES[0]  # Expected supporting ID is [0] (database port)
+    # Model cites ID 4 (Vikram's caching) which is in context, but not supporting evidence
+    res = CaseExecutionResult(
+        case=c1,
+        available_context_ids=[0, 1, 2, 3, 4],
+        valid_citation_ids=[4],
+        invalid_citation_ids=[],
+        answer="Database port for the replica cluster is configured to 5433 [ID 4].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
+    # Mechanically valid because ID 4 is in context
+    assert res.citation_validity_rate == 1.0
+    # But attribution precision and recall are ZERO
+    assert res.attribution_precision == 0.0
+    assert res.attribution_recall == 0.0
+    # Therefore E2E passed MUST be False despite grounded=True
+    assert res.e2e_passed is False
+
+
+def test_abstention_with_citations_fails_abstention_check():
+    """
+    Verifies that an abstention that appends citations (e.g. [ID 4]) is rejected
+    as an improper abstention rather than passing as clean abstention.
+    """
+    c6 = BENCHMARK_CASES[5]  # Absent answer: expected []
+    res = CaseExecutionResult(
+        case=c6,
+        available_context_ids=[0, 1, 2, 3, 4],
+        valid_citation_ids=[4],
+        invalid_citation_ids=[],
+        answer="The root password for the production bastion host was not discussed in the chat. [ID 4]",
+        grounded=False,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(res)
+    # Must NOT be marked as a correct abstention because it cited an ID
+    assert res.correct_abstention is False
+    assert res.e2e_passed is False
+    assert res.grounding_category == "FP"
+
+
+def test_infrastructure_errors_isolated_from_quality_metrics():
+    """
+    Verifies that infrastructure exceptions (like Chroma segment reader crash)
+    are separated and do not pollute the model grounding confusion matrix as FN.
+    """
+    c_err = BENCHMARK_CASES[10]  # BM-11
+    res = CaseExecutionResult(
+        case=c_err,
+        exceptions=["Internal error: Error creating hnsw segment reader: Nothing found on disk"],
+    )
+    evaluate_case_metrics(res)
+    assert res.e2e_passed is False
+    assert res.grounding_category == "ERROR"
+    assert res.retrieval_recall_at_k == 0.0
+
+    summary = aggregate_benchmark_metrics([res])
+    assert summary.infrastructure_error_count == 1
+    assert summary.fn_count == 0
+    assert summary.fp_count == 0
+    assert summary.tp_count == 0
+    assert summary.tn_count == 0
 
 
 def test_deterministic_offline_pipeline_execution(tech_ops_env):

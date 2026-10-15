@@ -364,7 +364,9 @@ class IsolatedBenchmarkEnvironment:
 @dataclass
 class CaseExecutionResult:
     case: BenchmarkCase
-    retrieved_ids: List[int] = field(default_factory=list)
+    retrieved_message_ids: List[int] = field(default_factory=list)
+    retrieved_chunk_ids: List[int] = field(default_factory=list)
+    expanded_neighbor_ids: List[int] = field(default_factory=list)
     available_context_ids: List[int] = field(default_factory=list)
     valid_citation_ids: List[int] = field(default_factory=list)
     invalid_citation_ids: List[int] = field(default_factory=list)
@@ -382,7 +384,7 @@ class CaseExecutionResult:
     attribution_recall: float = 0.0
     correct_abstention: bool = False
     distractor_avoided: bool = True
-    grounding_category: str = ""  # TP, TN, FP, FN
+    grounding_category: str = ""  # TP, TN, FP, FN, ERROR
     e2e_passed: bool = False
 
 
@@ -390,6 +392,7 @@ class CaseExecutionResult:
 class BenchmarkSummaryMetrics:
     total_cases: int = 0
     passed_cases: int = 0
+    infrastructure_error_count: int = 0
     e2e_pass_rate: float = 0.0
     mean_retrieval_recall: float = 0.0
     citation_id_validity_rate: float = 0.0
@@ -410,18 +413,32 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
     cited = set(res.valid_citation_ids)
     available = set(res.available_context_ids)
 
-    # 1. Retrieval recall at k
+    # 0. Infrastructure exception handling
+    if res.exceptions:
+        res.grounding_category = "ERROR"
+        res.e2e_passed = False
+        res.retrieval_recall_at_k = 0.0
+        res.citation_validity_rate = 0.0
+        res.attribution_precision = 0.0
+        res.attribution_recall = 0.0
+        res.correct_abstention = False
+        res.distractor_avoided = False
+        return res
+
+    # 1. Retrieval recall at k (against evidence available to generation)
     if expected:
         hits = len(expected.intersection(available))
         res.retrieval_recall_at_k = hits / len(expected)
     else:
-        # For absent answers, retrieval recall is 1.0 if no hallucinated retrieval
+        # For absent answers, retrieval is satisfied if no hallucinated evidence is expected
         res.retrieval_recall_at_k = 1.0
 
-    # 2. Citation-ID validity rate
-    total_cited = len(res.valid_citation_ids) + len(res.invalid_citation_ids)
-    if total_cited > 0:
-        res.citation_validity_rate = len(res.valid_citation_ids) / total_cited
+    # 2. Citation-ID validity rate (evaluated on unique cited IDs)
+    unique_valid = set(res.valid_citation_ids)
+    unique_invalid = set(res.invalid_citation_ids)
+    total_unique_cited = len(unique_valid) + len(unique_invalid)
+    if total_unique_cited > 0:
+        res.citation_validity_rate = len(unique_valid) / total_unique_cited
     else:
         # If no citations were made, validity is 1.0 for absent cases, 0.0 for answerable
         res.citation_validity_rate = 1.0 if not case.expected_answerable else 0.0
@@ -436,16 +453,19 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
             res.attribution_precision = 0.0
             res.attribution_recall = 0.0
     else:
-        # For absent cases, correct attribution means no citations
-        res.attribution_precision = 1.0 if len(cited) == 0 else 0.0
-        res.attribution_recall = 1.0 if len(cited) == 0 else 0.0
+        # For absent cases, correct attribution requires zero citations
+        has_any_citations = len(res.valid_citation_ids) > 0 or len(res.invalid_citation_ids) > 0
+        res.attribution_precision = 1.0 if not has_any_citations else 0.0
+        res.attribution_recall = 1.0 if not has_any_citations else 0.0
 
     # 4. Correct abstention on absent-answer cases
     if not case.expected_answerable:
         abstention_words = ["insufficient", "not mentioned", "not found", "cannot", "does not state", "no information"]
         answer_lower = res.answer.lower()
         has_abstention_phrase = any(w in answer_lower for w in abstention_words)
-        res.correct_abstention = (not res.grounded or has_abstention_phrase) and len(res.invalid_citation_ids) == 0
+        has_any_citations = len(res.valid_citation_ids) > 0 or len(res.invalid_citation_ids) > 0
+        # Clean abstention requires abstaining without appending citations or placeholders
+        res.correct_abstention = (not res.grounded or has_abstention_phrase) and not has_any_citations
     else:
         res.correct_abstention = True  # Not applicable, considered satisfied
 
@@ -462,7 +482,8 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
         else:
             res.grounding_category = "FN"
     else:
-        if not res.grounded:
+        has_any_citations = len(res.valid_citation_ids) > 0 or len(res.invalid_citation_ids) > 0
+        if not res.grounded and not has_any_citations:
             res.grounding_category = "TN"
         else:
             res.grounding_category = "FP"
@@ -473,13 +494,16 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
             res.retrieval_recall_at_k > 0.0
             and len(res.invalid_citation_ids) == 0
             and res.distractor_avoided
-            and (res.grounded or (res.attribution_recall > 0.0 and res.citations_valid))
+            and res.grounded
+            and res.attribution_precision > 0.0
+            and res.attribution_recall > 0.0
             and len(res.exceptions) == 0
         )
     else:
         res.e2e_passed = (
             res.correct_abstention
             and len(res.invalid_citation_ids) == 0
+            and len(res.valid_citation_ids) == 0
             and res.grounding_category == "TN"
             and len(res.exceptions) == 0
         )
@@ -493,12 +517,30 @@ def aggregate_benchmark_metrics(results: List[CaseExecutionResult]) -> Benchmark
         return BenchmarkSummaryMetrics()
 
     passed = sum(1 for r in results if r.e2e_passed)
-    mean_recall = sum(r.retrieval_recall_at_k for r in results) / total
-    mean_validity = sum(r.citation_validity_rate for r in results) / total
-    mean_prec = sum(r.attribution_precision for r in results) / total
-    mean_att_recall = sum(r.attribution_recall for r in results) / total
+    infra_errors = sum(1 for r in results if len(r.exceptions) > 0)
 
-    absent_cases = [r for r in results if not r.case.expected_answerable]
+    # Retrieval recall averaged specifically over answerable cases without infra errors
+    answerable_cases = [r for r in results if r.case.expected_answerable and not r.exceptions]
+    mean_recall = (
+        sum(r.retrieval_recall_at_k for r in answerable_cases) / len(answerable_cases)
+        if answerable_cases else 1.0
+    )
+
+    valid_results = [r for r in results if not r.exceptions]
+    mean_validity = (
+        sum(r.citation_validity_rate for r in valid_results) / len(valid_results)
+        if valid_results else 0.0
+    )
+    mean_prec = (
+        sum(r.attribution_precision for r in valid_results) / len(valid_results)
+        if valid_results else 0.0
+    )
+    mean_att_recall = (
+        sum(r.attribution_recall for r in answerable_cases) / len(answerable_cases)
+        if answerable_cases else 0.0
+    )
+
+    absent_cases = [r for r in results if not r.case.expected_answerable and not r.exceptions]
     abstention_rate = (
         sum(1 for r in absent_cases if r.correct_abstention) / len(absent_cases)
         if absent_cases else 1.0
@@ -515,6 +557,7 @@ def aggregate_benchmark_metrics(results: List[CaseExecutionResult]) -> Benchmark
     return BenchmarkSummaryMetrics(
         total_cases=total,
         passed_cases=passed,
+        infrastructure_error_count=infra_errors,
         e2e_pass_rate=passed / total,
         mean_retrieval_recall=mean_recall,
         citation_id_validity_rate=mean_validity,
@@ -570,6 +613,23 @@ def run_live_benchmark() -> Tuple[List[CaseExecutionResult], BenchmarkSummaryMet
                 res.valid_citation_ids = ans.get("valid_citation_ids", [])
                 res.invalid_citation_ids = ans.get("invalid_citation_ids", [])
                 res.available_context_ids = ans.get("available_citation_ids", [])
+
+                for s in ans.get("sources", []):
+                    if s.get("source") == "hybrid_search":
+                        mid = s.get("message_id")
+                        if mid is not None and mid not in res.retrieved_message_ids:
+                            res.retrieved_message_ids.append(mid)
+                    elif s.get("source") == "conversation_chunk":
+                        cid = s.get("chunk_id")
+                        if cid is not None and cid not in res.retrieved_chunk_ids:
+                            res.retrieved_chunk_ids.append(cid)
+                    if s.get("context_expanded"):
+                        start_id = s.get("context_start_message_id")
+                        end_id = s.get("context_end_message_id")
+                        if start_id is not None and end_id is not None:
+                            for nid in range(start_id, end_id + 1):
+                                if nid not in res.retrieved_message_ids and nid not in res.expanded_neighbor_ids:
+                                    res.expanded_neighbor_ids.append(nid)
 
                 val = ans.get("citation_validation")
                 if val:
