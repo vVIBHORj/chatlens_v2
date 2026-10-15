@@ -101,10 +101,18 @@ class BenchmarkCase:
     question: str
     expected_supporting_ids: List[int]
     expected_answerable: bool
+    acceptable_evidence_sets: List[List[int]] = field(default_factory=list)
     distractor_ids: List[int] = field(default_factory=list)
     superseded_ids: List[int] = field(default_factory=list)
     expected_keywords: List[str] = field(default_factory=list)
     description: str = ""
+
+    def __post_init__(self):
+        if not self.acceptable_evidence_sets:
+            if self.expected_answerable:
+                self.acceptable_evidence_sets = [list(self.expected_supporting_ids)]
+            else:
+                self.acceptable_evidence_sets = [[]]
 
 
 BENCHMARK_CASES: List[BenchmarkCase] = [
@@ -115,6 +123,7 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="What port is configured for the replica database cluster?",
         expected_supporting_ids=[0],
+        acceptable_evidence_sets=[[0]],
         expected_answerable=True,
         distractor_ids=[8],
         expected_keywords=["5433"],
@@ -127,6 +136,7 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="What caused the nocturnal system malfunction?",
         expected_supporting_ids=[1],
+        acceptable_evidence_sets=[[1]],
         expected_answerable=True,
         expected_keywords=["memory", "starvation", "thread"],
         description="Matches 'memory exhaustion and worker thread starvation during nocturnal batch cycle' with low lexical overlap.",
@@ -138,9 +148,10 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="Where was the backup SSL certificate placed?",
         expected_supporting_ids=[3],
+        acceptable_evidence_sets=[[3], [2, 3]],
         expected_answerable=True,
         expected_keywords=["vault 9"],
-        description="Requires Msg 3 ('In Vault 9.') whose question is Msg 2 ('Where did we store the backup SSL certificate?').",
+        description="Requires Msg 3 ('In Vault 9.') whose question is Msg 2 ('Where did we store the backup SSL certificate?'). Minimal sufficient evidence is [3]; contextual pair [2, 3] is acceptable as Msg 2 identifies the entity.",
     ),
     # 4. Pronouns and references to earlier messages (Anaphora)
     BenchmarkCase(
@@ -149,9 +160,10 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="What did Vikram change the cache TTL to?",
         expected_supporting_ids=[5],
+        acceptable_evidence_sets=[[5], [4, 5]],
         expected_answerable=True,
         expected_keywords=["10", "seconds"],
-        description="Msg 4 introduces Vikram refactoring caching middleware; Msg 5 says 'He mentioned the cache TTL was reduced... to 10 seconds.'",
+        description="Msg 4 introduces Vikram refactoring caching middleware; Msg 5 says 'He mentioned the cache TTL was reduced... to 10 seconds.' Minimal sufficient evidence is [5]; contextual pair [4, 5] is acceptable as Msg 4 resolves 'He'.",
     ),
     # 5. Multi-message answers requiring evidence from >1 message
     BenchmarkCase(
@@ -160,9 +172,10 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="When is release 2.4 scheduled and who approved the staging sign-off?",
         expected_supporting_ids=[6, 7],
+        acceptable_evidence_sets=[[6, 7]],
         expected_answerable=True,
         expected_keywords=["tuesday", "qa lead"],
-        description="Synthesizes Msg 6 (deployment Tuesday 3 AM) and Msg 7 (staging sign-off approved by QA lead).",
+        description="Synthesizes Msg 6 (deployment Tuesday 3 AM) and Msg 7 (staging sign-off approved by QA lead). Both messages are strictly required.",
     ),
     # 6. Questions whose answers are absent
     BenchmarkCase(
@@ -171,6 +184,7 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="What is the root password for the production bastion host?",
         expected_supporting_ids=[],
+        acceptable_evidence_sets=[[]],
         expected_answerable=False,
         expected_keywords=[],
         description="Unanswerable question absent from chat; system must abstain without inventing citations.",
@@ -182,6 +196,7 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="What port is configured for the replica database cluster?",
         expected_supporting_ids=[0],
+        acceptable_evidence_sets=[[0]],
         expected_answerable=True,
         distractor_ids=[8],
         expected_keywords=["5433"],
@@ -194,10 +209,11 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="When and where is the rescheduled team standup?",
         expected_supporting_ids=[10],
+        acceptable_evidence_sets=[[10]],
         expected_answerable=True,
         superseded_ids=[9],
         expected_keywords=["2:00", "meeting room b"],
-        description="Msg 9 scheduled standup for 11:00 in Room A; Msg 10 rescheduled to 2:00 PM in Room B.",
+        description="Msg 9 scheduled standup for 11:00 in Room A; Msg 10 rescheduled to 2:00 PM in Room B. Only Msg 10 is acceptable; superseded Msg 9 must not be cited.",
     ),
     # 9. Different message lengths and conversation densities
     BenchmarkCase(
@@ -206,9 +222,10 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="tech_ops",
         question="Where will the network diagnostics trace logs be uploaded?",
         expected_supporting_ids=[13],
+        acceptable_evidence_sets=[[13]],
         expected_answerable=True,
         expected_keywords=["engineering drive"],
-        description="Pulls detailed log upload statement following rapid conversational burst (ack, sounds good).",
+        description="Pulls detailed log upload statement following rapid conversational burst (ack, sounds good). Chatter messages [11, 12] are not supporting evidence.",
     ),
     # 10. Mixed-language / bilingual patterns
     BenchmarkCase(
@@ -217,9 +234,10 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="team_collab",
         question="What time is the client presentation tomorrow?",
         expected_supporting_ids=[1],
+        acceptable_evidence_sets=[[1], [0, 1]],
         expected_answerable=True,
         expected_keywords=["10:30", "conference room 2"],
-        description="Mixed Hinglish/English conversation: Priya asks 'Kal ka client presentation kitne baje hai?', Rohan replies with time/room.",
+        description="Mixed Hinglish/English conversation: Priya asks 'Kal ka client presentation kitne baje hai?' (Msg 0), Rohan replies with time/room (Msg 1). Minimal is [1]; contextual pair [0, 1] is acceptable as Msg 0 identifies the presentation is tomorrow.",
     ),
     # 10b. Mixed-language short reply
     BenchmarkCase(
@@ -228,9 +246,10 @@ BENCHMARK_CASES: List[BenchmarkCase] = [
         dataset_name="team_collab",
         question="Which slide contains the Q3 revenue metrics?",
         expected_supporting_ids=[4],
+        acceptable_evidence_sets=[[4], [3, 4]],
         expected_answerable=True,
         expected_keywords=["slide 8"],
-        description="Mixed conversation where Msg 4 ('Added to slide 8.') answers Msg 3 about Q3 revenue metrics.",
+        description="Mixed conversation where Msg 4 ('Added to slide 8.') answers Msg 3 about Q3 revenue metrics. Minimal is [4]; contextual pair [3, 4] is acceptable as Msg 3 identifies the referent.",
     ),
 ]
 
@@ -388,6 +407,7 @@ class CaseExecutionResult:
     attribution_recall: float = 0.0
     correct_abstention: bool = False
     distractor_avoided: bool = True
+    superseded_avoided: bool = True
     grounding_category: str = ""  # TP, TN, FP, FN, ERROR
     partial_e2e_passed: bool = False
     e2e_passed: bool = False
@@ -435,6 +455,7 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
         res.attribution_recall = 0.0
         res.correct_abstention = False
         res.distractor_avoided = False
+        res.superseded_avoided = False
         return res
 
     # 1. Retrieval recall distinctions
@@ -463,12 +484,25 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
         # For answerable queries: 0.0 (missing required citations)
         res.citation_validity_rate = 1.0 if not case.expected_answerable else 0.0
 
-    # 3. Citation attribution precision & recall against known supporting messages
+    # 3. Citation attribution precision & recall against declared acceptable evidence sets
     if case.expected_answerable:
         if cited:
-            correct_citations = len(cited.intersection(expected))
-            res.attribution_precision = correct_citations / len(cited)
-            res.attribution_recall = correct_citations / len(expected)
+            target_sets = (
+                [set(s) for s in case.acceptable_evidence_sets]
+                if case.acceptable_evidence_sets
+                else [set(case.expected_supporting_ids)]
+            )
+            candidates = []
+            for target_set in target_sets:
+                hits = len(cited.intersection(target_set))
+                p = hits / len(cited) if cited else 0.0
+                r = hits / len(target_set) if len(target_set) > 0 else (1.0 if not cited else 0.0)
+                f1 = (2.0 * p * r) / (p + r) if (p + r) > 0.0 else 0.0
+                candidates.append((f1, p, r, target_set))
+
+            best_f1, best_p, best_r, _ = max(candidates, key=lambda x: (x[0], x[1], x[2]))
+            res.attribution_precision = best_p
+            res.attribution_recall = best_r
         else:
             # Answerable case with no citations: precision and recall are strictly 0.0
             res.attribution_precision = 0.0
@@ -490,11 +524,16 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
     else:
         res.correct_abstention = True  # Not applicable, considered satisfied
 
-    # 5. Distractor avoided
+    # 5. Distractor avoided and superseded avoided
     if case.distractor_ids:
         res.distractor_avoided = all(did not in cited for did in case.distractor_ids)
     else:
         res.distractor_avoided = True
+
+    if case.superseded_ids:
+        res.superseded_avoided = all(sid not in cited for sid in case.superseded_ids)
+    else:
+        res.superseded_avoided = True
 
     # 6. Grounding confusion matrix
     if case.expected_answerable:
@@ -515,9 +554,10 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
         # - Context evidence available
         # - Mechanical citation validity (no invalid IDs and at least 1 citation)
         # - No distractors cited
+        # - No superseded messages cited
         # - Semantic groundedness check passed
-        # - Attribution precision must be 1.0 (EVERY cited ID must belong to expected supporting set)
-        # - Attribution recall must be 1.0 (ALL expected supporting IDs must be cited)
+        # - Attribution precision must be 1.0 (EVERY cited ID must belong to an acceptable evidence set)
+        # - Attribution recall must be 1.0 (ALL IDs of the matched acceptable evidence set must be cited)
         res.e2e_passed = (
             len(res.exceptions) == 0
             and res.context_availability_recall_at_k > 0.0
@@ -525,6 +565,7 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
             and len(res.invalid_citation_ids) == 0
             and len(res.valid_citation_ids) > 0
             and res.distractor_avoided
+            and res.superseded_avoided
             and res.grounded
             and res.attribution_precision == 1.0
             and res.attribution_recall == 1.0
@@ -537,6 +578,7 @@ def evaluate_case_metrics(res: CaseExecutionResult) -> CaseExecutionResult:
             and len(res.invalid_citation_ids) == 0
             and len(res.valid_citation_ids) > 0
             and res.distractor_avoided
+            and res.superseded_avoided
             and res.grounded
             and res.attribution_precision == 1.0
             and res.attribution_recall > 0.0

@@ -374,3 +374,271 @@ def test_deterministic_offline_pipeline_execution(tech_ops_env):
     assert resp.get("invalid_citation_ids") == []
     assert resp.get("grounded") is True
     assert "5433" in resp.get("answer", "")
+
+
+def test_bm03_short_reply_minimal_vs_contextual_pair_evidence():
+    """BM-03: Minimal evidence [3] and contextual pair [2, 3] pass; question-only [2] or unrelated fails."""
+    c3 = [c for c in BENCHMARK_CASES if c.case_id == "BM-03-Short-Reply-Context"][0]
+
+    # 1. Minimal sufficient evidence: citing [3] alone
+    r_min = CaseExecutionResult(
+        case=c3,
+        retrieved_message_ids=[3],
+        available_context_ids=[2, 3],
+        valid_citation_ids=[3],
+        answer="The backup SSL certificate was placed in Vault 9 [ID 3].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_min)
+    assert r_min.attribution_precision == 1.0
+    assert r_min.attribution_recall == 1.0
+    assert r_min.e2e_passed is True
+
+    # 2. Contextual pair: citing [2, 3] (question + answer)
+    r_pair = CaseExecutionResult(
+        case=c3,
+        retrieved_message_ids=[2, 3],
+        available_context_ids=[2, 3],
+        valid_citation_ids=[2, 3],
+        answer="Where did we store the backup SSL certificate? [ID 2] Sam confirmed: In Vault 9 [ID 3].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_pair)
+    assert r_pair.attribution_precision == 1.0
+    assert r_pair.attribution_recall == 1.0
+    assert r_pair.e2e_passed is True
+
+    # 3. Question-only: citing [2] alone (lacks the location answer)
+    r_q = CaseExecutionResult(
+        case=c3,
+        retrieved_message_ids=[2],
+        available_context_ids=[2, 3],
+        valid_citation_ids=[2],
+        answer="The backup SSL certificate was stored in Vault 9 [ID 2].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_q)
+    assert r_q.attribution_precision == 1.0
+    assert r_q.attribution_recall == 0.5  # Only 1 of 2 in pair {2, 3}
+    assert r_q.e2e_passed is False
+    assert r_q.partial_e2e_passed is True
+
+    # 4. Unrelated citation mixed in: [3, 4]
+    r_unrelated = CaseExecutionResult(
+        case=c3,
+        retrieved_message_ids=[3],
+        available_context_ids=[2, 3, 4],
+        valid_citation_ids=[3, 4],
+        answer="The certificate was stored in Vault 9 [ID 3], refactored by Vikram [ID 4].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_unrelated)
+    assert r_unrelated.attribution_precision == 0.5  # Only ID 3 is acceptable
+    assert r_unrelated.attribution_recall == 1.0
+    assert r_unrelated.e2e_passed is False
+    assert r_unrelated.partial_e2e_passed is False
+
+
+def test_bm04_pronoun_anaphora_evidence_policy():
+    """BM-04: Minimal evidence [5] and pronoun-antecedent pair [4, 5] pass; antecedent-only [4] fails."""
+    c4 = [c for c in BENCHMARK_CASES if c.case_id == "BM-04-Pronoun-Anaphora"][0]
+
+    # 1. Minimal evidence: citing [5]
+    r_min = CaseExecutionResult(
+        case=c4,
+        retrieved_message_ids=[5],
+        available_context_ids=[4, 5],
+        valid_citation_ids=[5],
+        answer="The cache TTL was reduced to 10 seconds [ID 5].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_min)
+    assert r_min.attribution_precision == 1.0
+    assert r_min.attribution_recall == 1.0
+    assert r_min.e2e_passed is True
+
+    # 2. Contextual pair: citing [4, 5]
+    r_pair = CaseExecutionResult(
+        case=c4,
+        retrieved_message_ids=[4, 5],
+        available_context_ids=[4, 5],
+        valid_citation_ids=[4, 5],
+        answer="Vikram refactored middleware [ID 4] and reduced cache TTL to 10 seconds [ID 5].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_pair)
+    assert r_pair.attribution_precision == 1.0
+    assert r_pair.attribution_recall == 1.0
+    assert r_pair.e2e_passed is True
+
+    # 3. Antecedent-only: citing [4] (lacks TTL value)
+    r_ant = CaseExecutionResult(
+        case=c4,
+        retrieved_message_ids=[4],
+        available_context_ids=[4, 5],
+        valid_citation_ids=[4],
+        answer="Vikram changed cache TTL to 10 seconds [ID 4].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_ant)
+    assert r_ant.attribution_precision == 1.0
+    assert r_ant.attribution_recall == 0.5
+    assert r_ant.e2e_passed is False
+
+
+def test_bm05_multi_message_synthesis_requires_both_evidence_ids():
+    """BM-05: Multi-message synthesis strictly requires both [6, 7]; citing only one fails complete E2E."""
+    c5 = [c for c in BENCHMARK_CASES if c.case_id == "BM-05-Multi-Message-Synthesis"][0]
+
+    # Only Msg 6 cited (omitted sign-off)
+    r6 = CaseExecutionResult(
+        case=c5,
+        available_context_ids=[6, 7],
+        valid_citation_ids=[6],
+        answer="Release 2.4 is scheduled for Tuesday at 3 AM [ID 6].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r6)
+    assert r6.attribution_precision == 1.0
+    assert r6.attribution_recall == 0.5
+    assert r6.e2e_passed is False
+    assert r6.partial_e2e_passed is True
+
+    # Both cited [6, 7]
+    r_both = CaseExecutionResult(
+        case=c5,
+        available_context_ids=[6, 7],
+        valid_citation_ids=[6, 7],
+        answer="Release 2.4 will deploy Tuesday 3 AM [ID 6], staging signed off by QA lead [ID 7].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_both)
+    assert r_both.attribution_precision == 1.0
+    assert r_both.attribution_recall == 1.0
+    assert r_both.e2e_passed is True
+
+    # Both cited + unrelated [6, 7, 8]
+    r_mixed = CaseExecutionResult(
+        case=c5,
+        available_context_ids=[6, 7, 8],
+        valid_citation_ids=[6, 7, 8],
+        answer="Release Tuesday [ID 6], QA lead [ID 7], and port scan article [ID 8].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_mixed)
+    assert round(r_mixed.attribution_precision, 2) == 0.67
+    assert r_mixed.attribution_recall == 1.0
+    assert r_mixed.e2e_passed is False
+
+
+def test_bm08_temporal_revision_rejects_superseded_update():
+    """BM-08: Only the rescheduled update [10] is acceptable; citing superseded Msg 9 fails."""
+    c8 = [c for c in BENCHMARK_CASES if c.case_id == "BM-08-Temporal-Contradiction"][0]
+
+    # 1. Correct: citing only the rescheduled update [10]
+    r_corr = CaseExecutionResult(
+        case=c8,
+        retrieved_message_ids=[10],
+        available_context_ids=[9, 10],
+        valid_citation_ids=[10],
+        answer="The team standup is rescheduled to 2:00 PM in Meeting Room B [ID 10].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_corr)
+    assert r_corr.attribution_precision == 1.0
+    assert r_corr.attribution_recall == 1.0
+    assert r_corr.superseded_avoided is True
+    assert r_corr.e2e_passed is True
+
+    # 2. Citing both superseded [9] and update [10]
+    r_both = CaseExecutionResult(
+        case=c8,
+        retrieved_message_ids=[9, 10],
+        available_context_ids=[9, 10],
+        valid_citation_ids=[9, 10],
+        answer="Standup was at 11:00 AM in Room A [ID 9] but rescheduled to 2:00 PM in Room B [ID 10].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_both)
+    assert r_both.attribution_precision == 0.5  # Only Msg 10 is acceptable supporting evidence for rescheduled
+    assert r_both.attribution_recall == 1.0
+    assert r_both.superseded_avoided is False
+    assert r_both.e2e_passed is False
+
+    # 3. Citing only superseded [9]
+    r_sup = CaseExecutionResult(
+        case=c8,
+        retrieved_message_ids=[9],
+        available_context_ids=[9, 10],
+        valid_citation_ids=[9],
+        answer="The rescheduled standup will happen at 11:00 AM in Room A [ID 9].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_sup)
+    assert r_sup.attribution_precision == 0.0
+    assert r_sup.attribution_recall == 0.0
+    assert r_sup.superseded_avoided is False
+    assert r_sup.e2e_passed is False
+
+
+def test_bm11_mixed_language_short_reply_alternatives():
+    """BM-11: Citing minimal [4] or contextual pair [3, 4] passes; citing request-only [3] fails."""
+    c11 = [c for c in BENCHMARK_CASES if c.case_id == "BM-11-Mixed-Language-Context"][0]
+
+    # Minimal [4]
+    r_min = CaseExecutionResult(
+        case=c11,
+        retrieved_message_ids=[4],
+        available_context_ids=[3, 4],
+        valid_citation_ids=[4],
+        answer="Q3 revenue metrics were added to slide 8 [ID 4].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_min)
+    assert r_min.attribution_precision == 1.0
+    assert r_min.attribution_recall == 1.0
+    assert r_min.e2e_passed is True
+
+    # Contextual pair [3, 4]
+    r_pair = CaseExecutionResult(
+        case=c11,
+        retrieved_message_ids=[3, 4],
+        available_context_ids=[3, 4],
+        valid_citation_ids=[3, 4],
+        answer="Rohan asked to include Q3 metrics [ID 3], and Priya confirmed slide 8 [ID 4].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_pair)
+    assert r_pair.attribution_precision == 1.0
+    assert r_pair.attribution_recall == 1.0
+    assert r_pair.e2e_passed is True
+
+    # Request-only [3]
+    r_req = CaseExecutionResult(
+        case=c11,
+        retrieved_message_ids=[3],
+        available_context_ids=[3, 4],
+        valid_citation_ids=[3],
+        answer="Q3 revenue metrics were added to slide 8 [ID 3].",
+        grounded=True,
+        citations_valid=True,
+    )
+    evaluate_case_metrics(r_req)
+    assert r_req.attribution_precision == 1.0
+    assert r_req.attribution_recall == 0.5
+    assert r_req.e2e_passed is False
