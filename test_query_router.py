@@ -158,6 +158,39 @@ def test_factual_questions_with_between_and_route_to_specific_retrieval(question
 
 
 # =====================================================================
+# 1b. Specific Factual Time, Schedule, and Milestone Inquiries
+# =====================================================================
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What time is the client presentation tomorrow?",
+        "When is the release scheduled?",
+        "What time did they say the meeting starts?",
+        "When was the deadline changed?",
+        "When did someone mention the meeting time?",
+        "What time did the train arrive?",
+        "When did the outage occur?",
+        "At what time was the server restarted?",
+        "What date was the contract signed?",
+        "When was the announcement made?",
+        "What time does the keynote begin?",
+    ],
+)
+def test_specific_factual_time_and_schedule_questions_route_to_semantic_rag(question: str):
+    """
+    Factual inquiries asking for specific event times, schedules, dates,
+    milestones, or conversational statements about timing must route to
+    semantic_rag with specific scope, not time_analysis.
+    """
+    assert_routing(
+        question=question,
+        expected_intent=QueryIntent.SEMANTIC_RAG,
+        expected_scope="specific",
+    )
+
+
+# =====================================================================
 # 2. Genuine Time Analysis and Message Frequency Requests
 # =====================================================================
 
@@ -168,10 +201,13 @@ def test_factual_questions_with_between_and_route_to_specific_retrieval(question
         "How has our messaging frequency changed?",
         "How has message frequency changed over time?",
         "When are we most active?",
+        "When are we usually most active?",
         "What day of the week do we chat the most?",
+        "What day do we chat the most?",
         "What time do we usually talk?",
         "When did we talk the most?",
         "How has our activity changed over time?",
+        "How has our messaging activity changed over time?",
         "How does the tone of the conversation change over time?",
     ],
 )

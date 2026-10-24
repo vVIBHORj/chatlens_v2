@@ -564,6 +564,9 @@ def detect_secondary_intents(query: str) -> List[QueryIntent]:
 
     secondary = []
 
+    if not text or _is_discussion_inquiry(text):
+        return secondary
+
     def add(intent: QueryIntent):
         if intent not in secondary:
             secondary.append(intent)
@@ -573,8 +576,8 @@ def detect_secondary_intents(query: str) -> List[QueryIntent]:
     # --------------------------------------------------------
 
     temporal_patterns = [
-        r"\bwhen\b",
-        r"\bwhat time\b",
+        r"\bwhen\s+(?:are|were|did)\b",
+        r"\bwhat\s+time\s+do\b",
         r"\bover time\b",
         r"\blast year\b",
         r"\blast month\b",
@@ -728,16 +731,19 @@ def detect_secondary_intents(query: str) -> List[QueryIntent]:
 def _is_discussion_inquiry(text: str) -> bool:
     """
     Identify inquiries asking what participants in the chat discussed, mentioned,
-    said, compared, or decided. These are factual retrieval requests about the
+    said, compared, or decided, or factual inquiries regarding specific scheduled
+    events, dates, and times. These are factual retrieval requests about the
     conversation archive, not requests for the assistant to perform whole-chat
     analytical aggregation or profiling.
     """
     patterns = [
-        r"\b(?:did|what did|where did|who did|how did)\s+.*\b(?:discuss|mention|say|tell|compare|decide|write|agree)\b",
+        r"\b(?:did|what did|where did|who did|how did|when did|what time did)\s+.*\b(?:discuss|mention|say|tell|compare|decide|write|agree)\b",
         r"\bwhere in\b.*\b(?:compare|mention|discuss|find)\b",
         r"\bwhat\s+(?:was|were)\s+decided\b",
         r"\bwhat\s+happened\b",
         r"\bwhat\s+(?:is|was)\s+the\s+score\b",
+        r"\b(?:what time|when|what date|which date)\s+(?:is|was|are|were|will|would)\s+.*\b(?:scheduled|planned|held|rescheduled|announced|changed|set|due|fixed|started|starts|begin|begins|happen|happened|occur|occurred|take place|taken place)\b",
+        r"\bwhat time\s+(?:is|was)\b",
     ]
     return any(re.search(p, text) for p in patterns)
 
@@ -837,9 +843,12 @@ def detect_query_intent(query: str) -> QueryIntent:
         r"\bthis month\b",
         r"\blast week\b",
         r"\bthis week\b",
-        r"\bwhen are\b",
-        r"\bwhen did\b",
-        r"\bwhat time\b",
+        r"\bwhen\s+(?:are|were)\s+(?:we|they)\s+(?:usually\s+|normally\s+)?(?:most\s+)?active\b",
+        r"\b(?:most\s+active|peak|busiest)\s+(?:time|hour|day|period)\b",
+        r"\bwhat\s+time\s+do\s+(?:we|they)\b",
+        r"\bwhen\s+did\s+(?:we|they)\s+(?:talk|chat|message|text)(?:\s+the\s+most)?\b",
+        r"\b(?:talk|chat|message|text)\s+the\s+most\b",
+        r"\bwhat\s+day(?:\s+of\s+the\s+week)?\s+do\s+(?:we|they)\b",
         r"\bday of the week\b",
         r"\b(?:message|messaging|chat|chatting|text|texting|conversation|communication|activity)\s+frequency\b",
         r"\bfrequency\s+of\s+(?:messages?|chats?|texts?|conversation|communication|activity)\b",
