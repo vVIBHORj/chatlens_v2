@@ -1,11 +1,16 @@
+import re
 import pytest
+from datetime import datetime
 from unittest.mock import MagicMock
 from langchain_core.documents import Document
 
+from enrich import EnrichedMessage
+from vectorstore import _format_message, _create_chunk_document, build_conversation_chunks
 from rag_graph import (
     validate_citations,
     extract_available_message_ids,
     extract_answer_citations,
+    extract_message_body,
     check_grounded,
     build_generation_prompt,
     generate,
@@ -175,8 +180,8 @@ def test_citation_case_4_valid_chronological_neighbor():
 def test_citation_case_5_chunk_id_incorrectly_used_as_citation():
     chunk_doc = Document(
         page_content=(
-            "[message_id=1] [2022-09-19] Alice: Good morning\n"
-            "[message_id=2] [2022-09-19] Bob: Hello everyone"
+            "[ID 1] [2022-09-19] Alice: Good morning\n"
+            "[ID 2] [2022-09-19] Bob: Hello everyone"
         ),
         metadata={
             "source": "conversation_chunk",
@@ -200,7 +205,7 @@ def test_citation_case_5_chunk_id_incorrectly_used_as_citation():
 
     # 5c: Citing numeric chunk_id that is NOT an individual message ID in the chunk
     chunk_doc_numeric = Document(
-        page_content="[message_id=1] Alice: Hi\n[message_id=2] Bob: Bye",
+        page_content="[ID 1] Alice: Hi\n[ID 2] Bob: Bye",
         metadata={
             "source": "conversation_chunk",
             "chunk_id": 777,
@@ -401,8 +406,8 @@ def test_generation_prompt_permitted_ids_synthetic_evidence():
 def test_generation_prompt_chunk_evidence_embedded_ids_not_chunk_id():
     chunk_doc = Document(
         page_content=(
-            "[message_id=5] Marcus: Cafeteria soup.\n"
-            "[message_id=6] Elena: Submit maintenance log."
+            "[ID 5] Marcus: Cafeteria soup.\n"
+            "[ID 6] Elena: Submit maintenance log."
         ),
         metadata={
             "source": "conversation_chunk",
@@ -651,3 +656,182 @@ def test_grader_failure_preserves_citation_and_grounding_checks():
     assert res_invalid["grounded"] is False
     assert res_invalid["invalid_citation_ids"] == [99]
 
+
+# =====================================================================
+# 22. Chunk-contained message ID canonical formatting tests
+# =====================================================================
+
+def _make_sample_enriched_message(
+    msg_id: int,
+    sender: str,
+    text: str,
+    timestamp_str: str = "2026-10-10 10:00:00",
+) -> EnrichedMessage:
+    dt = datetime.fromisoformat(timestamp_str)
+    return EnrichedMessage(
+        id=msg_id,
+        timestamp=dt,
+        sender=sender,
+        message=text,
+        message_type="user",
+        sentiment_compound=0.0,
+        sentiment_label="neutral",
+        is_question=text.endswith("?"),
+        message_length=len(text),
+        response_time_minutes=None,
+        reply_time_minutes=None,
+    )
+
+
+def test_chunk_multiple_messages_each_retain_own_canonical_id():
+    """
+    Multiple messages inside a single conversation chunk must each retain their own
+    correct [ID N] canonical header and metadata, without inheriting start/end IDs.
+    """
+    msgs = [
+        _make_sample_enriched_message(10, "Vance", "Primary shield at 450 GHz.", "2026-10-10 10:00:00"),
+        _make_sample_enriched_message(11, "Elena", "Acknowledged, telemetry active.", "2026-10-10 10:02:00"),
+        _make_sample_enriched_message(12, "Carlos", "Secondary conduits aligned.", "2026-10-10 10:04:00"),
+    ]
+    chunk_doc = _create_chunk_document(
+        messages=msgs,
+        episode_id=0,
+        chunk_index=0,
+        global_chunk_index=0,
+    )
+
+    # 1. Page content must contain canonical [ID N] for every message
+    assert "[ID 10]" in chunk_doc.page_content
+    assert "[ID 11]" in chunk_doc.page_content
+    assert "[ID 12]" in chunk_doc.page_content
+    assert "[message_id=" not in chunk_doc.page_content
+
+    # 2. Intermediate messages must NOT be overwritten with start_id (10) or end_id (12)
+    lines = chunk_doc.page_content.split("\n")
+    assert len(lines) == 3
+    assert lines[0].startswith("[ID 10]")
+    assert lines[1].startswith("[ID 11]")
+    assert lines[2].startswith("[ID 12]")
+    assert "Elena: Acknowledged, telemetry active." in lines[1]
+
+    # 3. Available IDs must extract all distinct IDs
+    avail = extract_available_message_ids([chunk_doc])
+    assert avail == {10, 11, 12}
+
+
+def test_overlapping_chunks_preserve_identical_canonical_ids():
+    """
+    Overlapping chunks must preserve the identical canonical [ID N] format,
+    timestamps, senders, and content for messages that appear in both chunks.
+    """
+    msgs = [
+        _make_sample_enriched_message(i, f"Speaker{i}", f"Statement number {i}.", f"2026-10-10 10:{i:02d}:00")
+        for i in range(25)
+    ]
+    chunks = build_conversation_chunks(msgs)
+    assert len(chunks) >= 2, "Expected multiple chunks from 25 messages"
+
+    # Verify every chunk contains only canonical [ID N] headers
+    for c in chunks:
+        assert "[message_id=" not in c.page_content
+        for line in c.page_content.split("\n"):
+            assert line.startswith("[ID ")
+
+    # Find messages shared between chunk 0 and chunk 1
+    chunk0_ids = extract_available_message_ids([chunks[0]])
+    chunk1_ids = extract_available_message_ids([chunks[1]])
+    shared_ids = chunk0_ids.intersection(chunk1_ids)
+    assert len(shared_ids) > 0, "Expected overlap between consecutive chunks"
+
+    chunk0_lines = {
+        int(m.group(1)): m.group(0)
+        for m in [re.match(r"^\[ID (\d+)\].*", line) for line in chunks[0].page_content.split("\n")]
+        if m
+    }
+    chunk1_lines = {
+        int(m.group(1)): m.group(0)
+        for m in [re.match(r"^\[ID (\d+)\].*", line) for line in chunks[1].page_content.split("\n")]
+        if m
+    }
+
+    for shared_id in shared_ids:
+        assert chunk0_lines[shared_id] == chunk1_lines[shared_id], (
+            f"Message ID {shared_id} differed across overlapping chunks:\n"
+            f"Chunk 0: {chunk0_lines[shared_id]}\n"
+            f"Chunk 1: {chunk1_lines[shared_id]}"
+        )
+
+
+def test_message_formatting_does_not_duplicate_ids_or_alter_content():
+    """
+    Message formatting must not double-prefix IDs or mutate text/timestamps/senders
+    when passed through formatting or candidate transformation.
+    """
+    msg = _make_sample_enriched_message(42, "Dr. Thorne", "Testing orbital mechanics: gamma=1.2.", "2026-10-10 14:00:00")
+    formatted = _format_message(msg)
+
+    # 1. Exactly one [ID 42] prefix
+    assert formatted.count("[ID 42]") == 1
+    assert "[ID 42] [ID 42]" not in formatted
+    assert "[message_id=" not in formatted
+
+    # 2. Preserves exact text, sender, and timestamp
+    assert "Dr. Thorne: Testing orbital mechanics: gamma=1.2." in formatted
+
+    # 3. Message body extraction returns exact original text
+    extracted = extract_message_body(formatted)
+    assert extracted == "Testing orbital mechanics: gamma=1.2."
+
+    # 4. If formatted message is passed through candidate stripping regex, no double-prefixing occurs
+    clean = re.sub(
+        r"^\[(?:message_id|ID)\s*=?\s*\d+\]\s*\[[^\]]+\]\s*[^:]*:\s*",
+        "",
+        formatted,
+        count=1,
+    )
+    assert clean == "Testing orbital mechanics: gamma=1.2."
+
+
+def test_generation_evidence_contains_canonical_ids_no_legacy_headers():
+    """
+    Generation prompt evidence context must present canonical [ID N] headers
+    and must not contain legacy [message_id=N] syntax.
+    """
+    msgs = [
+        _make_sample_enriched_message(101, "Vance", "Core frequency locked at 450 GHz.", "2026-10-10 10:00:00"),
+        _make_sample_enriched_message(102, "Elena", "Roger that.", "2026-10-10 10:01:00"),
+    ]
+    chunk_doc = _create_chunk_document(msgs, episode_id=1, chunk_index=0, global_chunk_index=0)
+    standalone_doc = Document(
+        page_content="[ID 103] [2026-10-10 10:05 AM] Carlos: Backup online.",
+        metadata={"source": "hybrid_search", "message_id": 103},
+    )
+
+    state = make_test_state(answer="", documents=[chunk_doc, standalone_doc])
+    prompt = build_generation_prompt(state, documents=[chunk_doc, standalone_doc])
+
+    assert "[ID 101]" in prompt
+    assert "[ID 102]" in prompt
+    assert "[ID 103]" in prompt
+    assert "[message_id=" not in prompt
+    assert "[101, 102, 103]" in prompt
+
+    avail = extract_available_message_ids([chunk_doc, standalone_doc])
+    assert avail == {101, 102, 103}
+
+
+def test_extract_available_message_ids_legacy_backward_compatibility():
+    """
+    extract_available_message_ids gracefully handles legacy [message_id=N] test fixtures
+    without crashing, while strictly excluding non-message IDs like chunk_id.
+    """
+    legacy_doc = Document(
+        page_content=(
+            "[message_id=50] Alice: First legacy message.\n"
+            "[message_id=51] Bob: Second legacy message."
+        ),
+        metadata={"source": "conversation_chunk", "chunk_id": 9999},
+    )
+    avail = extract_available_message_ids([legacy_doc])
+    assert avail == {50, 51}
+    assert 9999 not in avail

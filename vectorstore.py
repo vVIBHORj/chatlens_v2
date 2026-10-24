@@ -162,7 +162,7 @@ def _format_message(
     """
 
     return (
-        f"[message_id={message.id}] "
+        f"[ID {message.id}] "
         f"[{_safe_timestamp(message)}] "
         f"{message.sender}: "
         f"{message.message}"
@@ -183,7 +183,7 @@ def build_message_documents(
 
     Example:
 
-        [message_id=123] [2022-09-19 09:27 PM] Vibhor:
+        [ID 123] [2022-09-19 09:27 PM] Vibhor:
         Tum konsi sports loge ...?
 
     Metadata keeps the original message ID available so that

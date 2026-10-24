@@ -1280,8 +1280,8 @@ def extract_available_message_ids(documents: List[Document]) -> Set[int]:
         return available_ids
 
     # Regex patterns for message prefixes in candidate documents:
-    # 1. "[ID 123]" used in hybrid search and chronological context
-    # 2. "[message_id=123]" used in conversation chunks
+    # 1. "[ID 123]" canonical format used in hybrid search, chunks, and chronological context
+    # 2. "[message_id=123]" legacy format retained for backwards compatibility
     id_pattern = re.compile(r"\[(?:ID|message_id)\s*=?\s*(\d+)\]", re.IGNORECASE)
 
     for doc in documents:
