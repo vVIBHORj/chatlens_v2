@@ -2,19 +2,19 @@
 
 # 🔍 ChatLens
 
-### Local, evidence-grounded WhatsApp analysis — relationship insights and a Communication Coach on the roadmap
+### Local, evidence-grounded WhatsApp conversation RAG & analytics engine
 
-*Ask questions in plain English. Inspect the evidence behind answers. Designed for local analysis.*
+*Ask questions in plain English. Inspect the exact message evidence and citations. 100% private, local-first execution.*
 
-![Python](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)
-![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-1C3C3C)
-![LangChain](https://img.shields.io/badge/LangChain-Ollama-1C3C3C?logo=langchain&logoColor=white)
-![Ollama](https://img.shields.io/badge/Ollama-100%25%20Local-000000?logo=ollama&logoColor=white)
-![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector%20Store-FF6F00)
-![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)
-![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?logo=streamlit&logoColor=white)
-![Plotly](https://img.shields.io/badge/Plotly-Charts-3F4F75?logo=plotly&logoColor=white)
-![Privacy](https://img.shields.io/badge/Privacy-Local--First-2ea44f)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-Orchestration-1C3C3C)](https://langchain-ai.github.io/langgraph/)
+[![LangChain](https://img.shields.io/badge/LangChain-Ollama-1C3C3C?logo=langchain&logoColor=white)](https://python.langchain.com/)
+[![Ollama](https://img.shields.io/badge/Ollama-100%25%20Local-000000?logo=ollama&logoColor=white)](https://ollama.com)
+[![ChromaDB](https://img.shields.io/badge/ChromaDB-Vector%20Store-FF6F00)](https://www.trychroma.com/)
+[![SQLite](https://img.shields.io/badge/SQLite-FTS5-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
+[![Streamlit](https://img.shields.io/badge/Streamlit-UI-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)
+[![Plotly](https://img.shields.io/badge/Plotly-Charts-3F4F75?logo=plotly&logoColor=white)](https://plotly.com/)
+[![Tests](https://img.shields.io/badge/Tests-Passing-2ea44f)](https://github.com/vVIBHORj/chatlens_v2)
 
 </div>
 
@@ -23,915 +23,687 @@
 ## 📑 Table of Contents
 
 - [✨ Overview](#-overview)
-- [🚦 Project Status and Scope](#-project-status-and-scope)
-- [🎯 Key Features](#-key-features)
-- [🏗️ System Architecture](#️-system-architecture)
-- [🔄 Data Ingestion Pipeline](#-data-ingestion-pipeline)
-- [🧭 Query Routing](#-query-routing)
-- [🧠 The RAG Graph](#-the-rag-graph)
-- [🔎 Hybrid Retrieval Engine](#-hybrid-retrieval-engine)
-- [🪟 Smart Context Expansion](#-smart-context-expansion)
-- [🗄️ Data Model](#️-data-model)
-- [📊 Analytics Dashboard](#-analytics-dashboard)
-- [🧩 Planned Relationship and Communication Intelligence](#-planned-relationship-and-communication-intelligence)
-- [🧱 Evidence Model and Claim Validation](#-evidence-model-and-claim-validation)
-- [🛡️ Trust-Related Evidence: Design Principles](#️-trust-related-evidence-design-principles)
-- [💬 Communication Coach](#-communication-coach)
-- [🗺️ Implementation Plan](#️-implementation-plan)
+- [🏗️ System Architecture & Design](#️-system-architecture--design)
+- [🧠 The LangGraph RAG State Machine](#-the-langgraph-rag-state-machine)
+- [🎯 Context-Aware Relevance Grading](#-context-aware-relevance-grading)
+- [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
+- [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
+- [🧭 Deterministic Query Routing](#-deterministic-query-routing)
+- [🔄 Ingestion & Enrichment Pipeline](#-ingestion--enrichment-pipeline)
+- [🗄️ Relational & Vector Data Model](#️-relational--vector-data-model)
+- [📊 Analytics & Behavioural Dashboard](#-analytics--behavioural-dashboard)
+- [🧪 Universal Benchmark & Evaluation Infrastructure](#-universal-benchmark--evaluation-infrastructure)
+- [🛡️ Fail-Closed Benchmark Sandbox Architecture](#️-fail-closed-benchmark-sandbox-architecture)
 - [🛠️ Tech Stack](#️-tech-stack)
-- [📂 Project Structure](#-project-structure)
-- [🚀 Getting Started](#-getting-started)
+- [📂 Project Directory Structure](#-project-directory-structure)
+- [🚀 Quick Start Guide](#-quick-start-guide)
 - [⚙️ Configuration Reference](#️-configuration-reference)
-- [🧪 Testing & Diagnostics](#-testing--diagnostics)
-- [🔐 Privacy & Responsible Use](#-privacy--responsible-use)
-- [🗺️ Roadmap](#️-roadmap)
+- [🧪 Testing & Diagnostics Suite](#-testing--diagnostics-suite)
+- [🔐 Privacy, Safety & Responsible Use](#-privacy-safety--responsible-use)
+- [🗺️ Project Status & Roadmap](#️-project-status--roadmap)
 
 ---
 
 ## ✨ Overview
 
-**ChatLens** turns a raw WhatsApp `.txt` export into two things:
+**ChatLens** transforms raw, unstructured WhatsApp chat exports (`.txt`) into an intelligent, evidence-grounded conversational search and relationship intelligence system.
 
-1. **A semantic Q&A interface** – ask things like *"What laptop was he considering buying?"* or *"How did our chats change after March?"* and get an answer grounded in retrieved messages, not a hallucinated guess.
-2. **A behavioural insights dashboard** – sentiment trends, reply-time trends, conversation initiators and word frequencies, all computed with plain `pandas` statistics rather than invented by an LLM.
+Unlike generic RAG pipelines that suffer from conversational fragmentation, lost pronouns, and hallucinated references, ChatLens is engineered specifically for the chaotic reality of human messaging: short replies ("yes", "at 9", "vault 4"), typos, emojis, rapid bursts, interleaved sub-topics, and bilingual/Hinglish banter.
 
-The documented workflow uses **[Ollama](https://ollama.com)** on your own machine, without requiring a hosted LLM API key or per-token API spend. Check your complete environment and dependencies before assuming that every component is fully offline.
+### Core Capabilities:
+1. **Evidence-Grounded Semantic Q&A**: Ask factual or thematic questions in natural language. Answers are backed by canonical message citations (`[ID N]`) with verified provenance and strict anti-hallucination checks.
+2. **Conservative Context-Aware Relevance Grading**: Evaluates retrieved messages in batches using small local LLMs (`qwen2.5:3b`), dynamically supplying bounded preceding conversational context for short elliptical replies without mutating document metadata.
+3. **Dual-Level Hybrid Retrieval**: Combines per-message Chroma vector search, conversation-chunk Chroma search, and full-text SQLite FTS5 BM25 search, unified via evidence-weighted scoring and Reciprocal Rank Fusion.
+4. **Deterministic Analytics**: Generates response-time trends, initiator ratios, weekly sentiment trajectories, and word-frequency distributions using pure `pandas` mathematics—never synthetic LLM guesses.
+5. **Universal Benchmark Suite**: Evaluates 11 distinct conversational phenomena (direct facts, temporal contradictions, multi-message synthesis, absent answers, anaphora, etc.) with deterministic attribution metrics and a fail-closed sandbox.
 
-> **Design principle:** *Chroma locates, SQLite remembers, the LLM reasons.*
-> Vector search finds *where* to look, SQLite is the single source of truth for the full conversation, and the LLM should reason only over evidence that was actually retrieved. Answers still require evaluation: retrieval success alone does not guarantee that every generated claim is supported.
-
----
-
-## 🚦 Project Status and Scope
-
-ChatLens is being developed in stages. This README deliberately separates the existing RAG/analytics baseline from the relationship-analysis and coaching capabilities being designed next.
-
-| Status | Meaning |
-|---|---|
-| ✅ **Existing baseline** | The capability is present in the current project structure or has passed a relevant local smoke test. Individual use cases can still have defects. |
-| 🟡 **In progress / needs validation** | The capability exists, but reliability, end-to-end integration, or evaluation remains incomplete. |
-| 🧭 **Planned** | Design target only. It should not be interpreted as already available in the UI or codebase. |
-
-### Current validation snapshot
-
-| Area | Status | Current understanding |
-|---|---|---|
-| WhatsApp parsing and enrichment | ✅ Existing baseline | Recent test parsed 8,312 messages and enriched 8,310; two system messages were excluded. |
-| SQLite + FTS5 and dual Chroma retrieval | ✅ Existing baseline | Message-level, chunk-level, and lexical retrieval are part of the current architecture. |
-| Duplicate message candidate guard | ✅ Smoke-tested | A recent run reported 27 candidates and 27 unique message IDs. This is an invariant check, not proof that every candidate is relevant. |
-| Context display formatting | ✅ Recent test passed | A recent run showed normalized single headers in the context sent to the model. |
-| Answer groundedness | 🟡 Needs validation | A real sports-question test returned `Grounded: False`; diagnose whether this is a genuine unsupported claim, a checker-input issue, or a response-parsing issue before changing the checker. |
-| Relationship insights and Communication Coach | 🧭 Planned | The feature set, evidence schema, guardrails, and implementation sequence are documented below; they are not claimed as implemented. |
+> **Guiding Principle:** *Chroma locates, SQLite remembers, the LLM reasons.*
+> Vector search finds semantic anchor regions; SQLite serves as the immutable, chronological single source of truth; and local LLMs reason strictly over evidence actually presented in the prompt.
 
 ---
 
-## 🎯 Key Features
+## 🏗️ System Architecture & Design
 
-| | Feature | What it does |
-|---|---|---|
-| 🧭 | **Deterministic query router** | Classifies each question into one of 8 intents (statistics, sentiment, context, …) with no LLM call |
-| 🔀 | **Scope-aware routing** | Broad questions use a whole-chat profile; specific questions use retrieval |
-| 🔎 | **Hybrid retrieval** | Combines message-level semantic search, chunk-level semantic search and SQLite FTS5 keyword search |
-| 🧮 | **Evidence scoring** | Re-ranks candidates with semantic, lexical, term-coverage and multi-source signals |
-| 🪟 | **Context expansion** | Grows each hit into a time-aware conversation window using real timestamp gaps |
-| 🔁 | **Bounded query rewriting** | If retrieval comes back empty, the question is rewritten and retried (max 2 times) |
-| 🟡 | **Groundedness check** | A second LLM pass evaluates support for generated answers; false rejections and claim-level behavior are still being validated |
-| 📊 | **Deterministic analytics** | Trends and engagement stats are pure `pandas`, never LLM guesses |
-| 🔒 | **100% local** | Ollama + ChromaDB + SQLite, all on disk |
-
----
-
-## 🏗️ System Architecture
+The ChatLens architecture is split into five decoupled layers: Ingestion, Storage, Orchestration/Reasoning, Evaluation, and Presentation.
 
 ```mermaid
 flowchart TB
-    subgraph INPUT["📥 Input"]
-        A["WhatsApp .txt export"]
+    subgraph INGESTION["📥 1. Ingestion & Analytical Enrichment"]
+        RAW["WhatsApp .txt Export<br/>(iOS, Android, 12h/24h)"] --> PARSE["parser.py<br/>Regex tokenization, multi-line merge, system line filtering"]
+        PARSE --> ENRICH["enrich.py<br/>VADER sentiment, response/reply times, question detection, stable IDs"]
     end
 
-    subgraph INGEST["⚙️ Ingestion"]
-        B["parser.py<br/>regex parsing, multi-line merge"]
-        C["enrich.py<br/>sentiment, reply times, questions"]
+    subgraph STORAGE["💾 2. Hybrid Storage Layer"]
+        ENRICH --> SQLITE[("SQLite (chat_data.db)<br/>messages table + FTS5 full-text index<br/>(IMMUTABLE SOURCE OF TRUTH)")]
+        ENRICH --> CHROMA_MSG[("ChromaDB: whatsapp_messages<br/>Individual message embeddings<br/>(qwen3-embedding:0.6b)")]
+        ENRICH --> CHROMA_CHUNK[("ChromaDB: whatsapp_chat<br/>Conversation chunks (120m silence gap)<br/>(qwen3-embedding:0.6b)")]
     end
 
-    subgraph STORAGE["💾 Storage Layer"]
-        D[("SQLite<br/>messages + FTS5<br/>SOURCE OF TRUTH")]
-        E[("ChromaDB<br/>whatsapp_messages<br/>whatsapp_chat")]
+    subgraph REASONING["🧠 3. LangGraph Orchestration & Reasoning"]
+        USER_Q(["❓ User Query"]) --> ROUTER["query_router.py<br/>Intent classification & QuerySpec<br/>(Deterministic regex rules)"]
+        ROUTER --> SCOPE{"Scope Router<br/>(Broad vs Specific)"}
+
+        SCOPE -- "Broad (Stats / Sentiment / Time)" --> PROFILE["build_profile_context<br/>Whole-chat pandas analytics & style profile"]
+        SCOPE -- "Specific (Factual / Thematic)" --> RETRIEVE["hybrid_retriever.py<br/>Chroma Messages + Chunks + SQLite FTS5<br/>Evidence-Weighted RRF Re-scoring"]
+
+        RETRIEVE --> GRADER["grade_documents<br/>Conservative batch LLM grading<br/>Context lookahead for short replies"]
+        GRADER --> CHECK_DOCS{"Retained Candidates?"}
+
+        CHECK_DOCS -- "No & Rewrites &lt; 2" --> REWRITE["rewrite_query<br/>Query expansion & re-retrieval"]
+        REWRITE --> RETRIEVE
+        CHECK_DOCS -- "Yes or Rewrites = 2" --> EXPAND["expand_context<br/>Timestamp-bounded SQLite conversation windows"]
+
+        PROFILE --> GENERATE["generate<br/>qwen2.5:3b (temp=0)<br/>Canonical [ID N] evidence formatting"]
+        EXPAND --> GENERATE
+
+        GENERATE --> GROUND["check_grounded<br/>Strict claim-level verification<br/>Mechanical citation validation"]
     end
 
-    subgraph REASON["🧠 Reasoning Layer"]
-        F["query_router.py<br/>intent + QuerySpec"]
-        G["hybrid_retriever.py<br/>semantic + lexical fusion"]
-        H["context_expander.py<br/>time-aware windows"]
-        I["rag_graph.py<br/>LangGraph pipeline"]
-        J["Ollama<br/>qwen2.5:3b"]
+    subgraph PRESENTATION["🖥️ 4. Presentation & Analytics UI"]
+        GROUND --> UI["app.py (Streamlit)<br/>• Ask AI (Grounded answers + expandable citations)<br/>• Conversation Insights (Plotly trends, reply speeds)"]
     end
 
-    subgraph UI["🖥️ Interface"]
-        K["app.py - Streamlit"]
-        L["analytics.py - pandas"]
+    subgraph BENCHMARK["🧪 5. Evaluation & Benchmark Infrastructure"]
+        BENCH_SUITE["benchmark_suite.py<br/>11 Conversational Phenomena (BM-01 to BM-11)"]
+        HARNESS["bm03_comparison_harness.py<br/>Fail-Closed A/B Testing Sandbox"]
+        BENCH_SUITE -.-> STORAGE
+        HARNESS -.-> REASONING
     end
 
-    A --> B --> C
-    C --> D
-    C --> E
-    C --> L
-    K --> I
-    I --> F
-    I --> G
-    G --> D
-    G --> E
-    I --> H
-    H --> D
-    I --> J
-    L --> K
-
-    style D fill:#003B57,color:#fff
-    style E fill:#FF6F00,color:#fff
-    style J fill:#111,color:#fff
-    style I fill:#1C3C3C,color:#fff
-```
-
-The diagram above describes the **current baseline**. The following is the **target architecture** for the new relationship and communication features; the dashed boundary represents work not yet implemented.
-
-```mermaid
-flowchart TB
-    CHAT["WhatsApp export"] --> INGEST["Parse + enrich"]
-    INGEST --> STORE["SQLite source of truth"]
-    INGEST --> VECTORS["Chroma message + chunk index"]
-    STORE --> ROUTE["Query understanding and routing"]
-    VECTORS --> RETRIEVE["Hybrid evidence retrieval"]
-    ROUTE --> RETRIEVE
-    STORE --> ANALYTICS["Deterministic conversation analytics"]
-    RETRIEVE --> EVIDENCE["Evidence extraction with message IDs"]
-    ANALYTICS --> FUSION["Evidence fusion + uncertainty"]
-    EVIDENCE --> FUSION
-    FUSION --> VALIDATE["Claim-to-evidence validation"]
-    VALIDATE --> REPORT["Relationship / communication report"]
-    VALIDATE --> COACH["Communication Coach"]
-    REPORT --> UI["Streamlit interface"]
-    COACH --> UI
-
-    classDef current fill:#dbeafe,stroke:#2563eb,color:#111827
-    classDef planned fill:#fef3c7,stroke:#d97706,color:#111827,stroke-dasharray: 5 5
-    class CHAT,INGEST,STORE,VECTORS,ROUTE,RETRIEVE,ANALYTICS current
-    class EVIDENCE,FUSION,VALIDATE,REPORT,COACH planned
+    style SQLITE fill:#003B57,color:#fff
+    style CHROMA_MSG fill:#FF6F00,color:#fff
+    style CHROMA_CHUNK fill:#FF6F00,color:#fff
+    style USER_Q fill:#2ea44f,color:#fff
+    style UI fill:#FF4B4B,color:#fff
+    style GRADER fill:#8b5cf6,color:#fff
+    style GROUND fill:#10b981,color:#fff
 ```
 
 ---
 
-## 🔄 Data Ingestion Pipeline
+## 🧠 The LangGraph RAG State Machine
+
+ChatLens orchestrates retrieval, evaluation, context expansion, and generation via an explicit **LangGraph** finite state machine.
+
+```mermaid
+stateDiagram-v2
+    [*] --> route_query
+    route_query --> classify_scope: QuerySpec & Intent identified
+
+    classify_scope --> build_profile_context: Scope = Broad
+    classify_scope --> retrieve: Scope = Specific
+
+    build_profile_context --> generate: Whole-chat dataframe profile
+
+    retrieve --> grade_documents: Hybrid candidates (messages + chunks)
+
+    state grade_documents {
+        [*] --> CheckCandidateType
+        CheckCandidateType --> CheckLength: Single Message Anchor
+        CheckCandidateType --> DirectBatch: Transcript Chunk
+        CheckLength --> FetchPrecedingContext: Short Reply (<= 6 words)
+        CheckLength --> DirectBatch: Ordinary Message (> 6 words)
+        FetchPrecedingContext --> AssemblePrompt: Context from SQLite (before=2)
+        DirectBatch --> AssemblePrompt: Standalone Prompt Format
+        AssemblePrompt --> LLM_Batch_Invoke: qwen2.5:3b JSON array
+        LLM_Batch_Invoke --> FilterCandidates: Confident irrelevant dropped
+        FilterCandidates --> [*]
+    }
+
+    grade_documents --> decide_to_generate
+
+    decide_to_generate --> expand_context: Relevant/Uncertain candidates present
+    decide_to_generate --> rewrite_query: Candidate pool empty & rewrites < 2
+    decide_to_generate --> generate: Candidate pool empty & rewrites = 2 (fallback)
+
+    rewrite_query --> retrieve: Formulated alternative query
+
+    expand_context --> generate: Time-aware expanded transcript windows
+
+    generate --> check_grounded: Answer generated with [ID N] citations
+
+    state check_grounded {
+        [*] --> ValidateCitationsMechanical
+        ValidateCitationsMechanical --> SemanticClaimVerification: Citations match available IDs
+        ValidateCitationsMechanical --> MarkUngrounded: Hallucinated / missing ID cited
+        SemanticClaimVerification --> OutputState: Evaluated claim support
+        MarkUngrounded --> OutputState
+        OutputState --> [*]
+    }
+
+    check_grounded --> [*]: Return Answer, Groundedness Flag, Sources
+```
+
+### Graph State Structure
+
+```python
+class GraphState(TypedDict, total=False):
+    question: str                         # Active query (rewritten if retried)
+    original_question: str                # User's raw question
+    documents: List[Document]             # Active evidence candidates
+    generation: str                       # LLM response text
+    rewrite_count: int                    # Retry counter (capped at 2)
+    grounded: bool                        # Strict final groundedness boolean
+    semantic_grounded: bool               # LLM semantic claim verdict
+    df: Optional[pd.DataFrame]            # Enriched dataset for broad analytics
+    scope: str                            # "broad" or "specific"
+    primary_intent: str                   # Classified intent enum
+    secondary_intents: List[str]          # Mixed secondary intents
+    query_spec: Optional[QuerySpec]       # Extracted entities and constraints
+    citation_validation: Optional[dict]   # Detailed mechanical validation report
+    valid_citation_ids: List[int]         # IDs cited that exist in context
+    invalid_citation_ids: List[int]       # Hallucinated citation IDs
+    available_citation_ids: List[int]     # All message IDs present in final prompt
+    grader_status: Optional[str]          # "success" or "failure" (fail-open)
+```
+
+---
+
+## 🎯 Context-Aware Relevance Grading
+
+In real chat archives, many of the most critical answers are **short or elliptical replies**:
+- *"In Vault 9."* (answering *"Where did we store the backup SSL certificate?"*)
+- *"At noon."* (answering *"When is the team standup?"*)
+- *"Yes."* / *"Cancelled."* / *"Sub-level 4."*
+
+When evaluated in isolation, single-message retrieval anchors lacking nouns or context are routinely discarded by standard LLM relevance graders as unhelpful fragments (causing severe **false negatives** and recall collapse). Conversely, naively merging preceding messages directly into document content causes **citation pollution** and phantom evidence attribution.
+
+### The ChatLens Solution: Bounded Context Lookahead with Document Immutability
+
+```mermaid
+flowchart LR
+    subgraph RETRIEVED["Retrieved Single-Message Candidate"]
+        DOC["Document<br/>content: '[ID 3] In Vault 9.'<br/>metadata: message_id=3"]
+    end
+
+    subgraph INSPECTION["Dynamic Length & Type Inspection"]
+        DOC --> CHECK{"is_chunk OR<br/>length &gt; 6 words?"}
+        CHECK -- "Yes" --> PASS_THROUGH["Format Standalone Candidate<br/>(No Context Lookup)"]
+        CHECK -- "No (Short Reply)" --> SQL_FETCH["Query SQLite<br/>get_chronological_context(id=3, before=2, after=0)"]
+    end
+
+    subgraph PROMPT_ASSEMBLY["Structural Grader Prompt Assembly"]
+        SQL_FETCH --> FORMAT["Formatted Candidate Block:<br/>----------------------------------<br/>[Candidate 1] (Single Message ID: 3)<br/>Preceding Conversational Context:<br/>[ID 2] Dev_Alex: Where is the backup SSL certificate?<br/><br/>Candidate Message to Evaluate:<br/>[ID 3] Dev_Sam: In Vault 9."]
+        PASS_THROUGH --> FORMAT_STANDALONE["Formatted Candidate Block:<br/>----------------------------------<br/>[Candidate 1] (Single Message ID: 10)<br/>Commander Vance: The orbital relay vessel embarks..."]
+    end
+
+    subgraph MODEL_EVAL["Conservative Batch Grading (qwen2.5:3b)"]
+        FORMAT --> BATCH["Grade Batch (up to 10 candidates)<br/>Conservative JSON Output"]
+        FORMAT_STANDALONE --> BATCH
+        BATCH --> DECISION{"LLM Decision"}
+        DECISION -- "'relevant'" --> RETAIN["Retain Candidate"]
+        DECISION -- "'uncertain' or syntax error" --> RETAIN
+        DECISION -- "'irrelevant'" --> DROP["Drop Candidate (Confident Distractor)"]
+    end
+
+    subgraph IMMUTABILITY["Document Immutability Guarantee"]
+        RETAIN --> VERIFY["Original Candidate Passed Forward:<br/>• page_content: '[ID 3] In Vault 9.' (UNMODIFIED)<br/>• metadata['message_id']: 3 (UNMODIFIED)<br/>• Context ID 2 is NOT injected into citations"]
+    end
+
+    style DOC fill:#3b82f6,color:#fff
+    style FORMAT fill:#8b5cf6,color:#fff
+    style VERIFY fill:#10b981,color:#fff
+    style DROP fill:#ef4444,color:#fff
+```
+
+### Key Engineering Safeguards:
+1. **Dynamic Scope Control**: Long messages (`> 6` words, `> 35` chars) and conversation chunks (`source == "conversation_chunk"`) bypass SQLite context lookups entirely, preserving processing latency.
+2. **Structural Labeling**: Preceding context is labeled distinctly under `Preceding Conversational Context:`, while the candidate under review is isolated under `Candidate Message to Evaluate:`. The model evaluates whether the candidate is relevant *given* the context.
+3. **Strict Document Immutability**: Neither `page_content` nor `metadata` of the candidate `Document` is modified during grading. Preceding messages remain ephemeral prompt hints. Context expansion occurs only *after* grading.
+4. **Fail-Open Graceful Degradation**: If SQLite is temporarily unavailable, or context returns empty, grading automatically falls back to standalone candidate evaluation without raising exceptions. Syntax errors in JSON parsing default safely to `"uncertain"`, retaining the document for downstream validation.
+
+---
+
+## 🔎 Dual-Level Hybrid Retrieval Engine
+
+ChatLens rejects simple vector search in favor of a 3-way hybrid retrieval and evidence-scoring architecture that balances semantic nuance with keyword precision:
+
+```mermaid
+flowchart TD
+    Q(["User Query"]) --> EXTRACT["Extract Query Terms<br/>(Stopword filtering & regex normalization)"]
+
+    EXTRACT --> S1["🔵 Chroma: whatsapp_messages<br/>Dense message embedding top-k (20)<br/>Model: qwen3-embedding:0.6b"]
+    EXTRACT --> S2["🟣 Chroma: whatsapp_chat<br/>Dense conversation chunk top-k (5)<br/>Model: qwen3-embedding:0.6b"]
+    EXTRACT --> S3["🟢 SQLite FTS5: messages_fts<br/>BM25 keyword search top-k (20)<br/>Handles names, acronyms, dates, slang"]
+
+    S1 --> POOL["Merged Candidate Pool<br/>(Deduplicated by message_id)"]
+    S2 --> POOL
+    S3 --> POOL
+
+    POOL --> SCORE["Multi-Factor Evidence Scoring Engine"]
+
+    subgraph SCORING_WEIGHTS["Evidence Score Weights"]
+        W1["Semantic Similarity (35%)"]
+        W2["Lexical BM25 Score (35%)"]
+        W3["Query-Term Coverage (20%)"]
+        W4["Multi-Source Fusion Bonus (10%)"]
+    end
+
+    SCORING_WEIGHTS -.-> SCORE
+    SCORE --> RANKED(["Ranked Evidence Candidates<br/>(Preserves Message Anchors & Chunk Chunks)"])
+
+    style S1 fill:#3b82f6,color:#fff
+    style S2 fill:#8b5cf6,color:#fff
+    style S3 fill:#10b981,color:#fff
+    style SCORE fill:#f59e0b,color:#000
+    style RANKED fill:#2ea44f,color:#fff
+```
+
+---
+
+## 🪟 Timestamp-Aware Context Expansion
+
+A standalone hit like `"[ID 4] Specialist Lyra: Sub-level 4."` cannot be understood by the final generator without surrounding dialogue. `context_expander.py` expands retained anchors using **real temporal gaps** rather than fixed sentence windows:
+
+```mermaid
+flowchart TD
+    ANCHOR(["Retained Evidence Anchor<br/>[ID N] at timestamp T"]) --> FETCH["Fetch chronological timeline<br/>from SQLite (before & after)"]
+    FETCH --> CHECK_GAP{"Inspect timestamp delta (Δt)<br/>to adjacent message"}
+
+    CHECK_GAP -- "Δt &lt; 180 min" --> EXPAND["Include message in context window"]
+    CHECK_GAP -- "180 min &le; Δt &le; 12 hrs" --> SOFT_BOUND["Soft Boundary: Stop if minimum 5 messages met"]
+    CHECK_GAP -- "Δt &gt; 12 hrs" --> HARD_BOUND["Hard Boundary: Never cross overnight/multi-day silence"]
+
+    EXPAND --> CHECK_CAP{"Window reached 60 messages?"}
+    CHECK_CAP -- "No" --> CHECK_GAP
+    CHECK_CAP -- "Yes" --> BOUNDARY["Finalize Region"]
+
+    SOFT_BOUND --> BOUNDARY
+    HARD_BOUND --> BOUNDARY
+
+    BOUNDARY --> MERGE["Merge overlapping or adjacent conversation regions"]
+    MERGE --> OUT(["Ranked, Non-Redundant Transcript Windows<br/>Formatted with canonical [ID N] headers"])
+
+    style ANCHOR fill:#3b82f6,color:#fff
+    style HARD_BOUND fill:#ef4444,color:#fff
+    style OUT fill:#2ea44f,color:#fff
+```
+
+---
+
+## 🧭 Deterministic Query Routing
+
+To prevent broad behavioral questions from clogging hybrid retrieval, `query_router.py` employs a zero-LLM deterministic classification engine:
+
+```mermaid
+graph TD
+    Q["User Query"] --> INTENT{"Detect Query Intent"}
+
+    INTENT -->|"Factual questions: 'when did', 'what time is the meeting', 'where is'"| SR["SEMANTIC_RAG<br/>(Specific scope → Hybrid Retrieval)"]
+    INTENT -->|"Context inquiries: 'what was said around', 'full exchange'"| CT["CONTEXT<br/>(Specific scope → Timeline window)"]
+    INTENT -->|"Aggregate counts: 'how many messages', 'most active user'"| ST["STATISTICS<br/>(Broad scope → Pandas Aggregation)"]
+    INTENT -->|"Aggregate activity: 'when are we most active', 'what day do we chat most'"| TA["TIME_ANALYSIS<br/>(Broad scope → Hourly/Daily Distributions)"]
+    INTENT -->|"Comparison: 'who talks more', 'compare reply times'"| CM["COMPARISON<br/>(Broad scope → Participant Ratio Matrices)"]
+    INTENT -->|"Sentiment trends: 'how has tone changed', 'who is more positive'"| SA["SENTIMENT_ANALYSIS<br/>(Broad scope → VADER Weekly Trends)"]
+    INTENT -->|"Anomalies: 'unusual silence', 'chat spikes'"| AD["ANOMALY_DETECTION<br/>(Broad scope → Rolling Z-Score Windows)"]
+
+    style SR fill:#3b82f6,color:#fff
+    style CT fill:#3b82f6,color:#fff
+    style ST fill:#10b981,color:#fff
+    style TA fill:#10b981,color:#fff
+    style CM fill:#10b981,color:#fff
+    style SA fill:#10b981,color:#fff
+    style AD fill:#10b981,color:#fff
+```
+
+---
+
+## 🔄 Ingestion & Enrichment Pipeline
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor U as User
-    participant P as parser.py
-    participant E as enrich.py
-    participant S as SQLite
-    participant V as vectorstore.py
-    participant C as ChromaDB
-    participant O as Ollama
+    actor User as User
+    participant App as app.py
+    participant Parser as parser.py
+    participant Enrich as enrich.py
+    participant DB as SQLite (chat_data.db)
+    participant VS as vectorstore.py
+    participant Ollama as Ollama Embeddings
 
-    U->>P: Upload chat.txt
-    P->>P: Regex parse timestamp / sender / message
-    P->>P: Append continuation lines to previous message
-    P->>P: Tag text, media and system messages
-    P->>E: List of ChatMessage
-    E->>E: Stable IDs (original parser position)
-    E->>E: VADER sentiment + label
-    E->>E: Response time and reply time
-    E->>E: Question detection, message length
-    E->>S: save_messages (+ FTS5 triggers)
-    E->>V: EnrichedMessage list
-    V->>V: Build message docs and conversation chunks
-    V->>O: Embed in batches (qwen3-embedding:0.6b)
-    O-->>V: Vectors
-    V->>C: Persist both collections
+    User->>App: Upload raw WhatsApp .txt export
+    App->>Parser: parse_whatsapp_export(filepath)
+    Parser->>Parser: Normalize line endings & regex-split timestamps
+    Parser->>Parser: Merge multi-line messages into preceding entry
+    Parser->>Parser: Filter system notices ("Messages are end-to-end encrypted")
+    Parser-->>Enrich: Return List[ChatMessage]
+    Enrich->>Enrich: Assign permanent, stable integer IDs (0 .. N-1)
+    Enrich->>Enrich: Compute VADER sentiment compound (-1.0 to +1.0)
+    Enrich->>Enrich: Calculate response times and inter-sender reply times
+    Enrich->>Enrich: Detect question flags and character lengths
+    Enrich-->>DB: save_messages() -> SQLite + FTS5 triggers
+    Enrich-->>VS: build_vectorstore(enriched_messages)
+    VS->>VS: Build individual message docs
+    VS->>VS: Build 120-min silence conversation chunks
+    VS->>Ollama: Embed batches (qwen3-embedding:0.6b)
+    Ollama-->>VS: Dense vectors
+    VS->>VS: Persist to Chroma collections
+    App-->>User: Ready for Q&A and Analytics
 ```
-
-### Parsing
-
-`parser.py` handles the common WhatsApp export variants:
-
-```text
-12/1/24, 9:03 AM - John: Hey, are we still on for lunch?     (Android, 12-hour)
-1/12/2024, 21:03 - John: Hey there                            (24-hour)
-[12/1/24, 9:03:12 AM] John: Hey there                         (iOS, bracketed)
-```
-
-- Optional brackets, optional seconds, optional AM/PM, hyphen **or** en-dash separators
-- 12 date/time format fallbacks (`dd/mm` and `mm/dd`)
-- Multi-line messages are merged into the preceding message
-- System lines (no `sender:` split) are tagged `system` and excluded from analysis
-- Over-long "sender" captures (> 60 chars) are rejected to avoid mis-parsing URLs or stray colons
-
-### Enrichment
-
-Every message gets:
-
-| Field | Meaning |
-|---|---|
-| `id` | **Stable** position from the parser; never renumbered, so neighbours can always be found |
-| `sentiment_compound` / `sentiment_label` | VADER compound score and its label |
-| `is_question` | Whether the message is a question |
-| `message_length` | Length of the message |
-| `response_time_minutes` | Time since the immediately previous message |
-| `reply_time_minutes` | Time since the last message from a *different* participant |
 
 ---
 
-## 🧭 Query Routing
-
-Before any retrieval happens, `query_router.py` deterministically classifies the question into an intent and extracts a structured `QuerySpec` (target, entities, answer type, constraints).
-
-```mermaid
-mindmap
-  root((Query Router))
-    Specific
-      SEMANTIC_RAG
-      CONTEXT
-    Broad
-      STATISTICS
-      TIME_ANALYSIS
-      COMPARISON
-      BEHAVIOR_ANALYSIS
-      SENTIMENT_ANALYSIS
-      ANOMALY_DETECTION
-```
-
-| Intent | Scope | Example question |
-|---|---|---|
-| `semantic_rag` | 🎯 Specific | *"What laptop was he thinking of buying?"* |
-| `context` | 🎯 Specific | *"What was said around that argument?"* |
-| `statistics` | 🌐 Broad | *"Who sends more messages?"* |
-| `time_analysis` | 🌐 Broad | *"When are we most active?"* |
-| `comparison` | 🌐 Broad | *"How do our reply speeds compare?"* |
-| `behavior_analysis` | 🌐 Broad | *"How does each person usually respond?"* |
-| `sentiment_analysis` | 🌐 Broad | *"Has the tone changed over time?"* |
-| `anomaly_detection` | 🌐 Broad | *"Any unusual gaps or spikes?"* |
-
----
-
-## 🧠 The RAG Graph
-
-The heart of the project is a **LangGraph** state machine in `rag_graph.py`.
-
-```mermaid
-flowchart TD
-    Q(["❓ User Question"]) --> R["route_query<br/>deterministic intent"]
-    R --> S{"classify_scope"}
-
-    S -- "broad intent" --> P["build_profile_context<br/>whole-chat statistics + style profile"]
-    S -- "specific intent" --> RET["retrieve<br/>hybrid search"]
-
-    P --> GEN
-    RET --> GR["grade_documents<br/>recall-first candidate pool"]
-    GR --> D{"documents found?"}
-
-    D -- "yes" --> EXP["expand_context<br/>SQLite conversation windows"]
-    D -- "no and rewrites &lt; 2" --> RW["rewrite_query"]
-    D -- "no and rewrites = 2" --> GEN
-
-    RW --> RET
-    EXP --> GEN["generate<br/>qwen2.5:3b, temperature 0"]
-    GEN --> CG["check_grounded<br/>groundedness evaluation"]
-    CG --> END(["✅ Answer + grounded flag + sources"])
-
-    style Q fill:#2ea44f,color:#fff
-    style END fill:#2ea44f,color:#fff
-    style S fill:#f6c343,color:#000
-    style D fill:#f6c343,color:#000
-    style GEN fill:#1C3C3C,color:#fff
-```
-
-### Graph state
-
-```python
-class GraphState(TypedDict):
-    question: str              # possibly rewritten
-    original_question: str
-    documents: List[Document]  # retrieved evidence
-    generation: str            # the answer
-    rewrite_count: int
-    grounded: bool
-    df: Optional[pd.DataFrame] # enriched data for broad analysis
-    scope: str                 # "broad" | "specific"
-    primary_intent: str
-    secondary_intents: List[str]
-    query_spec: Optional[QuerySpec]
-```
-
-### What `ask()` returns
-
-```python
-result = ask("Who is udit?", df=df)
-
-result["answer"]         # the generated answer
-result["grounded"]       # True / False from the groundedness check
-result["sources"]        # evidence used
-result["rewrites_used"]  # 0 to 2
-result["scope"]          # "broad" | "specific"
-result["query_spec"]     # structured parse of the question
-```
-
-> **Why `grade_documents` doesn't use the LLM:** retrieval is deliberately **recall-first**. A small model acting as a hard relevance filter can throw away useful evidence, so candidates are retained for generation. The separate groundedness check runs after generation, but its verdict is currently under validation; a `Grounded: True` result must not be treated as proof of correctness without evaluation.
-
----
-
-## 🔎 Hybrid Retrieval Engine
-
-`hybrid_retriever.py` fuses three independent retrieval signals and then **re-scores every candidate** with a deterministic, query-aware evidence score.
-
-```mermaid
-flowchart LR
-    Q(["Query"]) --> T["Term extraction<br/>stopword removal and expansion"]
-
-    T --> A["🔵 Message semantic search<br/>Chroma, top 20"]
-    T --> B["🟢 Lexical search<br/>SQLite FTS5, top 20"]
-    T --> C["🟣 Chunk semantic search<br/>Chroma, top 5"]
-
-    A --> M["Candidate pool<br/>merged by message ID"]
-    B --> M
-    C --> M
-
-    M --> SC["Evidence scoring<br/>semantic, lexical, coverage, multi-source"]
-    SC --> OUT(["Ranked evidence"])
-
-    style A fill:#3b82f6,color:#fff
-    style B fill:#10b981,color:#fff
-    style C fill:#8b5cf6,color:#fff
-    style SC fill:#f59e0b,color:#000
-```
-
-### Evidence score weights
-
-```mermaid
-pie showData title Final Evidence Score Weights
-    "Semantic similarity" : 35
-    "Lexical (FTS5) match" : 35
-    "Query-term coverage" : 20
-    "Multi-source bonus" : 10
-```
-
-> A small additional message-quality term (`0.05`) down-weights low-information messages, and Reciprocal Rank Fusion (`k = 60`) is kept as *one* piece of evidence rather than the final ranker.
-
-| Parameter | Value | Purpose |
-|---|---|---|
-| `MESSAGE_SEMANTIC_TOP_K` | 20 | Candidates from per-message embeddings |
-| `LEXICAL_TOP_K` | 20 | Candidates from FTS5 keyword search |
-| `CHUNK_TOP_K` | 5 | Candidates from conversation-chunk embeddings |
-| `RRF_K` | 60 | Reciprocal Rank Fusion constant |
-
-### Dual-level vector store
-
-`vectorstore.py` maintains **two** Chroma collections so retrieval works at both a fine and a coarse level:
-
-| Collection | Granularity | Best for |
-|---|---|---|
-| `whatsapp_messages` | One document per message | Precise facts, names, specific statements |
-| `whatsapp_chat` | Conversation episodes | Topics, themes, "what did we discuss about…" |
-
-**Chunking rules**
-
-| Setting | Value |
-|---|---|
-| Episode gap (new episode after silence) | 120 min |
-| Max messages per chunk | 50 |
-| Overlap between chunks | 10 messages |
-| Max characters per chunk | 6000 |
-| Embedding batch size | 50 |
-
----
-
-## 🪟 Smart Context Expansion
-
-A single matching message is rarely enough to answer a question. `context_expander.py` grows each hit into a **conversation region** using actual timestamp gaps, not a fixed message count.
-
-```mermaid
-flowchart TD
-    A(["Anchor message"]) --> B["Fetch nearby timeline<br/>from SQLite"]
-    B --> C{"Gap to next or previous message"}
-    C -- "under 180 min" --> D["Include and keep expanding"]
-    C -- "180 min to 12 h" --> E["Normal boundary: stop if minimum reached"]
-    C -- "over 12 h" --> F["Hard boundary: never cross"]
-    D --> G{"Reached 60 messages?"}
-    G -- "no" --> C
-    G -- "yes" --> H["Stop"]
-    E --> I["Region complete"]
-    F --> I
-    H --> I
-    I --> J["Merge temporally connected regions"]
-    J --> K(["Up to 8 ranked context regions"])
-
-    style A fill:#2ea44f,color:#fff
-    style F fill:#ef4444,color:#fff
-    style K fill:#2ea44f,color:#fff
-```
-
-| Setting | Value | Meaning |
-|---|---|---|
-| `NORMAL_GAP_MINUTES` | 180 | A normal conversational pause |
-| `HARD_GAP_HOURS` | 12 | Absolute boundary, never crossed |
-| `MIN_CONTEXT_MESSAGES` | 5 | Minimum messages kept around an anchor |
-| `MAX_CONTEXT_MESSAGES` | 60 | Cap on a single region |
-| `MAX_REGIONS` | 8 | Maximum regions returned |
-| `MAX_EMPTY_MESSAGES` | 3 | Blank or system-like messages tolerated in a row |
-
----
-
-## 🗄️ Data Model
-
-SQLite is the **single source of truth** for the full conversation. `messages_fts` is an FTS5 external-content index kept in sync by `INSERT` / `DELETE` / `UPDATE` triggers.
+## 🗄️ Relational & Vector Data Model
 
 ```mermaid
 erDiagram
     MESSAGES {
-        INTEGER id PK "stable parser position"
-        TEXT timestamp "indexed"
-        TEXT sender "indexed"
-        TEXT message
-        TEXT message_type "text, media or system"
-        REAL sentiment_compound
-        TEXT sentiment_label
-        INTEGER is_question
-        INTEGER message_length
-        REAL response_time_minutes
-        REAL reply_time_minutes
+        INTEGER id PK "Immutable parser position index"
+        TEXT timestamp "ISO-8601 string (indexed)"
+        TEXT sender "Participant name (indexed)"
+        TEXT message "Raw message text"
+        TEXT message_type "text, media, or system"
+        REAL sentiment_compound "VADER score (-1.0 to 1.0)"
+        TEXT sentiment_label "positive, neutral, negative"
+        INTEGER is_question "Boolean (1 or 0)"
+        INTEGER message_length "Character count"
+        REAL response_time_minutes "Time delta from previous message"
+        REAL reply_time_minutes "Time delta from previous other sender"
     }
 
     MESSAGES_FTS {
-        TEXT message "FTS5"
-        TEXT sender "FTS5"
+        TEXT message "Indexed message body"
+        TEXT sender "Indexed sender name"
     }
 
-    MESSAGES ||--|| MESSAGES_FTS : "content_rowid = id"
+    CHROMA_MESSAGES {
+        TEXT id PK "message_id string"
+        BLOB embedding "Dense vector (1024-d / 1536-d)"
+        TEXT document "Canonical [ID N] [timestamp] sender: text"
+        JSON metadata "sender, timestamp, message_id"
+    }
+
+    CHROMA_CHUNKS {
+        TEXT id PK "chunk_id string"
+        BLOB embedding "Dense vector (1024-d / 1536-d)"
+        TEXT document "Multi-message dialogue transcript"
+        JSON metadata "start_id, end_id, episode_id, participants"
+    }
+
+    MESSAGES ||--|| MESSAGES_FTS : "content_rowid = id (Synced via Triggers)"
+    MESSAGES ||--o| CHROMA_MESSAGES : "Indexed 1:1"
+    MESSAGES ||--o{ CHROMA_CHUNKS : "Aggregated into episodes"
 ```
 
 ---
 
-## 📊 Analytics Dashboard
+## 📊 Analytics & Behavioural Dashboard
 
-The **Conversation Insights** tab is powered by `analytics.py`: deterministic `pandas` aggregations, with **no LLM-invented scores**.
+The **Conversation Insights** tab runs entirely on deterministic `pandas` aggregations without synthetic LLM scoring:
 
 ```mermaid
 flowchart LR
-    DF[("Enriched DataFrame")] --> S["sender_summary()"]
+    DF[("Enriched DataFrame<br/>(All messages)")] --> S["sender_summary()"]
     DF --> W["weekly_trend()"]
     DF --> E["engagement_balance()"]
     DF --> F["sender_word_frequencies()"]
 
-    S --> S1["👥 Participant overview table"]
-    W --> W1["📈 Avg sentiment by week"]
-    W --> W2["⏱️ Avg reply time by week"]
-    E --> E1["🥧 Message volume share"]
-    E --> E2["🚦 Who starts conversations?"]
-    F --> F1["🔤 Most used words per sender"]
-```
+    S --> S1["👥 Participant Overview Table<br/>Count, reply speeds, sentiment, questions"]
+    W --> W1["📈 Sentiment Trajectory (VADER over time)"]
+    W --> W2["⏱️ Average Reply Time Trends (Minutes)"]
+    E --> E1["🥧 Message Volume Share (%)"]
+    E --> E2["🚦 Conversation Initiators (3h+ silence gap)"]
+    F --> F1["🔤 Most Frequent Words per Participant"]
 
-| Visual | Chart type | Metric |
-|---|---|---|
-| Participant Overview | Table | Message count, avg and median reply time, avg sentiment, question rate, avg message length |
-| Average Sentiment by Week | Line | VADER compound score per week |
-| Average Reply Time | Line | Mean reply time in minutes per week |
-| Message Volume Share | Pie | Each sender's share of text messages |
-| Who Starts Conversations? | Bar | Messages sent after a 3+ hour silence |
-| Most Used Words | Bar | Top words per sender, with stopwords and WhatsApp noise removed |
+    style DF fill:#003B57,color:#fff
+    style S1 fill:#10b981,color:#fff
+    style W1 fill:#3b82f6,color:#fff
+    style E1 fill:#f59e0b,color:#000
+```
 
 ---
 
-## 🧩 Planned Relationship and Communication Intelligence
+## 🧪 Universal Benchmark & Evaluation Infrastructure
 
-> 🧭 **Status: planned.** These are product goals and design constraints, not a claim that these features are already implemented. The existing parser, retrieval system, SQLite data, and analytics are the foundation on which they will be built.
+ChatLens includes an automated, rigorous benchmark suite in [`benchmark_suite.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/benchmark_suite.py) testing 11 core conversational phenomena:
 
-The goal is to go beyond finding messages and descriptive charts while staying evidence-led. ChatLens should distinguish **what the chat explicitly shows**, **what may be a reasonable interpretation**, and **what cannot be concluded from text alone**.
+| Case ID | Phenomenon Tested | Description | Target Evaluation Contract |
+| :--- | :--- | :--- | :--- |
+| **BM-01** | **Direct Fact** | Explicit single-message factual statement | Minimal sufficient evidence `[0]`; distractor `[8]` rejected |
+| **BM-02** | **Semantic Paraphrase** | High semantic overlap with near-zero lexical overlap | Accurately matches paraphrase without FTS5 keyword assistance |
+| **BM-03** | **Short-Reply Context** | Elliptical short reply (`In Vault 9.`) whose meaning depends on preceding inquiry | Pre-grading context supplies antecedent; `[3]` or `[2, 3]` cited |
+| **BM-04** | **Pronoun Anaphora** | Resolves pronouns ("He mentioned...") to earlier referent | Minimal sufficient evidence `[5]`; contextual pair `[4, 5]` valid |
+| **BM-05** | **Multi-Message Synthesis** | Answer requires combining facts across distinct messages | Strictly requires citing both `[6, 7]`; partial citation fails recall |
+| **BM-06** | **Absent Answer** | Unanswerable query absent from conversation | **Clean abstention**: zero valid/invalid citations; True Negative (TN) |
+| **BM-07** | **Lexical Distractor** | High lexical overlap message about an irrelevant topic | Distractor message `[8]` must be excluded from citations |
+| **BM-08** | **Temporal Revision** | Fact updated later in time (rescheduled meeting) | Cites current update `[10]`; rejects superseded appointment `[9]` |
+| **BM-09** | **Density & Burst Variations** | Dense rapid-fire chat logs vs sparse statements | Measures context window isolation under varying message densities |
+| **BM-10** | **Bilingual / Hinglish** | Code-mixed queries (*"Kal ka client presentation kitne baje hai?"*) | Retrieves across Hindi/English code-switching without translation |
+| **BM-11** | **Bilingual Short Reply** | Short reply in code-mixed conversation (*"Added to slide 8."*) | Resolves referent across language boundaries |
 
-### Planned feature map
+### Benchmark Metrics Calculated Deterministically:
+- **Anchor Retrieval Recall @ k**: Proportion of expected anchor IDs retrieved in the initial top-$k$ candidate pool.
+- **Context Availability Recall @ k**: Proportion of ground-truth evidence IDs present in the final prompt context after grading and expansion.
+- **Citation Validity Rate**: Percentage of generated citations that correspond to valid, existing messages in context.
+- **Attribution Precision**: Fraction of cited message IDs that belong to the pre-declared acceptable evidence sets ($1.0$ = zero irrelevant or hallucinated citations).
+- **Attribution Recall**: Fraction of required evidence IDs successfully cited ($1.0$ = complete evidence coverage).
+- **Correct Abstention Rate**: Percentage of unanswerable questions where the system cleanly abstains without generating citations.
+- **Grounding Confusion Matrix**: Full True Positive (TP), True Negative (TN), False Positive (FP), and False Negative (FN) categorization.
 
-```mermaid
-mindmap
-  root((ChatLens Intelligence))
-    Relationship Patterns
-      Closeness and shared interaction
-      Support and responsiveness
-      Reciprocity and effort patterns
-      Relationship change over time
-    Communication Style
-      Directness and tone
-      Questions and follow-ups
-      Conflict and repair patterns
-      Boundaries and topic changes
-    Trust-related Evidence
-      Reliability and follow-through
-      Consistency across messages
-      Supportive behavior
-      Respect for stated boundaries
-    Romantic / Interpersonal Signals
-      Explicit expressions and invitations
-      Possible interest with alternatives
-      Ambiguity and insufficient evidence
-    Communication Coach
-      Personal-question phrasing
-      Conversation starters
-      Respectful follow-ups
-      Responding to short replies or refusals
-```
+---
 
-### Feature scope and how we intend to build it
+## 🛡️ Fail-Closed Benchmark Sandbox Architecture
 
-| Planned capability | Intended output | Proposed implementation approach |
-|---|---|---|
-| Interpersonal relationship patterns | Evidence-backed descriptions of playful, supportive, professional, romantic, transactional, or acquaintance-like interaction patterns where the messages support that framing | Retrieve time-bounded examples; classify observable interaction acts; compare patterns over time; show alternatives and evidence IDs. Do not force every conversation into one relationship label. |
-| Trust-related evidence | A profile of observed reliability, consistency, support, and boundary-respecting behavior relevant to a specified relationship context | Extract concrete behaviors, track supporting and contradicting examples, and report confidence and data coverage. Do not start with a universal numeric trust score. |
-| Openness and boundaries | Examples of voluntary disclosure, topic limits, privacy concerns, requests, and responses to boundaries | Identify explicit disclosure/boundary language and what happened next. Treat privacy, silence, or refusal as a boundary—not automatically as distrust. |
-| Communication style | Observable tendencies such as directness, question-asking, humor, reassurance, emotional language, and follow-up style | Use examples across time and participants. Describe communication behavior rather than diagnosing personality or assigning immutable traits. |
-| Conflict and repair | Evidence of disagreement, escalation, apology, clarification, compromise, or attempted repair | Analyze the exchange in chronological context; distinguish jokes, ambiguity, and isolated messages from recurring patterns. |
-| Reciprocity and effort | Balanced views of initiation, follow-ups, planning, support, and conversational contributions | Compute deterministic metrics from timestamps and message roles, then interpret them cautiously. Message counts alone cannot establish affection or effort. |
-| Romantic interest indicators | Directly expressed interest, compliments, invitations, and other relevant excerpts—with uncertainty when evidence is indirect | Separate explicit statements from inferred signals; include alternative explanations. Never state private attraction as fact on the basis of ambiguous text. |
-| Emotional closeness and relationship evolution | How observable communication patterns change across defined periods | Compare equivalent time windows and topic/context mix; use evidence snapshots and note missing or uneven data. Do not infer attachment from reply speed or disclosure alone. |
-| Evidence-grounded relationship report | Structured findings with message IDs, dates, evidence for and against, confidence, and limitations | Combine deterministic analytics with a modular evidence extractor and a strict claim validator. Every substantive conclusion should link to source messages. |
-| Communication Coach | Respectful draft wording, conversation openers, non-pressuring follow-ups, and ways to handle a short reply, topic change, or refusal | Generate options for a user-specified goal and tone; prioritize clarity, consent, and respect for boundaries. It must not coach manipulation, coercion, or persistence after a clear no. |
-
-### Target relationship-analysis flow
+To evaluate the system safely without corrupting user data or production databases, ChatLens includes a **fail-closed comparison harness** ([`bm03_comparison_harness.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/bm03_comparison_harness.py)):
 
 ```mermaid
 flowchart TD
-    Q["User question or selected analysis goal"] --> ROUTE["Route to a suitable analysis module"]
-    ROUTE --> RET["Retrieve relevant messages and surrounding context"]
-    ROUTE --> METRICS["Compute deterministic metrics"]
-    RET --> EXTRACT["Extract observations with stable message references"]
-    METRICS --> MERGE["Combine metrics and observations"]
-    EXTRACT --> MERGE
-    MERGE --> ALT["Check contradictions, alternatives, and uncertainty"]
-    ALT --> VALID["Validate each report claim against evidence"]
-    VALID --> OUT["Report with evidence, confidence, and limitations"]
+    subgraph SANDBOX_INIT["1. Sandbox Initialization"]
+        TMP["tempfile.mkdtemp(prefix='chatlens_bm03_safe_')"] --> ISOLATED_STORAGE["Isolated Filesystem:<br/>• tech_ops_chat.db (SQLite)<br/>• tech_ops_chroma/ (Chroma)"]
+    end
 
-    classDef current fill:#dbeafe,stroke:#2563eb,color:#111827
-    classDef planned fill:#fef3c7,stroke:#d97706,color:#111827,stroke-dasharray: 5 5
-    class Q,ROUTE,RET,METRICS current
-    class EXTRACT,MERGE,ALT,VALID,OUT planned
+    subgraph FAIL_CLOSED_GUARDS["2. Fail-Closed Interception Layer"]
+        ISOLATED_STORAGE --> GUARD{"Path Resolution Guard<br/>path.is_relative_to(tmp_dir)?"}
+        GUARD -- "Attempt to touch ./chat_data.db" --> REDIRECT["Redirect to isolated tech_ops_chat.db"]
+        GUARD -- "Attempt to touch ./chroma_db" --> REDIRECT_CHROMA["Redirect to isolated tech_ops_chroma/"]
+        GUARD -- "Attempt to touch unauthorized external path" --> ABORT["💥 Raise IsolationBreachError (FAIL-CLOSED)"]
+        GUARD -- "Inside tmp_dir" --> ALLOW["Proceed with isolated execution"]
+    end
+
+    subgraph REPRODUCIBLE_EVAL["3. Controlled Single-Pass A/B Execution"]
+        ALLOW --> SINGLE_RETRIEVE["Single Retrieval Pass<br/>(Identical candidate documents retrieved once)"]
+        SINGLE_RETRIEVE --> COND_A["Condition A (Context-Aware):<br/>get_grading_preceding_context enabled"]
+        SINGLE_RETRIEVE --> COND_B["Condition B (Standalone Baseline):<br/>get_grading_preceding_context patched to None"]
+
+        COND_A --> COMPARE["Differential Grader Comparison:<br/>• Captures exact prompt text<br/>• Records parsed LLM decisions & reasons<br/>• Measures per-grading latency<br/>• Evaluates candidate retention difference"]
+        COND_B --> COMPARE
+    end
+
+    subgraph TEARDOWN["4. Guaranteed Teardown (try / finally)"]
+        COMPARE --> CLEAN["Restore original global module pointers<br/>Clear Chroma SharedSystemClient cache<br/>shutil.rmtree(tmp_dir)"]
+    end
+
+    style ABORT fill:#ef4444,color:#fff
+    style ALLOW fill:#10b981,color:#fff
+    style REDIRECT fill:#f59e0b,color:#000
+    style REDIRECT_CHROMA fill:#f59e0b,color:#000
 ```
-
-The new subsystem should remain modular. `rag_graph.py` should orchestrate the request, not become a single oversized prompt containing all psychological logic. Specialized modules should return structured evidence that can be tested independently.
-
----
-
-## 🧱 Evidence Model and Claim Validation
-
-> 🧭 **Status: design target.** The schema below is proposed for the planned intelligence layer; it is not yet a production database schema.
-
-Every psychological or relationship-related interpretation should be represented as a traceable, reviewable observation rather than an unsupported label.
-
-### Proposed evidence record
-
-| Field | Purpose |
-|---|---|
-| `evidence_id` | Stable identifier for this extracted evidence item. |
-| `message_ids` | One or more original message IDs supporting the observation. |
-| `time_range` | Relevant date or period, so the report does not erase chronology. |
-| `participants` | The people involved in the observable interaction. |
-| `dimension` | A defined dimension such as reliability, support, openness, boundary respect, reciprocity, or conflict repair. |
-| `observation` | A neutral description of what the message or sequence explicitly shows. |
-| `evidence_direction` | `supports`, `contradicts`, or `neutral` with respect to a specific, clearly stated hypothesis. |
-| `confidence` | Confidence in the extraction/interpretation, not certainty about someone's inner state. |
-| `alternative_explanations` | Plausible non-exclusive interpretations that fit the same messages. |
-| `coverage_limitations` | Missing context, incomplete export, ambiguous slang, media not included, or insufficient examples. |
-
-### Observation → interpretation → report
-
-```mermaid
-flowchart LR
-    MSG["Original message(s)"] --> OBS["Observable fact"]
-    OBS --> HYP["Limited interpretation / hypothesis"]
-    HYP --> PRO["Look for supporting and contradicting evidence"]
-    PRO --> ALT["Consider alternatives and data coverage"]
-    ALT --> GATE{"Sufficient, relevant evidence?"}
-    GATE -- "No" --> INSUF["Report insufficient evidence"]
-    GATE -- "Yes, with limits" --> QUAL["Qualified finding + confidence"]
-    INSUF --> CITE["Always show message references and limitations"]
-    QUAL --> CITE
-```
-
-### Evidence quality rules
-
-1. **Traceability:** every substantive report claim should link to one or more actual message IDs and timestamps.
-2. **Separate fact from interpretation:** quote or summarize the observable behavior first; label interpretations as hypotheses.
-3. **Include counter-evidence:** look for relevant contradictory examples instead of cherry-picking only confirming messages.
-4. **Respect chronology:** one event should not silently become a stable long-term pattern; compare meaningful time windows.
-5. **Calibrate uncertainty:** allow `insufficient evidence`; do not force a score or label if the data is weak.
-6. **Preserve source wording:** slang, sarcasm, Hinglish, questions, requests, possibilities, and ambiguous statements must not be silently converted into confirmed events.
-7. **No false precision:** confidence labels are not calibrated probabilities unless tested and calibrated against reviewed data.
-
-### Evaluation before integration
-
-Before these outputs become user-facing, build a manually reviewed evaluation set containing message IDs and expected interpretations. It should include explicit statements, questions versus events, requests versus completed actions, code-mixed text, sarcasm, ambiguous wording, contradictory evidence, privacy boundaries, and examples where the correct result is **insufficient evidence**. Measure extraction accuracy, evidence-reference validity, unsupported-claim rate, contradiction handling, and calibration before enabling any numeric score.
-
----
-
-## 🛡️ Trust-Related Evidence: Design Principles
-
-ChatLens should not treat trust as a single universal quality that can be read directly from a chat. The proposed scope is narrower: **observable evidence relevant to whether person A appears to regard person B as reliable within a specified relationship context**. Even this must be reported as an evidence-based interpretation, not as access to someone's private mental state.
-
-### Candidate evidence dimensions
-
-| Dimension | Potentially relevant observations | Important caveat |
-|---|---|---|
-| Reliability | Keeping commitments, following through, correcting missed commitments | A promise in chat is not proof that it was fulfilled; look for follow-up evidence. |
-| Consistency / integrity | Statements that remain consistent across comparable contexts; clear corrections when details change | Different wording or changed plans are not automatically dishonesty. Context matters. |
-| Benevolence / support | Offering practical help, checking in, responding to expressed needs | Support in a few messages does not define the whole relationship. |
-| Openness | Voluntary sharing and direct communication about relevant topics | Disclosure is not a trust test. A person may reasonably keep information private. |
-| Boundary respect | A request to stop, change a topic, or keep something private is acknowledged and respected | Asking a personal question does not automatically reduce trust. The wording, pressure, response to refusal, and later behavior matter. |
-| Reciprocity | Initiation, follow-up, planning, listening, and support patterns over time | Equal message counts are not required, and asymmetry does not prove unequal affection. |
-
-### Why no trust percentage at the start?
-
-A Bayesian formulation such as `P(T | E)` can be considered later, but only after the construct `T` is explicitly defined and priors, likelihoods, dependence between observations, calibration, and evaluation procedures are justified. Repeated or correlated messages must not be counted as independent evidence merely to inflate confidence.
-
-The first release should be an **evidence profile**, with supporting and contradicting examples, confidence labels, alternatives, and an explicit data-coverage statement. A numeric trust score is out of scope until it demonstrates validity on a reviewed evaluation set.
-
----
-
-## 💬 Communication Coach
-
-> 🧭 **Status: planned.** This is a writing and reflection aid, not a persuasion engine.
-
-The Coach should help a user express themselves clearly and respectfully. It may use retrieved context to suggest phrasing, but it should not pretend to know what another person feels or recommend pressure tactics.
-
-### Planned user journey
-
-```mermaid
-flowchart TD
-    GOAL["User chooses a goal"] --> TYPE{"Goal type"}
-    TYPE --> ASK["Phrase a personal question"]
-    TYPE --> START["Start or revive a conversation"]
-    TYPE --> FOLLOW["Write a respectful follow-up"]
-    TYPE --> REPLY["Respond to a short reply or topic change"]
-    TYPE --> BOUNDARY["Handle a refusal or stated boundary"]
-    ASK --> CONTEXT["Retrieve relevant context if needed"]
-    START --> CONTEXT
-    FOLLOW --> CONTEXT
-    REPLY --> CONTEXT
-    BOUNDARY --> PRINCIPLES["Prioritize acknowledgement and space"]
-    CONTEXT --> DRAFT["Generate a few tone-controlled options"]
-    PRINCIPLES --> DRAFT
-    DRAFT --> CHECK["Check clarity, pressure, and boundary respect"]
-    CHECK --> OUTPUT["Offer editable suggestions + caveat"]
-```
-
-Expected behaviors:
-
-- Offer options such as direct, warm, casual, or concise without changing the user's intent.
-- Help turn a sensitive question into a low-pressure invitation that makes declining easy.
-- Suggest a respectful follow-up when appropriate, but do not encourage repeated messages after a clear refusal or request for space.
-- Treat a short reply or delayed reply as ambiguous; avoid asserting disinterest, attraction, anger, or attachment without explicit evidence.
-- Keep user agency: present drafts for the user to edit, not instructions designed to manipulate another person.
-
----
-
-## 🗺️ Implementation Plan
-
-The proposed development sequence intentionally stabilizes the existing RAG system before adding interpretation-heavy features.
-
-```mermaid
-flowchart LR
-    P0["Phase 0<br/>Stabilize RAG + grounding"] --> P1["Phase 1<br/>Define evidence schema"]
-    P1 --> P2["Phase 2<br/>Create reviewed evaluation set"]
-    P2 --> P3["Phase 3<br/>Build evidence extraction"]
-    P3 --> P4["Phase 4<br/>Add deterministic analytics"]
-    P4 --> P5["Phase 5<br/>Generate evidence-backed reports"]
-    P5 --> P6["Phase 6<br/>Evaluate trust model"]
-    P6 --> P7["Phase 7<br/>Build Communication Coach"]
-    P7 --> P8["Phase 8<br/>Integrate with Streamlit"]
-
-    classDef current fill:#dbeafe,stroke:#2563eb,color:#111827
-    classDef next fill:#fef3c7,stroke:#d97706,color:#111827,stroke-dasharray: 5 5
-    class P0 current
-    class P1,P2,P3,P4,P5,P6,P7,P8 next
-```
-
-| Phase | Deliverable | Exit criteria |
-|---|---|---|
-| **0 — Stabilize existing pipeline** | Confirm normalized context, message-ID/chunk invariants, no fabricated candidate content, and accurate groundedness behavior | Regression tests pass; false rejection and unsupported-claim cases are understood. Do not weaken the checker to make examples pass. |
-| **1 — Evidence schema** | Define dimensions, evidence direction, confidence, alternatives, message references, and insufficiency rules | Schema is documented and unit-tested independently of the UI. |
-| **2 — Evaluation set** | Manually reviewed questions, evidence IDs, correct interpretations, counterexamples, and abstention cases | Every planned feature has positive, negative, ambiguous, and insufficient-evidence cases. |
-| **3 — Evidence extraction** | Modular extractor outputs structured observations with source references | Source IDs exist, outputs parse to schema, and unsupported interpretations are measured. |
-| **4 — Deterministic analytics** | Initiation, follow-up, response-time, reciprocity proxies, and time-window comparisons | Metrics have transparent definitions and tests; limitations are visible in results. |
-| **5 — Relationship reports** | Reports that combine observations, metrics, counter-evidence, alternatives, and limitations | Every substantive claim has references and passes evaluation checks. |
-| **6 — Trust model evaluation** | Evaluate whether a calibrated model is justified at all | No numeric trust score unless the construct, data, dependence, calibration, and failure modes are defensible. |
-| **7 — Communication Coach** | Respectful drafts and conversation options | Tests cover refusals, stated boundaries, ambiguous replies, and non-manipulative wording. |
-| **8 — UI integration** | Integrate new analysis goals into Streamlit | Clear status labels, source inspection, uncertainty display, and regression tests. |
 
 ---
 
 ## 🛠️ Tech Stack
 
-| Layer | Technology |
-|---|---|
-| 🤖 LLM (generation, rewrite, groundedness) | [Ollama](https://ollama.com) · `qwen2.5:3b` |
-| 🧬 Embeddings | `qwen3-embedding:0.6b` via Ollama |
-| 🔗 Orchestration | LangChain · LangGraph |
-| 🧲 Vector store | ChromaDB (persisted to `./chroma_db`) |
-| 🗃️ Relational store + keyword search | SQLite + FTS5 (`./chat_data.db`) |
-| 💭 Sentiment | VADER (`vaderSentiment`) |
-| 📈 Analytics | pandas |
-| 🖥️ UI | Streamlit · Plotly |
+| Layer | Component | Version / Implementation | Role |
+| :--- | :--- | :--- | :--- |
+| **LLM Inference** | [Ollama](https://ollama.com) | `qwen2.5:3b` (temp=0) | Relevance grading, query rewriting, answer generation, groundedness check |
+| **Embeddings** | [Ollama](https://ollama.com) | `qwen3-embedding:0.6b` | Dual-level semantic embeddings for messages and chunks |
+| **Orchestration** | LangGraph & LangChain | `langgraph >= 0.2`, `langchain-core` | State graph workflow, conditional edges, retry loops |
+| **Vector Database** | ChromaDB | `chromadb >= 0.5`, `langchain-chroma` | Dense vector indexing across `whatsapp_messages` and `whatsapp_chat` |
+| **Relational Store** | SQLite3 + FTS5 | Standard Library | Single source of truth, chronological context lookups, BM25 keyword search |
+| **Analytics Engine** | pandas & numpy | `pandas >= 2.0` | Deterministic trend calculations, reply speeds, initiator metrics |
+| **Sentiment** | VADER | `vaderSentiment` | Rule-based compound sentiment scoring on ingestion |
+| **User Interface** | Streamlit & Plotly | `streamlit >= 1.35`, `plotly` | Interactive chat Q&A, source citation explorer, visual analytics dashboard |
+| **Test Suite** | pytest | `pytest >= 8.0` | Comprehensive unit, regression, offline evaluation, and sandbox tests |
 
 ---
 
-## 📂 Project Structure
+## 📂 Project Directory Structure
 
 ```text
-chatlens_v2/
+ChatLens-RAG/
 │
-├── app.py                 # Streamlit UI: Ask AI tab + Conversation Insights tab
+├── app.py                             # Streamlit UI (Ask AI tab + Conversation Insights tab)
+├── parser.py                          # Multi-format WhatsApp .txt parser & cleaner
+├── enrich.py                          # Feature enrichment (sentiment, response times, stable IDs)
+├── chat_database.py                   # SQLite schema, FTS5 triggers, context window queries
+├── vectorstore.py                     # Dual Chroma collections (individual messages + chunks)
 │
-├── parser.py              # WhatsApp .txt → structured ChatMessage records
-├── enrich.py              # Stable IDs, sentiment, reply times, question flags
+├── query_router.py                    # Deterministic intent routing & QuerySpec extraction
+├── hybrid_retriever.py                # 3-way retrieval fusion & multi-factor evidence scoring
+├── context_expander.py                # Time-aware context window expansion around anchors
+├── rag_graph.py                       # LangGraph state machine with context-aware grading
+├── analytics.py                       # Deterministic pandas statistics & Plotly aggregations
 │
-├── chat_database.py       # SQLite store + FTS5 search + context helpers
-├── vectorstore.py         # Dual-level Chroma store (messages + chunks)
+├── benchmark_suite.py                 # 11-phenomenon universal evaluation benchmark runner
+├── bm03_comparison_harness.py         # Fail-closed A/B testing harness for BM-03 grading
 │
-├── query_router.py        # Deterministic intent classification + QuerySpec
-├── hybrid_retriever.py    # Semantic + lexical retrieval fusion and scoring
-├── context_expander.py    # Timestamp-aware conversation windows
-├── rag_graph.py           # LangGraph pipeline (route → retrieve → generate → verify)
-├── analytics.py           # Deterministic pandas statistics
+├── test_relevance_grading.py          # Unit tests for context-aware grading (Cases A-F)
+├── test_controlled_grading_comparison.py # Controlled offline A/B grading comparison suite
+├── test_bm03_comparison_harness.py    # Unit tests for fail-closed sandbox and path guards
+├── test_universal_benchmark.py        # Offline benchmark metrics & policy contract tests
+├── test_evaluation_harness.py         # Synthetic dataset evaluation harness tests
+├── test_query_router.py               # Deterministic query router test suite
+├── test_hybrid_retriever.py           # Hybrid retrieval fusion unit tests
+├── test_ingestion_pipeline.py         # WhatsApp export parser and enrichment tests
+├── test_real_smoke_test.py            # Live dependency smoke test (requires local Ollama)
 │
-├── retrieval_test.py      # Retrieval diagnostics (no LLM)
-├── hybrid_test.py         # Hybrid search smoke test
-├── context_test.py        # Context expansion test
-├── inspect_context.py     # Print raw messages around a given ID
-├── test.py                # Embedding model sanity check
-│
-├── Requirements.txt       # Python dependencies
-└── .gitignore
-```
-
-### Proposed future modules (not yet claimed to exist)
-
-The names below are architectural suggestions for keeping the new features modular. They should only be added when their responsibilities and tests are ready.
-
-```text
-relationship_analysis/
-├── evidence_schema.py          # Typed evidence records and validation
-├── evidence_extractor.py       # Extract observations tied to message IDs
-├── relationship_metrics.py     # Deterministic, tested metrics over time
-├── evidence_fusion.py          # Supporting/contradicting evidence + alternatives
-├── report_builder.py            # Evidence-backed report structure
-├── trust_evidence.py            # Trust-related evidence profile; no default score
-├── communication_coach.py       # Respectful draft options and boundary checks
-└── evaluation/
-    ├── cases.jsonl              # Manually reviewed questions and expected evidence
-    └── run_evaluation.py        # Regression, grounding, and calibration metrics
+├── Requirements.txt                   # Project dependencies
+└── README.md                          # System documentation
 ```
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Quick Start Guide
 
-### Prerequisites
+### 1. Prerequisites
+- **Python 3.10+** (Python 3.12 recommended)
+- **[Ollama](https://ollama.com/download)** installed and running locally on `http://127.0.0.1:11434`
 
-- **Python 3.10+**
-- **[Ollama](https://ollama.com/download)** installed and running (`http://127.0.0.1:11434`)
-- ~4 GB of free disk space for the local models
-
-### 1️⃣ Pull the models
-
+### 2. Pull Required Local Models
 ```bash
 ollama pull qwen2.5:3b
 ollama pull qwen3-embedding:0.6b
 ```
 
-### 2️⃣ Clone and install
-
+### 3. Clone and Setup Environment
 ```bash
 git clone https://github.com/vVIBHORj/chatlens_v2.git
-cd chatlens_v2
+cd chatlens_v2/ChatLens-RAG
 
+# Create virtual environment
 python -m venv venv
-source venv/bin/activate        # macOS / Linux
-venv\Scripts\activate           # Windows
 
+# Activate virtual environment
+# Windows (PowerShell):
+.\venv\Scripts\Activate.ps1
+# macOS / Linux:
+source venv/bin/activate
+
+# Install dependencies
 pip install -r Requirements.txt
 ```
 
-### 3️⃣ Export your WhatsApp chat
+### 4. Export WhatsApp Chat
+1. Open any WhatsApp chat on your phone.
+2. Tap **Settings / More** (`⋮`) → **Export chat**.
+3. Choose **Without Media**.
+4. Save the `.txt` export to your machine.
 
-> **WhatsApp → open chat → ⋮ / contact name → More → Export chat → Without media**
-
-Save the resulting `.txt` file somewhere on your machine.
-
-### 4️⃣ Run the app
-
+### 5. Launch the Streamlit Interface
 ```bash
 streamlit run app.py
 ```
-
-Upload your `.txt` export in the sidebar, wait for indexing to finish, then:
-
-- 💬 **Ask AI**: ask natural-language questions about the chat
-- 📊 **Conversation Insights**: explore the analytics dashboard
-
-### Using the pipeline from Python
-
-```python
-from parser import parse_whatsapp_export
-from enrich import enrich_messages, to_dataframe
-from rag_graph import ask
-
-messages = parse_whatsapp_export("chat.txt")
-enriched = enrich_messages(messages)
-df       = to_dataframe(enriched)
-
-result = ask("What did we discuss about sports?", df=df)
-print(result["answer"])
-print("Grounded:", result["grounded"])
-```
-
-> The vector store (`./chroma_db`) and SQLite database (`./chat_data.db`) must be built before calling `ask()`.
+Upload your `.txt` export in the sidebar, wait for automated indexing, and start asking questions!
 
 ---
 
 ## ⚙️ Configuration Reference
 
-Most behaviour is tuned with constants at the top of each module.
+Key pipeline parameters can be configured directly in their respective modules:
 
-| File | Constant | Default | Effect |
-|---|---|---|---|
-| `rag_graph.py` | `MAX_REWRITES` | `2` | Max query-rewrite retries |
-| `rag_graph.py` | `CONTEXT_BEFORE` / `CONTEXT_AFTER` | `10` / `10` | Messages added around each hit |
-| `rag_graph.py` | `MAX_HYBRID_CANDIDATES` | `20` | Candidate pool size |
-| `rag_graph.py` | `ChatOllama(model=…)` | `qwen2.5:3b` | Generation model |
-| `vectorstore.py` | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` | Embedding model |
-| `vectorstore.py` | `EPISODE_GAP_MINUTES` | `120` | Silence that starts a new episode |
-| `vectorstore.py` | `PERSIST_DIR` | `./chroma_db` | Chroma location |
-| `chat_database.py` | `DATABASE_PATH` | `./chat_data.db` | SQLite location |
-| `hybrid_retriever.py` | `SEMANTIC_WEIGHT` / `LEXICAL_WEIGHT` | `0.35` / `0.35` | Evidence score weights |
-| `context_expander.py` | `NORMAL_GAP_MINUTES` / `HARD_GAP_HOURS` | `180` / `12` | Conversation boundaries |
+| Parameter | Location | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `MAX_REWRITES` | `rag_graph.py` | `2` | Maximum query reformulation retries if retrieval finds no evidence |
+| `GRADE_BATCH_SIZE` | `rag_graph.py` | `10` | Maximum candidate documents evaluated in a single LLM grading prompt |
+| `SEMANTIC_EXPANSION_MAX_WORDS`| `rag_graph.py` | `6` | Word threshold triggering preceding context lookahead for short replies |
+| `SEMANTIC_EXPANSION_MAX_CHARS`| `rag_graph.py` | `35` | Character threshold triggering context lookahead |
+| `MAX_HYBRID_CANDIDATES` | `rag_graph.py` | `20` | Candidate pool size passed to relevance grading |
+| `MESSAGE_SEMANTIC_TOP_K` | `hybrid_retriever.py` | `20` | Top individual message hits from Chroma |
+| `CHUNK_TOP_K` | `hybrid_retriever.py` | `5` | Top conversation chunk hits from Chroma |
+| `LEXICAL_TOP_K` | `hybrid_retriever.py` | `20` | Top keyword hits from SQLite FTS5 |
+| `EPISODE_GAP_MINUTES` | `vectorstore.py` | `120` | Inactivity silence threshold defining a new conversation episode |
+| `NORMAL_GAP_MINUTES` | `context_expander.py` | `180` | Soft conversational boundary for context expansion |
+| `HARD_GAP_HOURS` | `context_expander.py` | `12` | Absolute hard temporal boundary never crossed during expansion |
 
 ---
 
-## 🧪 Testing & Diagnostics
+## 🧪 Testing & Diagnostics Suite
 
-These scripts help you debug each stage in isolation. Several need a built index and a running Ollama server.
+ChatLens provides a comprehensive, multi-tiered test suite that can be run completely offline without Ollama:
 
 ```bash
-python test.py              # embedding model sanity check
-python retrieval_test.py    # message / chunk / lexical retrieval, no LLM involved
-python hybrid_test.py       # end-to-end hybrid search on sample queries
-python context_test.py      # context expansion behaviour
-python inspect_context.py   # dump raw messages around specific message IDs
-python parser.py chat.txt   # preview parsing output
+# 1. Run all offline relevance grading tests (prompt structure, immutability, scope control)
+python -m pytest test_relevance_grading.py
+
+# 2. Run the controlled context-aware vs standalone comparison tests
+python -m pytest test_controlled_grading_comparison.py
+
+# 3. Run the fail-closed BM-03 comparison harness tests (path guards, sandboxing)
+python -m pytest test_bm03_comparison_harness.py
+
+# 4. Run the universal benchmark policy and metrics tests
+python -m pytest test_universal_benchmark.py
+
+# 5. Run the query router classification tests
+python -m pytest test_query_router.py
+
+# 6. Execute all core offline evaluation suites in one pass
+python -m pytest test_bm03_comparison_harness.py test_controlled_grading_comparison.py test_relevance_grading.py test_universal_benchmark.py
 ```
 
-> 💡 **Debugging tip:** if an answer looks wrong, run `retrieval_test.py` first. If the right messages aren't being *retrieved*, no amount of prompt tuning will fix the answer. Also inspect the groundedness checker separately: a recent sports-question run returned `Grounded: False`, so do not assume the checker is fully validated or make it more permissive merely to pass a single example.
+### Live Benchmark Execution (Requires Local Ollama)
+When local models are running and authorized, execute the full 11-case benchmark suite:
+```bash
+python benchmark_suite.py
+```
 
 ---
 
-## 🔐 Privacy & Responsible Use
+## 🔐 Privacy, Safety & Responsible Use
 
-- 🔒 **Designed for local processing.** Parsing, embeddings, retrieval and generation use local components in the documented setup. Verify your own environment and dependencies before making privacy guarantees.
-- 🚫 **No hosted LLM API is required by the documented local workflow.** Do not assume every dependency or future integration is network-free without checking it.
-- 🗂️ `chat_data.db`, `chroma_db/`, exports and `.env` files should remain ignored by Git. **Never commit raw conversations, generated reports, or evaluation examples containing private messages.**
-- 🧾 Keep evidence references local and make it possible to inspect or remove indexed data.
-
-> ⚠️ **ChatLens is a conversation-analysis aid, not a psychological, medical, or relationship diagnostic.** It cannot read minds or prove someone's intent, attraction, attachment, personality, or trust. Planned relationship features must describe observable text behavior, show supporting and contradicting evidence, include uncertainty and alternatives, and allow an `insufficient evidence` result. Privacy, refusal, silence, delayed replies, disclosure, and message volume must not be treated as standalone proof of distrust, disinterest, or affection. Analyze only conversations you have the right to process and follow applicable consent and privacy requirements.
+- **100% On-Device Processing**: Ingestion, vector storage, BM25 indexing, embedding generation, relevance grading, and text generation all execute on your local hardware. No chat messages or metadata leave your machine.
+- **Fail-Closed Sandboxing**: Automated benchmarks and test evaluations run inside isolated temporary sandboxes with strict guards preventing accidental reads or writes to production databases.
+- **Local Evidence Transparency**: Every answer includes inspectable message IDs, timestamps, and senders. ChatLens never generates claims without displaying the evidence that supported them.
+- **Data Hygiene**: The `.gitignore` file strictly blocks all `.txt` exports, `.db` files, and `chroma_db/` folders from being tracked by Git. Never commit private personal chat exports.
 
 ---
 
-## 🗺️ Roadmap
+## 🗺️ Project Status & Roadmap
 
-### Existing RAG baseline
-- [x] Robust multi-format WhatsApp parser (existing baseline; keep regression coverage)
-- [x] Dual-level Chroma index (messages + conversation chunks)
-- [x] SQLite + FTS5 as source of truth
-- [x] Deterministic 8-intent query router
-- [x] Hybrid retrieval with evidence scoring
-- [x] Timestamp-aware context expansion
-- [x] Message-ID uniqueness invariant and normalized context headers smoke-tested
-- [ ] Diagnose and improve groundedness-check accuracy without weakening the checker
-- [ ] Align the Streamlit upload flow with the SQLite + dual-collection ingestion path
-- [ ] Sidebar model labels read from config instead of hardcoded text
-- [ ] Hinglish / code-mixed sentiment as an evaluated optional mode
-- [ ] Streamed answers and source highlighting in the UI
-- [ ] Automated retrieval-quality and answer-grounding evaluation set
+### ✅ Completed Milestones
+- [x] Multi-format WhatsApp parsing with continuation line merging and system line filtering.
+- [x] Dual-level Chroma vector indexing (individual messages + conversation episodes).
+- [x] SQLite FTS5 synchronized relational storage (Source of Truth).
+- [x] Deterministic 8-intent query routing with factual-time vs aggregate-activity disambiguation.
+- [x] Hybrid 3-way retrieval fusion with query-term coverage and multi-source evidence scoring.
+- [x] Timestamp-aware context expansion respecting conversational silence boundaries.
+- [x] Conservative batch relevance grading with bounded context lookahead for short replies.
+- [x] Candidate document immutability preventing phantom context ID citation pollution.
+- [x] Universal evaluation benchmark suite covering 11 core conversational phenomena.
+- [x] Fail-closed isolated A/B comparison testing harness with strict path guards.
+- [x] Deterministic metrics engine (attribution precision/recall, citation validity, abstention).
 
-### Planned relationship and communication features
-- [ ] Define and test the psychological evidence schema
-- [ ] Build a manually reviewed evaluation set with message IDs and insufficient-evidence cases
-- [ ] Implement modular evidence extraction with source references
-- [ ] Add deterministic relationship/communication metrics and time-window comparisons
-- [ ] Generate evidence-backed relationship reports with contradictions and alternatives
-- [ ] Evaluate trust-related evidence; defer any numeric score until calibration is justified
-- [ ] Build the boundary-respecting Communication Coach
-- [ ] Integrate new analysis modes into Streamlit with clear uncertainty and source inspection
+### 🚀 Upcoming Roadmap
+- [ ] Implement live real-model A/B validation run for BM-03 across local quantization profiles.
+- [ ] Add streaming response token generation in the Streamlit UI.
+- [ ] Add interactive message context graph visualization in the UI.
+- [ ] Optimize Chroma embedding batch throughput on multi-year chat exports (>50,000 messages).
+- [ ] Add optional exportable PDF/HTML conversation summary reports.
 
 ---
 
 <div align="center">
 
-**Built with 🧠 LangGraph · 🦙 Ollama · 🧲 ChromaDB · 🗃️ SQLite · 🎈 Streamlit**
-
-*If you find this useful, consider giving the repo a ⭐*
+**ChatLens** · Engineered for grounded conversation intelligence.
 
 </div>

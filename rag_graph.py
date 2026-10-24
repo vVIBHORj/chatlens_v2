@@ -668,6 +668,128 @@ def retrieve(
 # Relevance Grading Helpers
 # =====================================================================
 
+def extract_message_body(text: str) -> str:
+    """
+    Extract the clean message text from a formatted transcript line or content.
+    Strips leading [ID ...] or [message_id=...], [timestamp], and 'Sender: ' prefixes.
+    """
+    if not text:
+        return ""
+    cleaned = text.strip()
+    cleaned = re.sub(
+        r"^\[(?:ID|message_id)\s*=?\s*\d+\]\s*",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(
+        r"^\[[^\]]+\]\s*",
+        "",
+        cleaned,
+    )
+    cleaned = re.sub(
+        r"^[^:\n]+:\s*",
+        "",
+        cleaned,
+    )
+    return cleaned.strip()
+
+
+def should_expand_semantic_anchor(document: Document) -> bool:
+    """
+    Determine whether a retrieved anchor message in semantic RAG needs
+    chronological context expansion.
+
+    Single message candidates that are short conversational replies or
+    elliptical fragments (e.g. 'Sub-level 4.', '9pm', 'Yes') lack standalone
+    topic context and require preceding messages to be interpreted.
+
+    Conversation chunks already contain multi-message dialogue and are not expanded.
+    Self-contained factual messages with complete sentence structure are preserved
+    as standalone anchors to avoid introducing conversational distractor noise.
+    """
+    metadata = document.metadata or {}
+    if metadata.get("source") == "conversation_chunk":
+        return False
+
+    message_id = metadata.get("message_id")
+    if message_id is None:
+        return False
+
+    body = extract_message_body(document.page_content)
+    if not body:
+        return False
+
+    words = body.split()
+    if len(words) <= SEMANTIC_EXPANSION_MAX_WORDS or len(body) <= SEMANTIC_EXPANSION_MAX_CHARS:
+        return True
+
+    return False
+
+
+def get_grading_preceding_context(
+    document: Document,
+    database_path: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Fetch bounded preceding conversation context (up to 2 messages) for short
+    single-message candidates to help the relevance grader evaluate them in context.
+    Does not mutate the candidate document.
+    """
+    if not should_expand_semantic_anchor(document):
+        return None
+
+    message_id = document.metadata.get("message_id")
+    if message_id is None:
+        return None
+
+    try:
+        kwargs = {
+            "before": 2,
+            "after": 0,
+        }
+        if database_path is not None:
+            kwargs["database_path"] = database_path
+
+        rows = get_chronological_context(int(message_id), **kwargs)
+    except Exception as e:
+        print(
+            f"[GRADER CONTEXT LOOKUP WARNING] Could not fetch preceding context for message_id={message_id}: {e}"
+        )
+        return None
+
+    if not rows:
+        return None
+
+    preceding_rows = [
+        r for r in rows
+        if (r.get("id") if isinstance(r, dict) else r["id"]) != int(message_id)
+    ]
+    if not preceding_rows:
+        return None
+
+    lines = []
+    for row in preceding_rows:
+        if isinstance(row, dict) or hasattr(row, "__getitem__"):
+            row_id = row["id"]
+            timestamp = row["timestamp"]
+            sender = row["sender"] or ""
+            message = row["message"] or ""
+        else:
+            row_id = getattr(row, "id", None)
+            timestamp = getattr(row, "timestamp", None)
+            sender = getattr(row, "sender", "") or ""
+            message = getattr(row, "message", "") or ""
+        try:
+            dt = datetime.fromisoformat(str(timestamp))
+            timestamp_text = dt.strftime("%d/%m/%Y %I:%M %p")
+        except Exception:
+            timestamp_text = str(timestamp or "")
+        lines.append(f"[ID {row_id}] [{timestamp_text}] {sender}: {message}")
+
+    return "\n".join(lines)
+
+
 GRADE_PROMPT_TEMPLATE = (
     "You are a conservative relevance grader for a WhatsApp chat archive retrieval system.\n"
     "Assess whether each retrieved candidate contains information relevant to answering the user's question, "
@@ -678,7 +800,7 @@ GRADE_PROMPT_TEMPLATE = (
     "{candidates_text}\n\n"
     "Evaluation Guidelines:\n"
     "1. Evaluate each candidate individually.\n"
-    "2. Candidates may be single messages or conversation transcript chunks.\n"
+    "2. Candidates may be single messages (which may include preceding conversational context for short replies) or conversation transcript chunks.\n"
     "3. Conversational chats are informal: short replies (e.g., 'yes', '9pm', 'sure'), typos, emojis, "
     "slang, and indirect statements may be relevant context.\n"
     "4. Do NOT reject a candidate solely because of zero lexical keyword overlap, short length, or emojis.\n"
@@ -694,7 +816,11 @@ GRADE_PROMPT_TEMPLATE = (
 )
 
 
-def format_candidate_for_grader(idx: int, document: Document) -> str:
+def format_candidate_for_grader(
+    idx: int,
+    document: Document,
+    preceding_context: Optional[str] = None,
+) -> str:
     """Format a candidate document for the grader prompt preserving evidence type."""
     source = document.metadata.get("source", "unknown")
     if source == "conversation_chunk":
@@ -705,6 +831,15 @@ def format_candidate_for_grader(idx: int, document: Document) -> str:
         header = f"[Candidate {idx}] (Single Message ID: {msg_id})"
     else:
         header = f"[Candidate {idx}] (Evidence Source: {source})"
+
+    if preceding_context:
+        return (
+            f"{header}\n"
+            f"Preceding Conversational Context:\n"
+            f"{preceding_context.strip()}\n\n"
+            f"Candidate Message to Evaluate:\n"
+            f"{document.page_content.strip()}"
+        )
 
     return f"{header}\n{document.page_content.strip()}"
 
@@ -797,6 +932,7 @@ def grade_candidate_batch(
     question: str,
     batch_docs: List[Document],
     grader_llm: Optional[Any] = None,
+    database_path: Optional[str] = None,
 ) -> List[Tuple[Document, str, str, str]]:
     """
     Grade a bounded batch of candidates using LLM in a single structured prompt.
@@ -808,7 +944,11 @@ def grade_candidate_batch(
     active_llm = grader_llm if grader_llm is not None else llm
     indices = list(range(1, len(batch_docs) + 1))
     formatted_chunks = [
-        format_candidate_for_grader(idx, doc)
+        format_candidate_for_grader(
+            idx,
+            doc,
+            preceding_context=get_grading_preceding_context(doc, database_path=database_path),
+        )
         for idx, doc in zip(indices, batch_docs)
     ]
     candidates_text = "\n\n---\n\n".join(formatted_chunks)
@@ -844,6 +984,7 @@ def grade_candidate_batch(
 def grade_documents(
     state: GraphState,
     grader_llm: Optional[Any] = None,
+    database_path: Optional[str] = None,
 ) -> GraphState:
     """
     Conservatively grade retrieved documents using bounded LLM batch evaluation.
@@ -865,6 +1006,7 @@ def grade_documents(
         }
 
     question = state.get("original_question") or state.get("question", "")
+    db_path = database_path or state.get("database_path")
     print(
         f"\nConservative relevance grading: evaluating {len(documents)} "
         f"candidates in batches of up to {GRADE_BATCH_SIZE}..."
@@ -878,7 +1020,12 @@ def grade_documents(
     # Process in bounded batches
     for batch_start in range(0, len(documents), GRADE_BATCH_SIZE):
         batch = documents[batch_start : batch_start + GRADE_BATCH_SIZE]
-        graded_results = grade_candidate_batch(question, batch, grader_llm=grader_llm)
+        graded_results = grade_candidate_batch(
+            question,
+            batch,
+            grader_llm=grader_llm,
+            database_path=db_path,
+        )
 
         for doc, decision, reason, grader_status in graded_results:
             if grader_status == "failure":
@@ -1021,73 +1168,6 @@ def rewrite_query(
             state["rewrite_count"] + 1
         ),
     }
-
-
-# =====================================================================
-# Expand relevant documents
-# =====================================================================
-
-# =====================================================================
-# Message body extraction & semantic expansion decision
-# =====================================================================
-
-def extract_message_body(text: str) -> str:
-    """
-    Extract the clean message text from a formatted transcript line or content.
-    Strips leading [ID ...] or [message_id=...], [timestamp], and 'Sender: ' prefixes.
-    """
-    if not text:
-        return ""
-    cleaned = text.strip()
-    cleaned = re.sub(
-        r"^\[(?:ID|message_id)\s*=?\s*\d+\]\s*",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(
-        r"^\[[^\]]+\]\s*",
-        "",
-        cleaned,
-    )
-    cleaned = re.sub(
-        r"^[^:\n]+:\s*",
-        "",
-        cleaned,
-    )
-    return cleaned.strip()
-
-
-def should_expand_semantic_anchor(document: Document) -> bool:
-    """
-    Determine whether a retrieved anchor message in semantic RAG needs
-    chronological context expansion.
-
-    Single message candidates that are short conversational replies or
-    elliptical fragments (e.g. 'Sub-level 4.', '9pm', 'Yes') lack standalone
-    topic context and require preceding messages to be interpreted.
-
-    Conversation chunks already contain multi-message dialogue and are not expanded.
-    Self-contained factual messages with complete sentence structure are preserved
-    as standalone anchors to avoid introducing conversational distractor noise.
-    """
-    metadata = document.metadata or {}
-    if metadata.get("source") == "conversation_chunk":
-        return False
-
-    message_id = metadata.get("message_id")
-    if message_id is None:
-        return False
-
-    body = extract_message_body(document.page_content)
-    if not body:
-        return False
-
-    words = body.split()
-    if len(words) <= SEMANTIC_EXPANSION_MAX_WORDS or len(body) <= SEMANTIC_EXPANSION_MAX_CHARS:
-        return True
-
-    return False
 
 
 # =====================================================================

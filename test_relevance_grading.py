@@ -643,3 +643,286 @@ def test_fallback_case_8_failure_state_handling_graph_usable_and_reflects_limits
     assert len(expanded_state["documents"]) == 1
     assert expanded_state["documents"][0].metadata.get("grader_status") == "failure"
 
+
+# =====================================================================
+# 21. Context-dependent short message relevance grading
+# =====================================================================
+
+def test_terse_reply_receives_preceding_context_in_grader_prompt():
+    """
+    Case A: Relevant terse reply
+    - Query asks where an item is stored.
+    - Candidate reply is a short location.
+    - The preceding message asks where that item was stored.
+    - Assert that the grader input includes the preceding message and clearly identifies the candidate.
+    """
+    doc_short = Document(
+        page_content="[ID 4] [2026-10-15 09:21] Specialist Lyra: Sub-level 4.",
+        metadata={"source": "hybrid_search", "message_id": 4},
+    )
+    state = make_test_state(
+        question="Where are the backup coolant canisters stored?",
+        documents=[doc_short],
+    )
+
+    mock_llm = make_mock_llm(
+        json.dumps([{"candidate": 1, "decision": "relevant", "reason": "Preceding context confirms storage location"}])
+    )
+
+    mock_chronological_context = [
+        {
+            "id": 3,
+            "timestamp": "2026-10-15T09:20:00",
+            "sender": "Tech Kael",
+            "message": "Where did we store the backup cryogenic coolant canisters?",
+        },
+        {
+            "id": 4,
+            "timestamp": "2026-10-15T09:21:00",
+            "sender": "Specialist Lyra",
+            "message": "Sub-level 4.",
+        },
+    ]
+
+    with patch("rag_graph.get_chronological_context", return_value=mock_chronological_context):
+        result_state = grade_documents(state, grader_llm=mock_llm)
+
+    assert len(result_state["documents"]) == 1
+    assert mock_llm.invoke.called
+    grader_prompt = mock_llm.invoke.call_args[0][0]
+
+    # Verify prompt structures
+    assert "Preceding Conversational Context:" in grader_prompt
+    assert "[ID 3]" in grader_prompt
+    assert "Tech Kael: Where did we store the backup cryogenic coolant canisters?" in grader_prompt
+    assert "Candidate Message to Evaluate:" in grader_prompt
+    assert "[ID 4] [2026-10-15 09:21] Specialist Lyra: Sub-level 4." in grader_prompt
+
+
+def test_context_dependent_pronoun_receives_antecedent_context():
+    """
+    Case B: Context-dependent pronoun
+    - Candidate contains a short pronoun-based reply.
+    - Preceding message establishes the subject.
+    - Assert that the grader receives both messages with their distinct IDs.
+    """
+    doc_pronoun = Document(
+        page_content="[ID 12] [2026-10-15 14:02] Sarah: She did.",
+        metadata={"source": "hybrid_search", "message_id": 12},
+    )
+    state = make_test_state(
+        question="Who approved the telescope recalibration?",
+        documents=[doc_pronoun],
+    )
+
+    mock_llm = make_mock_llm(
+        json.dumps([{"candidate": 1, "decision": "relevant", "reason": "Antecedent clarifies subject"}])
+    )
+
+    mock_context = [
+        {
+            "id": 11,
+            "timestamp": "2026-10-15T14:01:00",
+            "sender": "Mark",
+            "message": "Did Dr. Aris approve the telescope recalibration?",
+        },
+        {
+            "id": 12,
+            "timestamp": "2026-10-15T14:02:00",
+            "sender": "Sarah",
+            "message": "She did.",
+        },
+    ]
+
+    with patch("rag_graph.get_chronological_context", return_value=mock_context):
+        result_state = grade_documents(state, grader_llm=mock_llm)
+
+    assert len(result_state["documents"]) == 1
+    grader_prompt = mock_llm.invoke.call_args[0][0]
+
+    # Assert distinct IDs are present in their respective sections
+    assert "Preceding Conversational Context:" in grader_prompt
+    assert "[ID 11]" in grader_prompt
+    assert "Dr. Aris approve the telescope recalibration" in grader_prompt
+    assert "Candidate Message to Evaluate:" in grader_prompt
+    assert "[ID 12]" in grader_prompt
+    assert "Sarah: She did." in grader_prompt
+
+
+def test_misleading_context_passed_accurately():
+    """
+    Case C: Misleading context
+    - Query concerns server deployment, but preceding message concerns cafeteria lunch.
+    - Candidate reply is 'At noon.'
+    - Assert that context is passed accurately to the grader without hardcoding semantic judgment.
+    """
+    doc_time = Document(
+        page_content="[ID 25] [2026-10-15 11:35] Dave: At noon.",
+        metadata={"source": "hybrid_search", "message_id": 25},
+    )
+    state = make_test_state(
+        question="When is the server database deployment?",
+        documents=[doc_time],
+    )
+
+    # Grader decides irrelevant based on misleading antecedent
+    mock_llm = make_mock_llm(
+        json.dumps([{"candidate": 1, "decision": "irrelevant", "reason": "Context shows time refers to lunch, not deployment"}])
+    )
+
+    mock_context = [
+        {
+            "id": 24,
+            "timestamp": "2026-10-15T11:30:00",
+            "sender": "Carol",
+            "message": "What time is the team lunch in the cafeteria today?",
+        },
+        {
+            "id": 25,
+            "timestamp": "2026-10-15T11:35:00",
+            "sender": "Dave",
+            "message": "At noon.",
+        },
+    ]
+
+    with patch("rag_graph.get_chronological_context", return_value=mock_context):
+        result_state = grade_documents(state, grader_llm=mock_llm)
+
+    # Grader prompt received the cafeteria context accurately
+    grader_prompt = mock_llm.invoke.call_args[0][0]
+    assert "Preceding Conversational Context:" in grader_prompt
+    assert "[ID 24]" in grader_prompt
+    assert "What time is the team lunch in the cafeteria today?" in grader_prompt
+    assert "Candidate Message to Evaluate:" in grader_prompt
+    assert "[ID 25]" in grader_prompt
+
+    # Because grader decided irrelevant, it is removed
+    assert len(result_state["documents"]) == 0
+
+
+def test_citation_and_document_integrity_preserved():
+    """
+    Case D: Citation and document integrity
+    - Original candidate content and metadata remain unchanged after grading.
+    - Candidate message ID remains its citation anchor.
+    - Preceding context ID does not become an available citation ID or candidate ID.
+    """
+    original_content = "[ID 4] [2026-10-15 09:21] Specialist Lyra: Sub-level 4."
+    doc = Document(
+        page_content=original_content,
+        metadata={
+            "source": "hybrid_search",
+            "message_id": 4,
+            "hybrid_score": 0.88,
+            "evidence_score": 0.75,
+        },
+    )
+    state = make_test_state(
+        question="Where are the canisters?",
+        documents=[doc],
+    )
+
+    mock_llm = make_mock_llm(
+        json.dumps([{"candidate": 1, "decision": "relevant", "reason": "Valid answer"}])
+    )
+
+    mock_context = [
+        {
+            "id": 3,
+            "timestamp": "2026-10-15T09:20:00",
+            "sender": "Tech Kael",
+            "message": "Where did we store the canisters?",
+        },
+        {
+            "id": 4,
+            "timestamp": "2026-10-15T09:21:00",
+            "sender": "Specialist Lyra",
+            "message": "Sub-level 4.",
+        },
+    ]
+
+    with patch("rag_graph.get_chronological_context", return_value=mock_context):
+        result_state = grade_documents(state, grader_llm=mock_llm)
+
+    assert len(result_state["documents"]) == 1
+    retained_doc = result_state["documents"][0]
+
+    # Content is unchanged (preceding context was grading-only)
+    assert retained_doc.page_content == original_content
+    # Original metadata preserved
+    assert retained_doc.metadata["message_id"] == 4
+    assert retained_doc.metadata["hybrid_score"] == 0.88
+    assert retained_doc.metadata["evidence_score"] == 0.75
+    # ID 3 is NOT in document metadata or page_content
+    assert retained_doc.metadata.get("context_start_message_id") is None
+    assert "[ID 3]" not in retained_doc.page_content
+
+
+def test_safe_fallback_on_missing_context_or_lookup_error():
+    """
+    Case E: Safe fallback
+    - Empty context and database exception handled gracefully without crashing.
+    - Candidate is graded using the fallback (page_content alone).
+    """
+    doc = Document(
+        page_content="[ID 4] Specialist Lyra: Sub-level 4.",
+        metadata={"source": "hybrid_search", "message_id": 4},
+    )
+    state = make_test_state(documents=[doc])
+
+    # 1. Lookup raises an exception
+    mock_llm_1 = make_mock_llm(
+        json.dumps([{"candidate": 1, "decision": "uncertain", "reason": "No context available"}])
+    )
+    with patch("rag_graph.get_chronological_context", side_effect=RuntimeError("SQLite connection lost")):
+        result_1 = grade_documents(state, grader_llm=mock_llm_1)
+
+    assert len(result_1["documents"]) == 1
+    prompt_1 = mock_llm_1.invoke.call_args[0][0]
+    assert "Preceding Conversational Context:" not in prompt_1
+    assert "[Candidate 1] (Single Message ID: 4)" in prompt_1
+
+    # 2. Lookup returns empty list
+    mock_llm_2 = make_mock_llm(
+        json.dumps([{"candidate": 1, "decision": "uncertain", "reason": "No context available"}])
+    )
+    with patch("rag_graph.get_chronological_context", return_value=[]):
+        result_2 = grade_documents(state, grader_llm=mock_llm_2)
+
+    assert len(result_2["documents"]) == 1
+    prompt_2 = mock_llm_2.invoke.call_args[0][0]
+    assert "Preceding Conversational Context:" not in prompt_2
+
+
+def test_scope_control_long_messages_and_chunks_bypass_preceding_context_lookup():
+    """
+    Case F: Scope control
+    - Ordinary-length messages and conversation chunks do not trigger get_chronological_context.
+    """
+    doc_long = Document(
+        page_content="[ID 10] Commander Vance: The orbital relay vessel embarks as soon as dusk falls across the platform.",
+        metadata={"source": "hybrid_search", "message_id": 10},
+    )
+    chunk_doc = Document(
+        page_content="[ID 1] Alice: Hi\n[ID 2] Bob: Bye",
+        metadata={"source": "conversation_chunk", "chunk_id": 99},
+    )
+    state = make_test_state(documents=[doc_long, chunk_doc])
+
+    mock_llm = make_mock_llm(
+        json.dumps([
+            {"candidate": 1, "decision": "relevant", "reason": "Factual statement"},
+            {"candidate": 2, "decision": "relevant", "reason": "Chunk dialogue"},
+        ])
+    )
+
+    with patch("rag_graph.get_chronological_context") as mock_lookup:
+        result_state = grade_documents(state, grader_llm=mock_llm)
+
+    # get_chronological_context must NOT be called for long messages or chunks
+    mock_lookup.assert_not_called()
+
+    prompt = mock_llm.invoke.call_args[0][0]
+    assert "Preceding Conversational Context:" not in prompt
+    assert len(result_state["documents"]) == 2
+
