@@ -3,12 +3,17 @@
 *.sqlite
 *.sqlite3
 chat_data.db
+eval_sandbox.db
+tech_ops_chat.db
 
 # Vector databases & local embeddings cache
 chroma_db/
+tech_ops_chroma/
+eval_chroma/
 
 # Data exports & raw chats
 sample_chat.txt
+tech_ops_chat.txt
 *.log
 
 # Python cache & build outputs
@@ -40,5 +45,3 @@ Thumbs.db
 venv/
 env/
 .venv/
-
-sample_chat.txt

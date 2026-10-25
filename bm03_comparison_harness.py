@@ -21,6 +21,7 @@ Safety Guarantees & Constraints:
    Ollama calls.
 """
 
+import inspect
 import time
 import copy
 import shutil
@@ -144,35 +145,42 @@ class SafeBM03Environment:
         self.orig_load_chunk = hybrid_retriever.load_chunk_vectorstore
         self.orig_vec_load_msg = vectorstore.load_message_vectorstore
         self.orig_vec_load_chunk = vectorstore.load_chunk_vectorstore
+        self.orig_defaults: Dict[Any, Tuple] = {}
 
         self.is_active = False
 
     def setup(self):
         """Builds the synthetic tech_ops dataset in the isolated environment."""
         try:
-            import chromadb.api.client
-            chromadb.api.client.SharedSystemClient.clear_system_cache()
+            # Install isolation interceptors and bind globals before storage actions
+            self.activate()
+
+            try:
+                import chromadb.api.client
+                chromadb.api.client.SharedSystemClient.clear_system_cache()
+            except Exception:
+                pass
+
+            t0 = time.time()
+            # 1. Write synthetic chat file
+            self.chat_file.write_text(TECH_OPS_CONVERSATION, encoding="utf-8")
+
+            # 2. Parse & enrich
+            messages = parse_whatsapp_export(str(self.chat_file))
+            enriched = enrich_messages(messages)
+            self.df = to_dataframe(enriched)
+
+            # 3. Populate SQLite & FTS5
+            save_messages(enriched, database_path=str(self.db_path), reset=True)
+
+            # 4. Optional Chroma build
+            if self.build_real_chroma:
+                build_vectorstore(enriched, persist_dir=str(self.chroma_path))
+
+            self.ingestion_latency = time.time() - t0
         except Exception:
-            pass
-
-        t0 = time.time()
-        # 1. Write synthetic chat file
-        self.chat_file.write_text(TECH_OPS_CONVERSATION, encoding="utf-8")
-
-        # 2. Parse & enrich
-        messages = parse_whatsapp_export(str(self.chat_file))
-        enriched = enrich_messages(messages)
-        self.df = to_dataframe(enriched)
-
-        # 3. Populate SQLite & FTS5
-        save_messages(enriched, database_path=str(self.db_path), reset=True)
-
-        # 4. Optional Chroma build
-        if self.build_real_chroma:
-            build_vectorstore(enriched, persist_dir=str(self.chroma_path))
-
-        self.ingestion_latency = time.time() - t0
-        self.activate()
+            self.teardown()
+            raise
 
     def activate(self):
         """Installs fail-closed interceptors for database and Chroma access."""
@@ -183,19 +191,45 @@ class SafeBM03Environment:
         chat_database.DATABASE_PATH = target_db
         vectorstore.PERSIST_DIR = target_chroma
 
+        # Dynamically update defaults on chat_database functions so no-arg calls use target_db
+        for name, fn in inspect.getmembers(chat_database, inspect.isfunction):
+            if fn.__module__ == "chat_database" and fn.__defaults__:
+                sig = inspect.signature(fn)
+                params = list(sig.parameters.values())
+                default_offset = len(params) - len(fn.__defaults__)
+                new_defaults = []
+                has_change = False
+                for idx, def_val in enumerate(fn.__defaults__):
+                    p = params[default_offset + idx]
+                    if p.name == "database_path" and (
+                        def_val == self.orig_db_path or def_val == "./chat_data.db"
+                    ):
+                        new_defaults.append(target_db)
+                        has_change = True
+                    else:
+                        new_defaults.append(def_val)
+                if has_change and fn not in self.orig_defaults:
+                    installed_tuple = tuple(new_defaults)
+                    self.orig_defaults[fn] = (fn.__defaults__, installed_tuple)
+                    fn.__defaults__ = installed_tuple
+
         # Fail-closed SQLite interceptor
         def fail_closed_get_connection(database_path=None):
             if database_path is None:
                 chosen_str = target_db
             else:
-                chosen_str = str(database_path)
-                # Redirect requests to default or production chat_data.db
+                p_str = str(database_path).replace("\\", "/")
+                resolved = Path(str(database_path)).resolve()
+                # Strict rejection of explicit production database path
                 if (
-                    chosen_str == str(self.prod_db_path)
-                    or chosen_str == self.orig_db_path
-                    or chosen_str.endswith("chat_data.db")
+                    resolved == self.prod_db_path
+                    or p_str in ("./chat_data.db", "chat_data.db")
+                    or resolved.name == "chat_data.db"
                 ):
-                    chosen_str = target_db
+                    raise IsolationBreachError(
+                        f"FAIL-CLOSED BREACH: Explicit access attempted to production database: {database_path}"
+                    )
+                chosen_str = str(database_path)
 
             resolved_chosen = Path(chosen_str).resolve()
 
@@ -208,20 +242,35 @@ class SafeBM03Environment:
             return self.orig_get_connection(str(resolved_chosen))
 
         chat_database.get_connection = fail_closed_get_connection
+        globals()["get_connection"] = fail_closed_get_connection
 
-        # Fail-closed Chroma interceptors
+        # Fail-closed Chroma path validator and interceptors (installed unconditionally in all modes)
+        def _validate_chroma_path(persist_dir: Optional[str] = None) -> Path:
+            if persist_dir is None:
+                resolved = Path(target_chroma).resolve()
+            else:
+                p_str = str(persist_dir).replace("\\", "/")
+                resolved = Path(persist_dir).resolve()
+                # Strict rejection of explicit production Chroma path
+                if (
+                    resolved == self.prod_chroma_path
+                    or p_str in ("./chroma_db", "chroma_db")
+                    or resolved.name == "chroma_db"
+                ):
+                    raise IsolationBreachError(
+                        f"FAIL-CLOSED BREACH: Explicit access attempted to production Chroma directory: {persist_dir}"
+                    )
+            if not resolved.is_relative_to(resolved_tmp):
+                raise IsolationBreachError(
+                    f"FAIL-CLOSED BREACH: Access attempted to Chroma directory outside isolated sandbox: {resolved}"
+                )
+            return resolved
+
         if self.build_real_chroma:
             from langchain_chroma import Chroma
 
             def fail_closed_load_msg(persist_dir=None):
-                target = str(persist_dir) if persist_dir is not None else target_chroma
-                if target == str(self.prod_chroma_path) or target.endswith("chroma_db"):
-                    target = target_chroma
-                resolved_target = Path(target).resolve()
-                if not resolved_target.is_relative_to(resolved_tmp):
-                    raise IsolationBreachError(
-                        f"FAIL-CLOSED BREACH: Access attempted to Chroma directory outside isolated sandbox: {resolved_target}"
-                    )
+                resolved_target = _validate_chroma_path(persist_dir)
                 return Chroma(
                     collection_name=vectorstore.MESSAGE_COLLECTION_NAME,
                     embedding_function=get_embeddings(),
@@ -229,24 +278,33 @@ class SafeBM03Environment:
                 )
 
             def fail_closed_load_chunk(persist_dir=None):
-                target = str(persist_dir) if persist_dir is not None else target_chroma
-                if target == str(self.prod_chroma_path) or target.endswith("chroma_db"):
-                    target = target_chroma
-                resolved_target = Path(target).resolve()
-                if not resolved_target.is_relative_to(resolved_tmp):
-                    raise IsolationBreachError(
-                        f"FAIL-CLOSED BREACH: Access attempted to Chroma directory outside isolated sandbox: {resolved_target}"
-                    )
+                resolved_target = _validate_chroma_path(persist_dir)
                 return Chroma(
                     collection_name=vectorstore.COLLECTION_NAME,
                     embedding_function=get_embeddings(),
                     persist_directory=str(resolved_target),
                 )
+        else:
+            def fail_closed_load_msg(persist_dir=None):
+                _validate_chroma_path(persist_dir)
+                mock_store = MagicMock()
+                mock_store.similarity_search.return_value = []
+                mock_store.similarity_search_with_relevance_scores.return_value = []
+                mock_store.as_retriever.return_value = MagicMock()
+                return mock_store
 
-            hybrid_retriever.load_message_vectorstore = fail_closed_load_msg
-            hybrid_retriever.load_chunk_vectorstore = fail_closed_load_chunk
-            vectorstore.load_message_vectorstore = fail_closed_load_msg
-            vectorstore.load_chunk_vectorstore = fail_closed_load_chunk
+            def fail_closed_load_chunk(persist_dir=None):
+                _validate_chroma_path(persist_dir)
+                mock_store = MagicMock()
+                mock_store.similarity_search.return_value = []
+                mock_store.similarity_search_with_relevance_scores.return_value = []
+                mock_store.as_retriever.return_value = MagicMock()
+                return mock_store
+
+        hybrid_retriever.load_message_vectorstore = fail_closed_load_msg
+        hybrid_retriever.load_chunk_vectorstore = fail_closed_load_chunk
+        vectorstore.load_message_vectorstore = fail_closed_load_msg
+        vectorstore.load_chunk_vectorstore = fail_closed_load_chunk
 
         self.is_active = True
         self.assert_fail_closed_isolation()
@@ -274,10 +332,20 @@ class SafeBM03Environment:
         chat_database.DATABASE_PATH = self.orig_db_path
         vectorstore.PERSIST_DIR = self.orig_chroma_persist_dir
         chat_database.get_connection = self.orig_get_connection
+        globals()["get_connection"] = self.orig_get_connection
         hybrid_retriever.load_message_vectorstore = self.orig_load_msg
         hybrid_retriever.load_chunk_vectorstore = self.orig_load_chunk
         vectorstore.load_message_vectorstore = self.orig_vec_load_msg
         vectorstore.load_chunk_vectorstore = self.orig_vec_load_chunk
+
+        for fn, (orig, installed) in self.orig_defaults.items():
+            try:
+                # Restore original only if current defaults still match what the harness installed
+                if fn.__defaults__ == installed:
+                    fn.__defaults__ = orig
+            except Exception:
+                pass
+        self.orig_defaults.clear()
 
         self.is_active = False
 
@@ -287,7 +355,8 @@ class SafeBM03Environment:
         except Exception:
             pass
 
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+        if self.tmp_path.exists():
+            shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
     def __enter__(self):
         self.setup()
@@ -496,7 +565,7 @@ def run_bm03_e2e_comparison(
 
         # 3. Generate answer
         t0 = time.time()
-        state = generate(state)
+        state = generate(state, generation_llm=active_llm)
         stage_latencies["generate"] = time.time() - t0
 
         # 4. Check groundedness

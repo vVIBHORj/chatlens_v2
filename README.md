@@ -34,6 +34,7 @@
 - [📊 Analytics & Behavioural Dashboard](#-analytics--behavioural-dashboard)
 - [🧪 Universal Benchmark & Evaluation Infrastructure](#-universal-benchmark--evaluation-infrastructure)
 - [🛡️ Fail-Closed Benchmark Sandbox Architecture](#️-fail-closed-benchmark-sandbox-architecture)
+- [⚖️ 12-Case Context Grading Suite & Runtime Budget Enforcement](#️-12-case-context-grading-suite--runtime-budget-enforcement)
 - [🛠️ Tech Stack](#️-tech-stack)
 - [📂 Project Directory Structure](#-project-directory-structure)
 - [🚀 Quick Start Guide](#-quick-start-guide)
@@ -106,8 +107,12 @@ flowchart TB
     subgraph BENCHMARK["🧪 5. Evaluation & Benchmark Infrastructure"]
         BENCH_SUITE["benchmark_suite.py<br/>11 Conversational Phenomena (BM-01 to BM-11)"]
         HARNESS["bm03_comparison_harness.py<br/>Fail-Closed A/B Testing Sandbox"]
+        EVAL_12["test_context_grading_evaluation.py<br/>12-Case Deterministic Synthetic Suite"]
+        LIVE_RUNNER["run_context_grading_live.py<br/>Live Evaluation Runner + Budget Wrapper"]
         BENCH_SUITE -.-> STORAGE
         HARNESS -.-> REASONING
+        EVAL_12 -.-> REASONING
+        LIVE_RUNNER -.-> HARNESS
     end
 
     style SQLITE fill:#003B57,color:#fff
@@ -521,6 +526,80 @@ flowchart TD
 
 ---
 
+## ⚖️ 12-Case Context Grading Suite & Runtime Budget Enforcement
+
+To rigorously measure whether context lookahead improves relevance grading without introducing hallucinations or false positives, ChatLens provides:
+1. **12-Case Deterministic Evaluation Suite** ([`test_context_grading_evaluation.py`](test_context_grading_evaluation.py)): A fully deterministic offline diagnostic suite covering 12 distinct synthetic conversational scenarios with predefined expected labels.
+2. **Live Multi-Case Grading Evaluation Runner** ([`run_context_grading_live.py`](run_context_grading_live.py)): An opt-in evaluation harness for real local models with strict dry-run protection and active runtime budget enforcement.
+
+### The 12 Synthetic Evaluation Phenomena
+
+| Case ID | Category | Query Example | Candidate Message | Preceding Conversational Context | Expected Label | Standalone (B) | Context-Aware (A) | Impact |
+|:---:|:---|:---|:---|:---|:---:|:---:|:---:|:---|
+| **CASE-01** | Terse Location | Where was the backup SSL certificate placed? | *"In Vault 9."* | Alice: Where did we store the backup SSL certificate? | `relevant` | `irrelevant` (FN) | `relevant` (TP) | **Recovered** |
+| **CASE-02** | Short Time | What time is the production deployment window scheduled for? | *"9pm."* | Bob: When does the deployment window begin tonight? | `relevant` | `irrelevant` (FN) | `relevant` (TP) | **Recovered** |
+| **CASE-03** | Pronoun Anaphora | Where can I find the incident root cause report? | *"It is in the second folder."* | Ken: Has anyone seen the incident root cause report? | `relevant` | `irrelevant` (FN) | `relevant` (TP) | **Recovered** |
+| **CASE-04** | Yes/No Confirmation | Did the database migration script succeed on staging? | *"Yes, completely clean."* | Chris: Did the migration script finish successfully? | `relevant` | `irrelevant` (FN) | `relevant` (TP) | **Recovered** |
+| **CASE-05** | Misleading Context | Where is the staging API key stored? | *"On the kitchen counter."* | Alex: Where did you leave the cafeteria keys? | `irrelevant` | `irrelevant` (TN) | `irrelevant` (TN) | **Invariant (No FP)** |
+| **CASE-06** | Self-Contained Positive | What is the primary IP address for the Redis cache cluster? | *"The primary IP address for the Redis cache cluster is 10.0.4.15."* | *(None needed)* | `relevant` | `relevant` (TP) | `relevant` (TP) | **Invariant** |
+| **CASE-07** | Self-Contained Negative | What is the primary IP address for the Redis cache cluster? | *"Pizza sounds great for lunch today."* | Chris: Anyone ordering lunch today? | `irrelevant` | `irrelevant` (TN) | `irrelevant` (TN) | **Invariant** |
+| **CASE-08** | Context Distractor | Who approved the firewall port change? | *"I think the weather is going to be stormy this evening."* | Security: Who approved the firewall port change? | `irrelevant` | `irrelevant` (TN) | `irrelevant` (TN) | **Invariant (No FP)** |
+| **CASE-09** | Multi-Message Exchange | Which server rack is experiencing power fluctuation? | *"Confirmed, heavy voltage drops."* | Monitor: Rack C4 power sensor throwing warnings.<br/>Ops: Can anyone confirm on site? | `relevant` | `irrelevant` (FN) | `relevant` (TP) | **Recovered** |
+| **CASE-10** | Ambiguous Abstention | Did the Kubernetes pod autoscaler trigger? | *"Maybe."* | Alex: Checking general system alerts. | `irrelevant` *(Abstain)* | `uncertain` (Abstain) | `uncertain` (Abstain) | **Invariant** |
+| **CASE-11** | Similar Entity Distractor | Where is the production JWT secret stored? | *"In secrets.dev.json."* | Test: Where did we save the dev test JWT token? | `irrelevant` | `irrelevant` (TN) | `irrelevant` (TN) | **Invariant (No FP)** |
+| **CASE-12** | Ordinary-Length Bypass | What is the backup retention policy for user data? | *"Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving."* | *(Bypassed - length > 6 words)* | `relevant` | `relevant` (TP) | `relevant` (TP) | **Invariant** |
+
+### Runtime Inference Budget Enforcement Architecture
+
+To guarantee that live local model experiments can never run unchecked, spawn infinite retries, or exceed token/hardware allocations, `run_context_grading_live.py` employs a stateful **`BudgetEnforcingLLMWrapper`**:
+
+```mermaid
+flowchart TD
+    subgraph CLI_ENTRY["1. CLI Entry & Pre-Execution Budget Check"]
+        CMD["python run_context_grading_live.py --confirm-live --max-calls 24"]
+        CMD --> CALC_PLANNED["Calculate Planned Inferences:<br/>planned_calls = len(cases) * 2 = 24"]
+        CALC_PLANNED --> PRE_CHECK{"planned_calls &gt; max_calls?"}
+        PRE_CHECK -- "Yes (e.g. --max-calls 15)" --> ABORT_PRE["💥 Abort before model init (Exit code 2)<br/>InferenceBudgetExceededError"]
+        PRE_CHECK -- "No (Budget Authorized)" --> GATE{"--confirm-live provided?"}
+    end
+
+    subgraph GATE_SEPARATION["2. Strict Live Confirmation Gate"]
+        GATE -- "No (Default Mode)" --> DRY_RUN["[DRY-RUN MODE]<br/>• Verifies isolated SQLite sandbox<br/>• Outputs planned cases & configuration<br/>• Zero model calls, zero network (Exit code 0)"]
+        GATE -- "Yes" --> SANDBOX["Initialize SafeContextGradingEnvironment<br/>• Fail-closed SQLite & Chroma interceptors<br/>• Rejects ./chat_data.db & ./chroma_db"]
+    end
+
+    subgraph RUNTIME_WRAPPER["3. Active Per-Call Budget Enforcement"]
+        SANDBOX --> WRAP_INIT["Initialize BudgetEnforcingLLMWrapper(inner_llm, max_calls=24)<br/>• attempted_calls = 0<br/>• exhausted = False<br/>• Single shared instance across conditions A and B"]
+        WRAP_INIT --> CALL_INVOKE["wrapper.invoke(prompt) called for candidate"]
+
+        CALL_INVOKE --> CHECK_BUDGET{"attempted_calls &gt;= max_calls?"}
+        CHECK_BUDGET -- "Yes (Budget Exhausted)" --> SET_EXHAUSTED["Set exhausted = True<br/>Raise InferenceBudgetExceededError<br/>(Inner model is NEVER called)"]
+        CHECK_BUDGET -- "No (Budget Available)" --> INC_CALLS["Increment attempted_calls += 1<br/>(BEFORE calling inner model)"]
+        INC_CALLS --> CALL_MODEL["inner_llm.invoke(prompt)<br/>(Exceptions & retries strictly consume budget)"]
+    end
+
+    subgraph ERROR_PROPAGATION["4. Non-Swallowing Exception Propagation"]
+        SET_EXHAUSTED --> RAG_CATCH["rag_graph.grade_candidate_batch catches Exception<br/>Returns status='failure', decision='uncertain'"]
+        RAG_CATCH --> EVAL_INTERCEPT{"evaluate_case_condition detects<br/>wrapper.exhausted == True?"}
+        EVAL_INTERCEPT -- "Yes" --> HALT_SUITE["Immediately halt suite loop<br/>Do not evaluate remaining cases"]
+        HALT_SUITE --> PARTIAL_REPORT["Generate Partial Report:<br/>• is_complete = False<br/>• Warning alert: 'Inference Budget Exhausted'<br/>• Metrics reflect only completed cases<br/>• Exit with code 2"]
+    end
+
+    style ABORT_PRE fill:#ef4444,color:#fff
+    style SET_EXHAUSTED fill:#ef4444,color:#fff
+    style HALT_SUITE fill:#f59e0b,color:#000
+    style DRY_RUN fill:#10b981,color:#fff
+    style INC_CALLS fill:#3b82f6,color:#fff
+```
+
+### Metrics & Mathematical Grounding
+- **Decisive Coverage**: Percentage of candidates receiving a definitive (`relevant` / `irrelevant`) decision: $\frac{N_{\text{decisive}}}{N_{\text{total}}}$.
+- **Abstention Rate**: Percentage of candidates where the model abstained as `uncertain`: $\frac{N_{\text{uncertain}}}{N_{\text{total}}}$.
+- **Decisive Accuracy**: Classification accuracy over decisive outputs: $\frac{\text{TP} + \text{TN}}{N_{\text{decisive}}}$.
+- **Strict Accuracy**: Conservative metric treating abstentions as classification errors against ground truth: $\frac{\text{TP} + \text{TN}}{N_{\text{total}}}$.
+
+---
+
 ## 🛠️ Tech Stack
 
 | Layer | Component | Version / Implementation | Role |
@@ -556,7 +635,10 @@ ChatLens-RAG/
 │
 ├── benchmark_suite.py                 # 11-phenomenon universal evaluation benchmark runner
 ├── bm03_comparison_harness.py         # Fail-closed A/B testing harness for BM-03 grading
+├── run_context_grading_live.py        # Safe live evaluation runner with runtime budget enforcement
 │
+├── test_context_grading_evaluation.py # 12-case deterministic offline grading evaluation suite
+├── test_run_context_grading_live.py   # Unit tests for live runner confirmation gate & budget wrapper
 ├── test_relevance_grading.py          # Unit tests for context-aware grading (Cases A-F)
 ├── test_controlled_grading_comparison.py # Controlled offline A/B grading comparison suite
 ├── test_bm03_comparison_harness.py    # Unit tests for fail-closed sandbox and path guards
@@ -642,23 +724,40 @@ Key pipeline parameters can be configured directly in their respective modules:
 ChatLens provides a comprehensive, multi-tiered test suite that can be run completely offline without Ollama:
 
 ```bash
-# 1. Run all offline relevance grading tests (prompt structure, immutability, scope control)
+# 1. Run the 12-case offline context grading evaluation suite
+python -m pytest test_context_grading_evaluation.py
+
+# 2. Run the live evaluation runner verification tests (confirmation gate & budget wrapper)
+python -m pytest test_run_context_grading_live.py
+
+# 3. Run all offline relevance grading tests (prompt structure, immutability, scope control)
 python -m pytest test_relevance_grading.py
 
-# 2. Run the controlled context-aware vs standalone comparison tests
+# 4. Run the controlled context-aware vs standalone comparison tests
 python -m pytest test_controlled_grading_comparison.py
 
-# 3. Run the fail-closed BM-03 comparison harness tests (path guards, sandboxing)
+# 5. Run the fail-closed BM-03 comparison harness tests (path guards, sandboxing)
 python -m pytest test_bm03_comparison_harness.py
 
-# 4. Run the universal benchmark policy and metrics tests
+# 6. Run the universal benchmark policy and metrics tests
 python -m pytest test_universal_benchmark.py
 
-# 5. Run the query router classification tests
+# 7. Run the query router classification tests
 python -m pytest test_query_router.py
 
-# 6. Execute all core offline evaluation suites in one pass
-python -m pytest test_bm03_comparison_harness.py test_controlled_grading_comparison.py test_relevance_grading.py test_universal_benchmark.py
+# 8. Execute all 66 offline grading, sandboxing, and evaluation tests in one pass
+python -m pytest test_run_context_grading_live.py test_context_grading_evaluation.py test_bm03_comparison_harness.py test_controlled_grading_comparison.py test_relevance_grading.py
+```
+
+### Multi-Case Live Grading Evaluation Runner
+The evaluation runner tests the 12 synthetic cases against local models. By default, it operates in safe dry-run mode without invoking inference:
+
+```bash
+# Dry run: validates configuration, isolation sandbox, and outputs the plan (0 model calls)
+python run_context_grading_live.py
+
+# Live execution: strictly requires explicit opt-in flag (enforces max budget of 24 model calls)
+python run_context_grading_live.py --confirm-live
 ```
 
 ### Live Benchmark Execution (Requires Local Ollama)
@@ -673,6 +772,7 @@ python benchmark_suite.py
 
 - **100% On-Device Processing**: Ingestion, vector storage, BM25 indexing, embedding generation, relevance grading, and text generation all execute on your local hardware. No chat messages or metadata leave your machine.
 - **Fail-Closed Sandboxing**: Automated benchmarks and test evaluations run inside isolated temporary sandboxes with strict guards preventing accidental reads or writes to production databases.
+- **Runtime Inference Budget Enforcement**: Live evaluation runners wrap the LLM with a hard call counter (`BudgetEnforcingLLMWrapper`) that fails closed before exceeding authorized inference quotas.
 - **Local Evidence Transparency**: Every answer includes inspectable message IDs, timestamps, and senders. ChatLens never generates claims without displaying the evidence that supported them.
 - **Data Hygiene**: The `.gitignore` file strictly blocks all `.txt` exports, `.db` files, and `chroma_db/` folders from being tracked by Git. Never commit private personal chat exports.
 
@@ -691,10 +791,13 @@ python benchmark_suite.py
 - [x] Candidate document immutability preventing phantom context ID citation pollution.
 - [x] Universal evaluation benchmark suite covering 11 core conversational phenomena.
 - [x] Fail-closed isolated A/B comparison testing harness with strict path guards.
+- [x] 12-case deterministic offline context-aware grading evaluation suite across 6 core conversational categories.
+- [x] Controlled live grading evaluation runner with explicit confirmation gate and dry-run default.
+- [x] Strict runtime LLM inference budget enforcement (`BudgetEnforcingLLMWrapper`) preventing runaway model calls.
 - [x] Deterministic metrics engine (attribution precision/recall, citation validity, abstention).
 
 ### 🚀 Upcoming Roadmap
-- [ ] Implement live real-model A/B validation run for BM-03 across local quantization profiles.
+- [ ] Execute authorized live multi-case grading evaluation against local `qwen2.5:3b`.
 - [ ] Add streaming response token generation in the Streamlit UI.
 - [ ] Add interactive message context graph visualization in the UI.
 - [ ] Optimize Chroma embedding batch throughput on multi-year chat exports (>50,000 messages).
