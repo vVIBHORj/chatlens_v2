@@ -51,6 +51,8 @@ from run_context_grading_live import (
     format_evaluation_summary,
     main,
     run_context_grading_suite,
+    EXPERIMENTAL_GRADE_PROMPT_TEMPLATE,
+    format_candidate_structure_aware,
 )
 
 
@@ -72,7 +74,7 @@ class DeterministicMockGraderLLM:
                 decision = "irrelevant"
         elif "retaining all daily user database snapshots for 90 days" in prompt_str:
             decision = "relevant"
-        elif "Pizza sounds great" in prompt_str:
+        elif "pizza" in prompt_str.lower():
             decision = "irrelevant"
         elif "Maybe." in prompt_str:
             decision = "uncertain"
@@ -463,3 +465,474 @@ def test_budget_exhaustion_stops_suite_and_reports_incomplete():
     summary_text = format_evaluation_summary(report)
     assert "INCOMPLETE" in summary_text
     assert "Inference Budget Exhausted:" in summary_text
+
+
+# ---------------------------------------------------------------------
+# Tests 16-19: Isolated Prompt Experiment & Metric Enhancements (Task 17)
+# ---------------------------------------------------------------------
+
+def test_experimental_prompt_removes_literal_examples_and_instructs_context():
+    """
+    Verifies that EXPERIMENTAL_GRADE_PROMPT_TEMPLATE:
+      1. Removes literal shortcut tokens 'yes', '9pm', 'sure' from short-reply rules.
+      2. Instructs the grader to interpret candidate alongside Preceding Conversational Context.
+      3. Clarifies context is supporting evidence, not an independent candidate to grade.
+    """
+    # 1. Literal examples removed
+    assert "'yes'" not in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+    assert "'9pm'" not in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+    assert "'sure'" not in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+
+    # 2. Contextual interpretation instruction present
+    assert "When Preceding Conversational Context is provided" in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+    assert "interpret the candidate message in the light of that dialogue" in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+
+    # 3. Context role clarification present
+    assert "supporting evidence for interpreting the candidate message, NOT an independent candidate" in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+
+    # 4. JSON contract and uncertain options preserved
+    assert '"candidate"' in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+    assert '"decision"' in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+    assert '"reason"' in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+    assert "uncertain" in EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+
+
+def test_prompt_experiment_mode_isolates_only_prompt_template():
+    """
+    Verifies that in prompt_experiment mode:
+      1. Both Control and Treatment receive identical candidate messages, IDs, and queries.
+      2. Both Control and Treatment have Preceding Conversational Context enabled.
+      3. The ONLY variable differing is the prompt template wording.
+    """
+    mock_llm = DeterministicMockGraderLLM()
+    case_1 = EVALUATION_CASES[0]  # "In Vault 9."
+
+    with SafeContextGradingEnvironment() as env:
+        res_ctrl = evaluate_case_condition(
+            case=case_1,
+            condition="control_prompt",
+            grader_llm=mock_llm,
+            database_path=str(env.db_path),
+            prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+        )
+        res_treat = evaluate_case_condition(
+            case=case_1,
+            condition="treatment_prompt",
+            grader_llm=mock_llm,
+            database_path=str(env.db_path),
+            prompt_template=EXPERIMENTAL_GRADE_PROMPT_TEMPLATE,
+        )
+
+        # Identical candidates, queries, and ground truth
+        assert res_ctrl.candidate_id == res_treat.candidate_id == case_1.candidate_id
+        assert res_ctrl.query == res_treat.query == case_1.query
+        assert res_ctrl.expected_label == res_treat.expected_label == case_1.expected_label
+
+        # Both have preceding context enabled
+        assert res_ctrl.has_preceding_context is True
+        assert res_treat.has_preceding_context is True
+        assert "Preceding Conversational Context:" in res_ctrl.prompt
+        assert "Preceding Conversational Context:" in res_treat.prompt
+
+        # Prompt template difference: Control has '9pm', Treatment does not
+        assert "'9pm'" in res_ctrl.prompt
+        assert "'9pm'" not in res_treat.prompt
+        assert "NOT an independent candidate to grade" in res_treat.prompt
+        assert "NOT an independent candidate to grade" not in res_ctrl.prompt
+
+
+def test_case_07_fixture_exceeds_threshold_and_bypasses_expansion():
+    """
+    Verifies that corrected CASE-07 has >6 words and >35 chars, bypassing context expansion.
+    """
+    case_7 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-07-Self-Contained-Irrelevant")
+    words = case_7.candidate_text.split()
+    assert len(words) > 6, f"Expected >6 words, got {len(words)}"
+    assert len(case_7.candidate_text) > 35, f"Expected >35 chars, got {len(case_7.candidate_text)}"
+
+    doc = build_candidate_document(case_7)
+    from rag_graph import should_expand_semantic_anchor, get_grading_preceding_context
+    assert should_expand_semantic_anchor(doc) is False
+    with patch("rag_graph.get_chronological_context") as mock_chrono:
+        ctx = get_grading_preceding_context(doc)
+        assert ctx is None
+        mock_chrono.assert_not_called()
+
+
+def test_population_recall_and_abstention_metrics():
+    """
+    Verifies exact mathematical calculations for decisive recall vs population recall,
+    strict accuracy, decisive accuracy, and explicit confusion breakdown.
+    """
+    # 8 total cases: 4 ground-truth relevant, 4 ground-truth irrelevant
+    # Relevant cases:
+    #   Case 1: relevant -> relevant (TP)
+    #   Case 2: relevant -> relevant (TP)
+    #   Case 3: relevant -> irrelevant (FN)
+    #   Case 4: relevant -> uncertain (Abstention on relevant)
+    # Irrelevant cases:
+    #   Case 5: irrelevant -> irrelevant (TN)
+    #   Case 6: irrelevant -> irrelevant (TN)
+    #   Case 7: irrelevant -> relevant (FP)
+    #   Case 8: irrelevant -> uncertain (Abstention on irrelevant)
+    dummy_results = [
+        CaseExecutionResult("c1", "cat", "q", 1, "t", "relevant", "cond", "p", True, "", "relevant", "r", "success", 0.1),
+        CaseExecutionResult("c2", "cat", "q", 2, "t", "relevant", "cond", "p", True, "", "relevant", "r", "success", 0.1),
+        CaseExecutionResult("c3", "cat", "q", 3, "t", "relevant", "cond", "p", True, "", "irrelevant", "r", "success", 0.1),
+        CaseExecutionResult("c4", "cat", "q", 4, "t", "relevant", "cond", "p", True, "", "uncertain", "r", "success", 0.1),
+        CaseExecutionResult("c5", "cat", "q", 5, "t", "irrelevant", "cond", "p", False, "", "irrelevant", "r", "success", 0.1),
+        CaseExecutionResult("c6", "cat", "q", 6, "t", "irrelevant", "cond", "p", False, "", "irrelevant", "r", "success", 0.1),
+        CaseExecutionResult("c7", "cat", "q", 7, "t", "irrelevant", "cond", "p", False, "", "relevant", "r", "success", 0.1),
+        CaseExecutionResult("c8", "cat", "q", 8, "t", "irrelevant", "cond", "p", False, "", "uncertain", "r", "success", 0.1),
+    ]
+
+    metrics = compute_condition_metrics("Test Condition", dummy_results)
+
+    assert metrics.total_cases == 8
+    assert metrics.decisive_cases == 6
+    assert metrics.abstention_cases == 2
+
+    assert metrics.tp == 2
+    assert metrics.fn == 1
+    assert metrics.tn == 2
+    assert metrics.fp == 1
+
+    assert metrics.total_ground_truth_relevant == 4
+    assert metrics.total_ground_truth_irrelevant == 4
+    assert metrics.uncertain_relevant == 1
+    assert metrics.uncertain_irrelevant == 1
+
+    # Decisive Recall: TP / (TP + FN) = 2 / (2 + 1) = 2/3
+    assert metrics.recall == pytest.approx(2 / 3)
+
+    # Population Recall: TP / Total Ground Truth Relevant = 2 / 4 = 0.50
+    assert metrics.population_recall == pytest.approx(2 / 4)
+
+    # Precision: TP / (TP + FP) = 2 / (2 + 1) = 2/3
+    assert metrics.precision == pytest.approx(2 / 3)
+
+    # Decisive Accuracy: (TP + TN) / Decisive = (2 + 2) / 6 = 4/6 = 2/3
+    assert metrics.decisive_accuracy == pytest.approx(4 / 6)
+
+    # Strict Accuracy: (TP + TN) / Total = (2 + 2) / 8 = 4/8 = 0.50
+    assert metrics.strict_accuracy == pytest.approx(4 / 8)
+
+
+# ---------------------------------------------------------------------
+# Test 20: Structure-Aware Formatter Transcript & Target Marking
+# ---------------------------------------------------------------------
+
+def test_format_candidate_structure_aware_chronological_transcript_and_marking():
+    """
+    Verifies that format_candidate_structure_aware presents preceding messages and
+    the candidate as a single chronological transcript with turn numbers, normalized
+    timestamps, preserved message content, and explicit target marking.
+    """
+    from langchain_core.documents import Document
+
+    cand_doc = Document(
+        page_content="[ID 102] [2026-10-14T09:11:00] Dev_Sam: In Vault 9.",
+        metadata={
+            "source": "hybrid_search",
+            "message_id": 102,
+            "timestamp": "2026-10-14T09:11:00",
+            "sender": "Dev_Sam",
+        },
+    )
+    preceding_ctx = (
+        "[ID 101] [14/10/2026 09:10 AM] Dev_Alex: Where did we store the backup SSL certificate?"
+    )
+
+    formatted = format_candidate_structure_aware(
+        idx=1,
+        document=cand_doc,
+        preceding_context=preceding_ctx,
+    )
+
+    expected_lines = [
+        "[Candidate 1] (Chronological Conversation Transcript | Target Message ID: 102)",
+        "[Turn 1] [ID 101] [14/10/2026 09:10 AM] Dev_Alex: Where did we store the backup SSL certificate?",
+        "[Turn 2 (TARGET MESSAGE TO EVALUATE)] [ID 102] [14/10/2026 09:11 AM] Dev_Sam: In Vault 9.",
+    ]
+    assert formatted == "\n".join(expected_lines)
+
+    # Multi-turn test (2 preceding turns + 1 candidate = 3 turns)
+    preceding_multi = (
+        "[ID 100] [14/10/2026 09:08 AM] Dev_Lead: Check security docs.\n"
+        "[ID 101] [14/10/2026 09:10 AM] Dev_Alex: Where did we store the backup SSL certificate?"
+    )
+    formatted_multi = format_candidate_structure_aware(
+        idx=2,
+        document=cand_doc,
+        preceding_context=preceding_multi,
+    )
+    lines_multi = formatted_multi.splitlines()
+    assert len(lines_multi) == 4
+    assert lines_multi[0] == "[Candidate 2] (Chronological Conversation Transcript | Target Message ID: 102)"
+    assert lines_multi[1].startswith("[Turn 1] [ID 100]")
+    assert lines_multi[2].startswith("[Turn 2] [ID 101]")
+    assert lines_multi[3] == "[Turn 3 (TARGET MESSAGE TO EVALUATE)] [ID 102] [14/10/2026 09:11 AM] Dev_Sam: In Vault 9."
+
+
+# ---------------------------------------------------------------------
+# Test 21: Structure-Aware Formatter Edge Cases
+# ---------------------------------------------------------------------
+
+def test_format_candidate_structure_aware_missing_context_and_edge_cases():
+    """
+    Verifies handling of missing context, malformed timestamps, and absent speaker metadata.
+    """
+    from langchain_core.documents import Document
+
+    # 1. Missing / None context -> formats as clean single target message without turns
+    cand_doc = Document(
+        page_content="[ID 102] [2026-10-14T09:11:00] Dev_Sam: In Vault 9.",
+        metadata={"source": "hybrid_search", "message_id": 102},
+    )
+    out_none = format_candidate_structure_aware(1, cand_doc, preceding_context=None)
+    assert "[Turn" not in out_none
+    assert out_none == (
+        "[Candidate 1] (Single Message ID: 102 | TARGET MESSAGE TO EVALUATE)\n"
+        "[ID 102] [14/10/2026 09:11 AM] Dev_Sam: In Vault 9."
+    )
+
+    out_empty = format_candidate_structure_aware(1, cand_doc, preceding_context="   ")
+    assert "[Turn" not in out_empty
+    assert out_empty == out_none
+
+    # 2. Malformed timestamp -> preserved untouched, never invented
+    doc_bad_ts = Document(
+        page_content="[ID 200] [invalid-raw-timestamp] Alice: Test message",
+        metadata={"source": "hybrid_search", "message_id": 200},
+    )
+    out_bad_ts = format_candidate_structure_aware(1, doc_bad_ts, None)
+    assert "[invalid-raw-timestamp]" in out_bad_ts
+    assert "Alice: Test message" in out_bad_ts
+
+    # 3. Absent speaker metadata / line without speaker colon
+    doc_no_spk = Document(
+        page_content="[ID 201] [2026-10-14T09:15:00] System broadcast message without speaker",
+        metadata={"source": "hybrid_search", "message_id": 201},
+    )
+    out_no_spk = format_candidate_structure_aware(1, doc_no_spk, None)
+    assert "[ID 201] [14/10/2026 09:15 AM] System broadcast message without speaker" in out_no_spk
+
+
+# ---------------------------------------------------------------------
+# Test 22: Structure Experiment Mode Single-Variable & Shared Context
+# ---------------------------------------------------------------------
+
+def test_structure_experiment_mode_isolates_only_formatting_and_shares_context():
+    """
+    Verifies that structure_experiment mode:
+      1. Resolves preceding context strictly once per case (never repeated for Treatment).
+      2. Uses the exact same production GRADE_PROMPT_TEMPLATE for both conditions.
+      3. Uses identical candidate IDs, texts, queries, and expected labels.
+      4. Shares the single 24-call budget wrapper.
+      5. Isolates candidate formatting as the ONLY difference.
+    """
+    with SafeContextGradingEnvironment() as env:
+        mock_llm = DeterministicMockGraderLLM()
+
+        # Spy on get_grading_preceding_context to verify call count
+        orig_fn = rag_graph.get_grading_preceding_context
+        lookup_call_count = 0
+
+        def spy_lookup(*args, **kwargs):
+            nonlocal lookup_call_count
+            lookup_call_count += 1
+            return orig_fn(*args, **kwargs)
+
+        with patch("rag_graph.get_grading_preceding_context", side_effect=spy_lookup):
+            report = run_context_grading_suite(
+                grader_llm=mock_llm,
+                env=env,
+                cases=EVALUATION_CASES,
+                max_budget=24,
+                mode="structure_experiment",
+            )
+
+        assert report.is_complete is True
+        assert report.cases_evaluated == 12
+
+        # CRITICAL: Context lookup is performed strictly ONCE per case (12 times total, NOT 24)
+        assert lookup_call_count == 12, (
+            f"Expected exactly 12 context lookups (1 per candidate), got {lookup_call_count}"
+        )
+
+        assert report.metrics_a.condition_name == "Control Formatter (Standard)"
+        assert report.metrics_b.condition_name == "Treatment Formatter (Structure-Aware)"
+
+        # Compare every case between Control and Treatment
+        for res_ctrl, res_treat in zip(report.condition_a_results, report.condition_b_results):
+            # Identical case metadata and ground truth
+            assert res_ctrl.case_id == res_treat.case_id
+            assert res_ctrl.candidate_id == res_treat.candidate_id
+            assert res_ctrl.candidate_text == res_treat.candidate_text
+            assert res_ctrl.query == res_treat.query
+            assert res_ctrl.expected_label == res_treat.expected_label
+            assert res_ctrl.has_preceding_context == res_treat.has_preceding_context
+
+            # Both conditions use the EXACT same production GRADE_PROMPT_TEMPLATE guidelines
+            assert "Do NOT reject a candidate solely because of zero lexical keyword overlap" in res_ctrl.prompt
+            assert "Do NOT reject a candidate solely because of zero lexical keyword overlap" in res_treat.prompt
+            assert "Evaluation Guidelines:" in res_ctrl.prompt
+            assert "Evaluation Guidelines:" in res_treat.prompt
+
+            # Neither condition uses EXPERIMENTAL_GRADE_PROMPT_TEMPLATE
+            assert "NOT an independent candidate to grade" not in res_ctrl.prompt
+            assert "NOT an independent candidate to grade" not in res_treat.prompt
+
+            # If preceding context is present, Control has separate block, Treatment has unified transcript
+            if res_ctrl.has_preceding_context:
+                assert "Preceding Conversational Context:" in res_ctrl.prompt
+                assert "Preceding Conversational Context:" not in res_treat.prompt
+                assert "Chronological Conversation Transcript" in res_treat.prompt
+                assert "[Turn 1]" in res_treat.prompt
+                assert "(TARGET MESSAGE TO EVALUATE)" in res_treat.prompt
+
+        # Shared call budget: exactly 24 calls attempted (12 cases x 2 conditions)
+        assert report.attempted_calls == 24
+        assert mock_llm.call_count == 24
+
+
+# ---------------------------------------------------------------------
+# Test 23: CLI Dry-Run and Mode Dispatch for structure_experiment
+# ---------------------------------------------------------------------
+
+def test_structure_experiment_cli_dry_run_and_mode_dispatch(capsys):
+    """
+    Verifies CLI --mode structure_experiment executes safely in dry-run mode
+    with 0 model calls and complete sandbox isolation.
+    """
+    with patch.object(sys, "argv", ["run_context_grading_live.py", "--mode", "structure_experiment"]):
+        with patch("langchain_ollama.ChatOllama") as mock_ollama:
+            exit_code = main()
+            assert exit_code == 0
+            mock_ollama.assert_not_called()
+
+    captured = capsys.readouterr().out
+    assert "Evaluation Mode:          structure_experiment" in captured
+    assert "DRY-RUN VERIFICATION SUCCESSFUL" in captured
+
+
+# ---------------------------------------------------------------------
+# Test 24: Multiline Message Fidelity and Boundary Preservation
+# ---------------------------------------------------------------------
+
+def test_format_candidate_structure_aware_multiline_fidelity_and_edge_cases():
+    """
+    Verifies that format_candidate_structure_aware preserves multiline message bodies
+    without fragmenting them into artificial turns:
+      1. One context message with a multiline body remains exactly Turn 1.
+      2. Multiple context messages where one contains embedded newlines, blank lines,
+         colons, URLs, and brackets preserve all content within their respective turns.
+      3. Candidate body with embedded newlines remains a single target turn.
+      4. Chronological ordering is preserved and exactly one target candidate is marked.
+      5. Malformed context lines without standard headers fail safely.
+    """
+    from langchain_core.documents import Document
+
+    # Scenario 1: One multiline context message + single-line candidate
+    multiline_ctx = (
+        "[ID 101] [14/10/2026 09:10 AM] Dev_Alex: Question on deployment:\n"
+        "Step 1: Check environment\n"
+        "Step 2: Run migration"
+    )
+    cand_doc = Document(
+        page_content="[ID 102] [2026-10-14T09:11:00] Dev_Sam: In Vault 9.",
+        metadata={"source": "hybrid_search", "message_id": 102},
+    )
+    formatted_1 = format_candidate_structure_aware(1, cand_doc, preceding_context=multiline_ctx)
+
+    # Must have exactly 2 turns (Turn 1 = preceding, Turn 2 = target candidate)
+    assert "[Turn 1]" in formatted_1
+    assert "[Turn 2 (TARGET MESSAGE TO EVALUATE)]" in formatted_1
+    assert "[Turn 3" not in formatted_1
+
+    # Multiline body preserved within Turn 1
+    assert "Step 1: Check environment\nStep 2: Run migration" in formatted_1
+
+    # Scenario 2: Multiple context messages with blank lines, colons, URLs, brackets
+    complex_ctx = (
+        "[ID 100] [14/10/2026 09:05 AM] Dev_Ops: Alert triggered: high CPU [alert-id: 99]\n"
+        "[ID 101] [14/10/2026 09:10 AM] Dev_Alex: See internal dashboard:\n"
+        "\n"
+        "URL: https://metrics.internal.net/cpu?range=1h\n"
+        "Config: [cluster=prod-us-east]\n"
+        "[ID 102] [14/10/2026 09:12 AM] Dev_Lead: Under investigation."
+    )
+    multiline_cand = Document(
+        page_content=(
+            "[ID 103] [2026-10-14T09:15:00] Dev_Sam: Resolution plan:\n"
+            "- Step 1: restart daemon\n"
+            "- Step 2: verify logs: https://logs.internal.net/app"
+        ),
+        metadata={"source": "hybrid_search", "message_id": 103},
+    )
+    formatted_2 = format_candidate_structure_aware(2, multiline_cand, preceding_context=complex_ctx)
+
+    # Exactly 4 turns in total (3 preceding messages + 1 candidate)
+    assert "[Turn 1] [ID 100]" in formatted_2
+    assert "[Turn 2] [ID 101]" in formatted_2
+    assert "[Turn 3] [ID 102]" in formatted_2
+    assert "[Turn 4 (TARGET MESSAGE TO EVALUATE)] [ID 103]" in formatted_2
+    assert "[Turn 5" not in formatted_2
+
+    # Verify complex content in Turn 2 (blank lines, colons, URLs, brackets)
+    assert "URL: https://metrics.internal.net/cpu?range=1h" in formatted_2
+    assert "Config: [cluster=prod-us-east]" in formatted_2
+    assert "\n\nURL:" in formatted_2
+
+    # Verify multiline content in candidate Turn 4
+    assert "- Step 1: restart daemon\n- Step 2: verify logs: https://logs.internal.net/app" in formatted_2
+
+    # Scenario 3: Candidate body with embedded newlines and no context
+    formatted_3 = format_candidate_structure_aware(3, multiline_cand, preceding_context=None)
+    assert "[Turn" not in formatted_3
+    assert "[Candidate 3] (Single Message ID: 103 | TARGET MESSAGE TO EVALUATE)" in formatted_3
+    assert "- Step 1: restart daemon\n- Step 2: verify logs: https://logs.internal.net/app" in formatted_3
+
+    # Scenario 4: Malformed context lines and missing metadata
+    doc_no_meta = Document(
+        page_content="[ID 200] [invalid-ts] Anonymous: Message body",
+        metadata={},
+    )
+    malformed_ctx = "Headerless line 1\nHeaderless line 2"
+    formatted_4 = format_candidate_structure_aware(1, doc_no_meta, preceding_context=malformed_ctx)
+    assert "[Candidate 1] (Chronological Conversation Transcript)" in formatted_4
+    assert "[Turn 1] Headerless line 1\nHeaderless line 2" in formatted_4
+    assert "[Turn 2 (TARGET MESSAGE TO EVALUATE)] [ID 200] [invalid-ts] Anonymous: Message body" in formatted_4
+    assert "[Turn 3" not in formatted_4
+
+    # Scenario 5: Exact preservation of leading indentation, internal blank lines, and trailing blank lines
+    indent_trailing_ctx = (
+        "[ID 105] [14/10/2026 09:20 AM] Dev_Alex: Code snippet:\n"
+        "    def calculate_total():\n"
+        "        return 42\n"
+        "\n"
+    )
+    cand_doc_indent = Document(
+        page_content=(
+            "[ID 106] [2026-10-14T09:22:00] Dev_Sam:    Indented candidate response\n"
+            "        with extra indent\n"
+            "\n"
+        ),
+        metadata={"source": "hybrid_search", "message_id": 106},
+    )
+    formatted_5 = format_candidate_structure_aware(5, cand_doc_indent, preceding_context=indent_trailing_ctx)
+    # Turn 1 must preserve leading indentation and trailing blank line
+    assert (
+        "[Turn 1] [ID 105] [14/10/2026 09:20 AM] Dev_Alex: Code snippet:\n"
+        "    def calculate_total():\n"
+        "        return 42\n"
+        "\n"
+    ) in formatted_5
+
+    # Turn 2 must preserve candidate indentation and trailing blank line
+    assert (
+        "[Turn 2 (TARGET MESSAGE TO EVALUATE)] [ID 106] [14/10/2026 09:22 AM] Dev_Sam:    Indented candidate response\n"
+        "        with extra indent\n"
+        "\n"
+    ) in formatted_5
+    assert "[Turn 3" not in formatted_5

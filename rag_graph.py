@@ -90,7 +90,7 @@ Requirements:
 import json
 import re
 from dataclasses import dataclass
-from typing import List, Optional, TypedDict, Dict, Tuple, Any, Set
+from typing import List, Optional, TypedDict, Dict, Tuple, Any, Set, Callable
 from datetime import datetime
 
 import pandas as pd
@@ -933,6 +933,9 @@ def grade_candidate_batch(
     batch_docs: List[Document],
     grader_llm: Optional[Any] = None,
     database_path: Optional[str] = None,
+    prompt_template: Optional[str] = None,
+    candidate_formatter: Optional[Callable[[int, Document, Optional[str]], str]] = None,
+    preceding_contexts: Optional[List[Optional[str]]] = None,
 ) -> List[Tuple[Document, str, str, str]]:
     """
     Grade a bounded batch of candidates using LLM in a single structured prompt.
@@ -943,16 +946,25 @@ def grade_candidate_batch(
 
     active_llm = grader_llm if grader_llm is not None else llm
     indices = list(range(1, len(batch_docs) + 1))
+    active_formatter = candidate_formatter if candidate_formatter is not None else format_candidate_for_grader
+    if preceding_contexts is not None:
+        contexts = preceding_contexts
+    else:
+        contexts = [
+            get_grading_preceding_context(doc, database_path=database_path)
+            for doc in batch_docs
+        ]
     formatted_chunks = [
-        format_candidate_for_grader(
+        active_formatter(
             idx,
             doc,
-            preceding_context=get_grading_preceding_context(doc, database_path=database_path),
+            preceding_context=ctx,
         )
-        for idx, doc in zip(indices, batch_docs)
+        for idx, doc, ctx in zip(indices, batch_docs, contexts)
     ]
     candidates_text = "\n\n---\n\n".join(formatted_chunks)
-    prompt = GRADE_PROMPT_TEMPLATE.format(
+    active_template = prompt_template if prompt_template is not None else GRADE_PROMPT_TEMPLATE
+    prompt = active_template.format(
         question=question,
         candidates_text=candidates_text,
     )

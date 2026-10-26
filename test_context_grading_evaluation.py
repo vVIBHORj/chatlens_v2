@@ -202,7 +202,7 @@ EVALUATION_CASES: List[ContextGradingCase] = [
         description="Completely unrelated conversation about lunch.",
         query="What is the primary IP address for the Redis cache cluster?",
         candidate_id=114,
-        candidate_text="Pizza sounds great for lunch today.",
+        candidate_text="I think ordering pizza sounds like a great choice for the entire team today.",
         sender="Dev_Dana",
         timestamp="2026-10-14T12:15:00",
         expected_label="irrelevant",
@@ -399,8 +399,8 @@ class DeterministicEvaluationMockLLM:
             decision = "relevant"
             reason = "Self-contained statement directly provides the Redis cluster IP address."
 
-        # Candidate 7: Pizza sounds great
-        elif "Pizza sounds great" in prompt_str:
+        # Candidate 7: Pizza sounds great / ordering pizza
+        elif "pizza" in prompt_str.lower():
             decision = "irrelevant"
             reason = "Candidate discusses lunch preferences, completely unrelated to Redis cluster."
 
@@ -729,9 +729,27 @@ def test_self_contained_and_ordinary_length_cases_preserve_standalone_decisions(
             res_a = evaluate_single_case(case, "context_aware")
             res_b = evaluate_single_case(case, "standalone")
             assert res_a.actual_decision == res_b.actual_decision == case.expected_label
-            # Case 12 should bypass preceding context lookup due to word count > 6
-            if case.case_id == "CASE-012-Ordinary-Length-Bypass":
+            # Case 7 and Case 12 should bypass preceding context lookup due to word count > 6
+            if case.case_id in ("CASE-07-Self-Contained-Irrelevant", "CASE-012-Ordinary-Length-Bypass"):
                 assert res_a.has_preceding_context is False
+
+
+def test_case_07_bypasses_semantic_context_expansion():
+    """
+    Verify that CASE-07 (14 words, 73 chars) exceeds the short-reply threshold (6 words / 35 chars)
+    and bypasses preceding context lookup entirely.
+    """
+    case_7 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-07-Self-Contained-Irrelevant")
+    doc = Document(
+        page_content=f"[ID {case_7.candidate_id}] [{case_7.timestamp}] {case_7.sender}: {case_7.candidate_text}",
+        metadata={"message_id": case_7.candidate_id, "source": "hybrid_search"},
+    )
+    from rag_graph import should_expand_semantic_anchor, get_grading_preceding_context
+    assert should_expand_semantic_anchor(doc) is False
+    with patch("rag_graph.get_chronological_context") as mock_chrono:
+        ctx = get_grading_preceding_context(doc)
+        assert ctx is None
+        mock_chrono.assert_not_called()
 
 
 def test_insufficient_context_properly_abstains():

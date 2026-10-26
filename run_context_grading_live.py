@@ -23,14 +23,16 @@ import copy
 import inspect
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
 import tempfile
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, patch
 
 from langchain_core.documents import Document
@@ -47,6 +49,37 @@ from rag_graph import (
 from test_context_grading_evaluation import (
     EVALUATION_CASES,
     ContextGradingCase,
+)
+
+
+# ---------------------------------------------------------------------
+# Isolated Experimental Prompt Variant (Treatment)
+# ---------------------------------------------------------------------
+
+EXPERIMENTAL_GRADE_PROMPT_TEMPLATE = (
+    "You are a conservative relevance grader for a WhatsApp chat archive retrieval system.\n"
+    "Assess whether each retrieved candidate contains information relevant to answering the user's question, "
+    "or could plausibly serve as helpful conversational context.\n\n"
+    "User Question:\n"
+    "{question}\n\n"
+    "Retrieved Candidates:\n"
+    "{candidates_text}\n\n"
+    "Evaluation Guidelines:\n"
+    "1. Evaluate each candidate individually.\n"
+    "2. Candidates may be single messages (which may include preceding conversational context for short replies) or conversation transcript chunks.\n"
+    "3. When Preceding Conversational Context is provided for a candidate, interpret the candidate message in the light of that dialogue. A short reply, confirmation, numerical value, or pronoun is relevant if the preceding dialogue establishes its meaning and the candidate helps answer the user question.\n"
+    "4. Preceding Conversational Context is supporting evidence for interpreting the candidate message, NOT an independent candidate to grade. An unrelated or off-topic candidate message does not become relevant merely because the preceding conversation mentions the user query.\n"
+    "5. Conversational chats are informal: terse replies, brief confirmations, numerical answers, typos, emojis, slang, and indirect statements may be relevant context.\n"
+    "6. Do NOT reject a candidate solely because of zero lexical keyword overlap, short length, or emojis.\n"
+    "7. If a candidate is clearly and unambiguously about a completely unrelated topic, mark 'irrelevant'.\n"
+    "8. If a candidate is helpful or directly answers the question (either on its own or through its preceding conversational dialogue), mark 'relevant'.\n"
+    "9. If you are uncertain or the context is ambiguous, mark 'uncertain'.\n"
+    "10. Do not invent probabilities or numeric scores.\n\n"
+    "Output MUST be a valid JSON array of objects with keys:\n"
+    '- "candidate": integer candidate number (1, 2, ...)\n'
+    '- "decision": exactly "relevant", "irrelevant", or "uncertain"\n'
+    '- "reason": brief explanation (1 sentence)\n\n'
+    "JSON Response:\n"
 )
 
 
@@ -116,6 +149,11 @@ class ConditionSummaryMetrics:
     false_positive_rate: float
     strict_accuracy: float
     infra_failures: int
+    total_ground_truth_relevant: int = 0
+    total_ground_truth_irrelevant: int = 0
+    population_recall: float = 0.0
+    uncertain_relevant: int = 0
+    uncertain_irrelevant: int = 0
 
 
 @dataclass
@@ -418,17 +456,154 @@ def build_candidate_document(case: ContextGradingCase) -> Document:
 
 
 # ---------------------------------------------------------------------
+# Structure-Aware Formatting Helpers
+# ---------------------------------------------------------------------
+
+def _normalize_iso_timestamp(text: str) -> str:
+    """
+    Safely parses an ISO timestamp string into '%d/%m/%Y %I:%M %p' if valid.
+    If parsing fails, returns the original text untouched.
+    Never invents timestamps.
+    """
+    if not text:
+        return ""
+    text_clean = str(text).strip()
+    try:
+        dt = datetime.fromisoformat(text_clean)
+        return dt.strftime("%d/%m/%Y %I:%M %p")
+    except Exception:
+        return text_clean
+
+
+def _parse_preceding_messages(preceding_context: Optional[str]) -> List[str]:
+    """
+    Parses preceding_context produced by get_grading_preceding_context() into
+    individual message blocks, preserving message boundaries, indentation, and
+    trailing blank lines. Message boundaries begin at index 0 with: [ID <id>] [<timestamp>]
+
+    Limitation: Because the upstream context producer joins messages using newline
+    separation without escaping literal bracketed headers in message bodies, any line
+    starting unindented with '[ID <id>] [<timestamp>]' is identified as a message boundary.
+    """
+    if not preceding_context or not preceding_context.strip():
+        return []
+
+    messages: List[str] = []
+    current_lines: List[str] = []
+    header_pattern = re.compile(r"^\[ID\s+[^\]]+\]\s+\[[^\]]+\]")
+
+    for raw_line in preceding_context.splitlines():
+        if header_pattern.match(raw_line):
+            if current_lines:
+                messages.append("\n".join(current_lines))
+                current_lines = []
+            current_lines.append(raw_line)
+        else:
+            if current_lines:
+                current_lines.append(raw_line)
+            else:
+                if raw_line.strip():
+                    current_lines.append(raw_line)
+
+    if current_lines:
+        messages.append("\n".join(current_lines))
+
+    return messages
+
+
+def _normalize_message_line(line: str) -> str:
+    """
+    Parses and normalizes message line timestamps without modifying IDs,
+    speaker labels, or message text. If timestamp cannot be parsed as ISO,
+    preserves original timestamp string. Preserves multiline message bodies,
+    indentation, blank lines, and trailing spaces.
+    """
+    if not line:
+        return ""
+    # Pattern 1: [ID <id>] [<timestamp>] <sender>: <body...>
+    m1 = re.match(r"^\s*\[ID\s+([^\]]+)\]\s+\[([^\]]+)\]\s+([^:]+):\s?(.*)$", line, re.DOTALL)
+    if m1:
+        msg_id, raw_ts, sender, body = m1.groups()
+        norm_ts = _normalize_iso_timestamp(raw_ts)
+        return f"[ID {msg_id}] [{norm_ts}] {sender}: {body}"
+
+    # Pattern 2: [ID <id>] [<timestamp>] <body...> (no speaker colon)
+    m2 = re.match(r"^\s*\[ID\s+([^\]]+)\]\s+\[([^\]]+)\]\s?(.*)$", line, re.DOTALL)
+    if m2:
+        msg_id, raw_ts, rest = m2.groups()
+        norm_ts = _normalize_iso_timestamp(raw_ts)
+        return f"[ID {msg_id}] [{norm_ts}] {rest}"
+
+    return line
+
+
+def format_candidate_structure_aware(
+    idx: int,
+    document: Document,
+    preceding_context: Optional[str] = None,
+) -> str:
+    """
+    Experimental structure-aware formatter for relevance grading evaluation.
+    Presents preceding messages and target candidate as a unified, chronological
+    conversation transcript with explicit turn labels, while preserving exact
+    message IDs, timestamps, speaker labels, and multiline text.
+    Marks the candidate as the target message to evaluate.
+    If preceding context is unavailable, formats the candidate directly without inventing context.
+    """
+    source = document.metadata.get("source", "unknown")
+    msg_id = document.metadata.get("message_id")
+    chunk_id = document.metadata.get("chunk_id")
+
+    cand_line = _normalize_message_line(document.page_content)
+
+    preceding_messages = _parse_preceding_messages(preceding_context)
+    normalized_preceding = [
+        _normalize_message_line(msg)
+        for msg in preceding_messages
+    ]
+
+    if normalized_preceding:
+        if source == "hybrid_search" and msg_id is not None:
+            header = f"[Candidate {idx}] (Chronological Conversation Transcript | Target Message ID: {msg_id})"
+        elif source == "conversation_chunk" and chunk_id is not None:
+            header = f"[Candidate {idx}] (Chronological Conversation Transcript | Chunk ID: {chunk_id})"
+        else:
+            header = f"[Candidate {idx}] (Chronological Conversation Transcript)"
+
+        turns = []
+        for t_idx, p_msg in enumerate(normalized_preceding, 1):
+            turns.append(f"[Turn {t_idx}] {p_msg}")
+
+        target_turn = len(normalized_preceding) + 1
+        turns.append(f"[Turn {target_turn} (TARGET MESSAGE TO EVALUATE)] {cand_line}")
+
+        return f"{header}\n" + "\n".join(turns)
+    else:
+        if source == "hybrid_search" and msg_id is not None:
+            header = f"[Candidate {idx}] (Single Message ID: {msg_id} | TARGET MESSAGE TO EVALUATE)"
+        elif source == "conversation_chunk" and chunk_id is not None:
+            header = f"[Candidate {idx}] (Conversation Transcript Chunk ID: {chunk_id} | TARGET MESSAGE TO EVALUATE)"
+        else:
+            header = f"[Candidate {idx}] (Evidence Source: {source} | TARGET MESSAGE TO EVALUATE)"
+
+        return f"{header}\n{cand_line}"
+
+
+# ---------------------------------------------------------------------
 # Single Case Evaluation
 # ---------------------------------------------------------------------
 
 def evaluate_case_condition(
     case: ContextGradingCase,
-    condition: str,  # "context_aware" or "standalone"
+    condition: str,  # "context_aware", "standalone", "control_prompt", "treatment_prompt", "control_structure", "treatment_structure"
     grader_llm: Any,
     database_path: str,
+    prompt_template: Optional[str] = None,
+    candidate_formatter: Optional[Callable[[int, Document, Optional[str]], str]] = None,
+    preceding_context: Optional[str] = None,
 ) -> CaseExecutionResult:
     """
-    Evaluates a single synthetic case under Condition A or Condition B using
+    Evaluates a single synthetic case under a given condition using
     the real rag_graph.grade_candidate_batch() pipeline.
     """
     doc = build_candidate_document(case)
@@ -444,12 +619,13 @@ def evaluate_case_condition(
     raw_output = ""
     error_msg = None
 
-    if condition == "context_aware":
+    if condition in ("context_aware", "control_prompt", "treatment_prompt"):
         graded_batch = grade_candidate_batch(
             question=case.query,
             batch_docs=[doc],
             grader_llm=wrapper,
             database_path=database_path,
+            prompt_template=prompt_template,
         )
     elif condition == "standalone":
         # Suppress preceding context lookup strictly for Condition B
@@ -459,7 +635,18 @@ def evaluate_case_condition(
                 batch_docs=[doc],
                 grader_llm=wrapper,
                 database_path=database_path,
+                prompt_template=prompt_template,
             )
+    elif condition in ("control_structure", "treatment_structure"):
+        graded_batch = grade_candidate_batch(
+            question=case.query,
+            batch_docs=[doc],
+            grader_llm=wrapper,
+            database_path=database_path,
+            prompt_template=prompt_template,
+            candidate_formatter=candidate_formatter,
+            preceding_contexts=[preceding_context],
+        )
     else:
         raise ValueError(f"Unknown condition: {condition}")
 
@@ -476,7 +663,11 @@ def evaluate_case_condition(
         prompt = wrapper.captured_prompts[prompt_count_before]
     else:
         prompt = ""
-    has_preceding_context = "Preceding Conversational Context:" in prompt
+    has_preceding_context = (
+        "Preceding Conversational Context:" in prompt
+        or "Chronological Conversation Transcript" in prompt
+        or "[Turn 1]" in prompt
+    )
 
     if graded_batch:
         _, decision, reason, status = graded_batch[0]
@@ -515,7 +706,7 @@ def compute_condition_metrics(
     results: List[CaseExecutionResult],
 ) -> ConditionSummaryMetrics:
     """
-    Computes binary metrics, abstention rates, and coverage with explicit denominators.
+    Computes binary metrics, abstention rates, population recall, and coverage with explicit denominators.
     """
     total = len(results)
     decisive_results = [r for r in results if r.parsed_decision in ("relevant", "irrelevant")]
@@ -530,12 +721,18 @@ def compute_condition_metrics(
     tn = sum(1 for r in decisive_results if r.parsed_decision == "irrelevant" and r.expected_label == "irrelevant")
     fn = sum(1 for r in decisive_results if r.parsed_decision == "irrelevant" and r.expected_label == "relevant")
 
+    total_gt_relevant = sum(1 for r in results if r.expected_label == "relevant")
+    total_gt_irrelevant = sum(1 for r in results if r.expected_label == "irrelevant")
+    uncertain_relevant = sum(1 for r in results if r.parsed_decision == "uncertain" and r.expected_label == "relevant")
+    uncertain_irrelevant = sum(1 for r in results if r.parsed_decision == "uncertain" and r.expected_label == "irrelevant")
+
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
     decisive_acc = (tp + tn) / decisive_count if decisive_count > 0 else 0.0
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     strict_acc = (tp + tn) / total if total > 0 else 0.0
+    population_recall = tp / total_gt_relevant if total_gt_relevant > 0 else 0.0
     infra_failures = sum(1 for r in results if r.status == "failure")
 
     return ConditionSummaryMetrics(
@@ -556,6 +753,11 @@ def compute_condition_metrics(
         false_positive_rate=fpr,
         strict_accuracy=strict_acc,
         infra_failures=infra_failures,
+        total_ground_truth_relevant=total_gt_relevant,
+        total_ground_truth_irrelevant=total_gt_irrelevant,
+        population_recall=population_recall,
+        uncertain_relevant=uncertain_relevant,
+        uncertain_irrelevant=uncertain_irrelevant,
     )
 
 
@@ -568,9 +770,15 @@ def run_context_grading_suite(
     env: SafeContextGradingEnvironment,
     cases: Optional[List[ContextGradingCase]] = None,
     max_budget: Optional[int] = None,
+    mode: str = "prompt_experiment",  # "prompt_experiment" or "context_comparison"
 ) -> MultiCaseEvaluationReport:
     """
     Executes the 12-case A/B evaluation suite against the provided LLM instance.
+    Modes:
+      - 'prompt_experiment': Compares Control Prompt vs Experimental Treatment Prompt,
+        holding Preceding Conversational Context constant (enabled for both).
+      - 'context_comparison': Compares Context-Aware vs Standalone Baseline,
+        holding Prompt Template constant (production GRADE_PROMPT_TEMPLATE).
     Enforces a single shared BudgetEnforcingLLMWrapper across all cases and conditions.
     """
     eval_cases = cases or EVALUATION_CASES
@@ -589,41 +797,109 @@ def run_context_grading_suite(
 
     try:
         for case in eval_cases:
-            res_a = evaluate_case_condition(
-                case=case,
-                condition="context_aware",
-                grader_llm=enforcing_wrapper,
-                database_path=str(env.db_path),
-            )
-            results_a.append(res_a)
+            if mode == "structure_experiment":
+                # Single shared context lookup per candidate
+                doc = build_candidate_document(case)
+                resolved_context = rag_graph.get_grading_preceding_context(
+                    doc, database_path=str(env.db_path)
+                )
 
-            res_b = evaluate_case_condition(
-                case=case,
-                condition="standalone",
-                grader_llm=enforcing_wrapper,
-                database_path=str(env.db_path),
-            )
-            results_b.append(res_b)
+                # Condition A: Control Formatter (Standard format_candidate_for_grader) + Production GRADE_PROMPT_TEMPLATE
+                res_a = evaluate_case_condition(
+                    case=case,
+                    condition="control_structure",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+                    candidate_formatter=rag_graph.format_candidate_for_grader,
+                    preceding_context=resolved_context,
+                )
+                results_a.append(res_a)
+
+                # Condition B: Treatment Formatter (format_candidate_structure_aware) + EXACT SAME Production GRADE_PROMPT_TEMPLATE
+                res_b = evaluate_case_condition(
+                    case=case,
+                    condition="treatment_structure",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+                    candidate_formatter=format_candidate_structure_aware,
+                    preceding_context=resolved_context,
+                )
+                results_b.append(res_b)
+            elif mode == "prompt_experiment":
+                # Condition A: Control Prompt (Production GRADE_PROMPT_TEMPLATE) with Context
+                res_a = evaluate_case_condition(
+                    case=case,
+                    condition="control_prompt",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+                )
+                results_a.append(res_a)
+
+                # Condition B: Treatment Prompt (EXPERIMENTAL_GRADE_PROMPT_TEMPLATE) with Context
+                res_b = evaluate_case_condition(
+                    case=case,
+                    condition="treatment_prompt",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=EXPERIMENTAL_GRADE_PROMPT_TEMPLATE,
+                )
+                results_b.append(res_b)
+            else:
+                # Mode: context_comparison
+                res_a = evaluate_case_condition(
+                    case=case,
+                    condition="context_aware",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                )
+                results_a.append(res_a)
+
+                res_b = evaluate_case_condition(
+                    case=case,
+                    condition="standalone",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                )
+                results_b.append(res_b)
     except InferenceBudgetExceededError as exc:
         is_complete = False
         termination_reason = str(exc)
 
-    metrics_a = compute_condition_metrics("Context-Aware (Condition A)", results_a)
-    metrics_b = compute_condition_metrics("Standalone Baseline (Condition B)", results_b)
+    if mode == "structure_experiment":
+        name_a = "Control Formatter (Standard)"
+        name_b = "Treatment Formatter (Structure-Aware)"
+    elif mode == "prompt_experiment":
+        name_a = "Control Prompt (Original)"
+        name_b = "Treatment Prompt (Experimental)"
+    else:
+        name_a = "Context-Aware (Condition A)"
+        name_b = "Standalone Baseline (Condition B)"
+
+    metrics_a = compute_condition_metrics(name_a, results_a)
+    metrics_b = compute_condition_metrics(name_b, results_b)
 
     recovered = []
     broken = []
     invariant = []
 
     for ra, rb in zip(results_a, results_b):
-        # Case recovered: standalone was incorrect, context-aware is correct
-        if rb.parsed_decision != rb.expected_label and ra.parsed_decision == ra.expected_label:
-            recovered.append(ra.case_id)
-        # Decision broken: standalone was correct, context-aware made an error
-        elif rb.parsed_decision == rb.expected_label and ra.parsed_decision != ra.expected_label:
-            broken.append(ra.case_id)
+        if mode in ("prompt_experiment", "structure_experiment"):
+            if ra.parsed_decision != ra.expected_label and rb.parsed_decision == rb.expected_label:
+                recovered.append(ra.case_id)
+            elif ra.parsed_decision == ra.expected_label and rb.parsed_decision != rb.expected_label:
+                broken.append(ra.case_id)
+            else:
+                invariant.append(ra.case_id)
         else:
-            invariant.append(ra.case_id)
+            if rb.parsed_decision != rb.expected_label and ra.parsed_decision == ra.expected_label:
+                recovered.append(ra.case_id)
+            elif rb.parsed_decision == rb.expected_label and ra.parsed_decision != ra.expected_label:
+                broken.append(ra.case_id)
+            else:
+                invariant.append(ra.case_id)
 
     total_infra_failures = metrics_a.infra_failures + metrics_b.infra_failures
     inner_model = getattr(enforcing_wrapper.inner_llm, "model", str(type(enforcing_wrapper.inner_llm).__name__))
@@ -675,9 +951,12 @@ def format_evaluation_summary(report: MultiCaseEvaluationReport) -> str:
             "",
         ])
 
+    header_b = mb.condition_name
+    header_a = ma.condition_name
+
     lines.extend([
         "### Case-by-Case Results",
-        "| Case ID | Category | Expected | Standalone (B) | Context-Aware (A) | Preceding Context | Transition |",
+        f"| Case ID | Category | Expected | {header_a} | {header_b} | Preceding Context | Transition |",
         "|:---|:---|:---:|:---:|:---:|:---:|:---|",
     ])
 
@@ -689,28 +968,40 @@ def format_evaluation_summary(report: MultiCaseEvaluationReport) -> str:
         else:
             transition = "Invariant"
 
-        has_ctx = "Yes" if ra.has_preceding_context else "No"
+        has_ctx = "Yes" if (ra.has_preceding_context or rb.has_preceding_context) else "No"
         lines.append(
-            f"| `{ra.case_id}` | {ra.category} | `{ra.expected_label}` | `{rb.parsed_decision}` | `{ra.parsed_decision}` | {has_ctx} | {transition} |"
+            f"| `{ra.case_id}` | {ra.category} | `{ra.expected_label}` | `{ra.parsed_decision}` | `{rb.parsed_decision}` | {has_ctx} | {transition} |"
         )
+
+    # In prompt_experiment: A is Control, B is Treatment. Delta = B - A.
+    # In context_comparison: B is Standalone, A is Context-Aware. Delta = A - B.
+    is_prompt_exp = "Control" in ma.condition_name
+    base_m = ma if is_prompt_exp else mb
+    target_m = mb if is_prompt_exp else ma
+    col1_title = f"{ma.condition_name}"
+    col2_title = f"{mb.condition_name}"
+    delta_title = f"Delta ({target_m.condition_name} vs {base_m.condition_name})"
 
     lines.extend([
         "",
         "### Summary Metrics Comparison",
-        "| Metric | Standalone Baseline (B) | Context-Aware (A) | Delta (A vs B) |",
+        f"| Metric | {col1_title} | {col2_title} | {delta_title} |",
         "|:---|:---:|:---:|:---:|",
-        f"| **Decisive Coverage** | {mb.coverage_rate:.2%} ({mb.decisive_cases}/{mb.total_cases}) | {ma.coverage_rate:.2%} ({ma.decisive_cases}/{ma.total_cases}) | {ma.coverage_rate - mb.coverage_rate:+.2%} |",
-        f"| **Abstention Rate** | {mb.abstention_rate:.2%} ({mb.abstention_cases}/{mb.total_cases}) | {ma.abstention_rate:.2%} ({ma.abstention_cases}/{ma.total_cases}) | {ma.abstention_rate - mb.abstention_rate:+.2%} |",
-        f"| **True Positives (TP)** | {mb.tp} | {ma.tp} | {ma.tp - mb.tp:+d} |",
-        f"| **False Negatives (FN)** | {mb.fn} | {ma.fn} | {ma.fn - mb.fn:+d} |",
-        f"| **True Negatives (TN)** | {mb.tn} | {ma.tn} | {ma.tn - mb.tn:+d} |",
-        f"| **False Positives (FP)** | {mb.fp} | {ma.fp} | {ma.fp - mb.fp:+d} |",
-        f"| **Precision** | {mb.precision:.2%} ({mb.tp}/{mb.tp + mb.fp if mb.tp + mb.fp > 0 else 1}) | {ma.precision:.2%} ({ma.tp}/{ma.tp + ma.fp if ma.tp + ma.fp > 0 else 1}) | {ma.precision - mb.precision:+.2%} |",
-        f"| **Recall** | {mb.recall:.2%} ({mb.tp}/{mb.tp + mb.fn if mb.tp + mb.fn > 0 else 1}) | {ma.recall:.2%} ({ma.tp}/{ma.tp + ma.fn if ma.tp + ma.fn > 0 else 1}) | {ma.recall - mb.recall:+.2%} |",
-        f"| **F1 Score** | {mb.f1:.4f} | {ma.f1:.4f} | {ma.f1 - mb.f1:+.4f} |",
-        f"| **Decisive Accuracy** | {mb.decisive_accuracy:.2%} ({mb.tp + mb.tn}/{mb.decisive_cases if mb.decisive_cases > 0 else 1}) | {ma.decisive_accuracy:.2%} ({ma.tp + ma.tn}/{ma.decisive_cases if ma.decisive_cases > 0 else 1}) | {ma.decisive_accuracy - mb.decisive_accuracy:+.2%} |",
-        f"| **False Positive Rate** | {mb.false_positive_rate:.2%} ({mb.fp}/{mb.fp + mb.tn if mb.fp + mb.tn > 0 else 1}) | {ma.false_positive_rate:.2%} ({ma.fp}/{ma.fp + ma.tn if ma.fp + ma.tn > 0 else 1}) | {ma.false_positive_rate - mb.false_positive_rate:+.2%} |",
-        f"| **Strict Accuracy (Abstentions as Errors)** | {mb.strict_accuracy:.2%} ({mb.tp + mb.tn}/{mb.total_cases}) | {ma.strict_accuracy:.2%} ({ma.tp + ma.tn}/{ma.total_cases}) | {ma.strict_accuracy - mb.strict_accuracy:+.2%} |",
+        f"| **Decisive Coverage** | {ma.coverage_rate:.2%} ({ma.decisive_cases}/{ma.total_cases}) | {mb.coverage_rate:.2%} ({mb.decisive_cases}/{mb.total_cases}) | {target_m.coverage_rate - base_m.coverage_rate:+.2%} |",
+        f"| **Abstention Rate** | {ma.abstention_rate:.2%} ({ma.abstention_cases}/{ma.total_cases}) | {mb.abstention_rate:.2%} ({mb.abstention_cases}/{mb.total_cases}) | {target_m.abstention_rate - base_m.abstention_rate:+.2%} |",
+        f"| **True Positives (TP)** | {ma.tp} | {mb.tp} | {target_m.tp - base_m.tp:+d} |",
+        f"| **False Negatives (FN)** | {ma.fn} | {mb.fn} | {target_m.fn - base_m.fn:+d} |",
+        f"| **True Negatives (TN)** | {ma.tn} | {mb.tn} | {target_m.tn - base_m.tn:+d} |",
+        f"| **False Positives (FP)** | {ma.fp} | {mb.fp} | {target_m.fp - base_m.fp:+d} |",
+        f"| **Uncertain on Relevant** | {ma.uncertain_relevant} | {mb.uncertain_relevant} | {target_m.uncertain_relevant - base_m.uncertain_relevant:+d} |",
+        f"| **Uncertain on Irrelevant** | {ma.uncertain_irrelevant} | {mb.uncertain_irrelevant} | {target_m.uncertain_irrelevant - base_m.uncertain_irrelevant:+d} |",
+        f"| **Precision (Decisive)** | {ma.precision:.2%} ({ma.tp}/{ma.tp + ma.fp if ma.tp + ma.fp > 0 else 1}) | {mb.precision:.2%} ({mb.tp}/{mb.tp + mb.fp if mb.tp + mb.fp > 0 else 1}) | {target_m.precision - base_m.precision:+.2%} |",
+        f"| **Recall (Decisive)** | {ma.recall:.2%} ({ma.tp}/{ma.tp + ma.fn if ma.tp + ma.fn > 0 else 1}) | {mb.recall:.2%} ({mb.tp}/{mb.tp + mb.fn if mb.tp + mb.fn > 0 else 1}) | {target_m.recall - base_m.recall:+.2%} |",
+        f"| **Population Recall (All Relevant)** | {ma.population_recall:.2%} ({ma.tp}/{ma.total_ground_truth_relevant}) | {mb.population_recall:.2%} ({mb.tp}/{mb.total_ground_truth_relevant}) | {target_m.population_recall - base_m.population_recall:+.2%} |",
+        f"| **F1 Score** | {ma.f1:.4f} | {mb.f1:.4f} | {target_m.f1 - base_m.f1:+.4f} |",
+        f"| **Decisive Accuracy** | {ma.decisive_accuracy:.2%} ({ma.tp + ma.tn}/{ma.decisive_cases if ma.decisive_cases > 0 else 1}) | {mb.decisive_accuracy:.2%} ({mb.tp + mb.tn}/{mb.decisive_cases if mb.decisive_cases > 0 else 1}) | {target_m.decisive_accuracy - base_m.decisive_accuracy:+.2%} |",
+        f"| **False Positive Rate** | {ma.false_positive_rate:.2%} ({ma.fp}/{ma.fp + ma.tn if ma.fp + ma.tn > 0 else 1}) | {mb.false_positive_rate:.2%} ({mb.fp}/{mb.fp + mb.tn if mb.fp + mb.tn > 0 else 1}) | {target_m.false_positive_rate - base_m.false_positive_rate:+.2%} |",
+        f"| **Strict Accuracy (Abstentions as Errors)** | {ma.strict_accuracy:.2%} ({ma.tp + ma.tn}/{ma.total_cases}) | {mb.strict_accuracy:.2%} ({mb.tp + mb.tn}/{mb.total_cases}) | {target_m.strict_accuracy - base_m.strict_accuracy:+.2%} |",
         "",
         f"**Recovered Cases:** {len(report.recovered_cases)} | **Broken Decisions:** {len(report.broken_decisions)} | **Infrastructure Failures:** {report.infra_failures_count}",
     ])
@@ -756,6 +1047,13 @@ def main():
         default=DEFAULT_TIMEOUT_SECONDS,
         help=f"Per-call inference timeout in seconds (default: {DEFAULT_TIMEOUT_SECONDS}s).",
     )
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["prompt_experiment", "structure_experiment", "context_comparison"],
+        default="prompt_experiment",
+        help="Evaluation mode: 'prompt_experiment' (Control vs Treatment Prompt with Context), 'structure_experiment' (Standard vs Structure-Aware Formatter with identical prompt), or 'context_comparison' (Context-Aware vs Standalone). Default: prompt_experiment.",
+    )
 
     args = parser.parse_args()
 
@@ -767,6 +1065,7 @@ def main():
     print("ChatLens-RAG: Multi-Case Relevance Grading Evaluation Runner")
     print("=====================================================================")
     print(f"Target Grader Model:      {args.model}")
+    print(f"Evaluation Mode:          {args.mode}")
     print(f"Evaluation Cases:         {num_cases}")
     print(f"Planned Inference Calls:  {planned_calls} (12 cases x 2 conditions)")
     print(f"Max Call Budget Limit:    {args.max_calls}")
@@ -824,12 +1123,13 @@ def main():
             max_calls=args.max_calls,
         )
 
-        print("\nExecuting live evaluation across 12 cases (Condition A and B)...")
+        print(f"\nExecuting live evaluation across 12 cases ({args.mode})...")
         report = run_context_grading_suite(
             grader_llm=wrapped_live_llm,
             env=env,
             cases=EVALUATION_CASES,
             max_budget=args.max_calls,
+            mode=args.mode,
         )
 
         print("\n" + format_evaluation_summary(report))
