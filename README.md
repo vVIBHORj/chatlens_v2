@@ -26,6 +26,7 @@
 - [🏗️ System Architecture & Design](#️-system-architecture--design)
 - [🧠 The LangGraph RAG State Machine](#-the-langgraph-rag-state-machine)
 - [🎯 Context-Aware Relevance Grading](#-context-aware-relevance-grading)
+- [🔀 Opt-In Dialogue-Evidence Retrieval Pipeline](#-opt-in-dialogue-evidence-retrieval-pipeline)
 - [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
 - [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
 - [🧭 Deterministic Query Routing](#-deterministic-query-routing)
@@ -200,6 +201,10 @@ class GraphState(TypedDict, total=False):
     invalid_citation_ids: List[int]       # Hallucinated citation IDs
     available_citation_ids: List[int]     # All message IDs present in final prompt
     grader_status: Optional[str]          # "success" or "failure" (fail-open)
+    evidence_mode: str                    # "standard" or "dialogue_evidence_unit"
+    dialogue_evidence_mode: Optional[bool]# Opt-in feature flag override
+    database_path: Optional[str]          # Isolated SQLite path (for testing/sandboxing)
+    embedding_function: Optional[Any]     # Injected embedding function for scoring/ranking
 ```
 
 ---
@@ -256,6 +261,74 @@ flowchart LR
 2. **Structural Labeling**: Preceding context is labeled distinctly under `Preceding Conversational Context:`, while the candidate under review is isolated under `Candidate Message to Evaluate:`. The model evaluates whether the candidate is relevant *given* the context.
 3. **Strict Document Immutability**: Neither `page_content` nor `metadata` of the candidate `Document` is modified during grading. Preceding messages remain ephemeral prompt hints. Context expansion occurs only *after* grading.
 4. **Fail-Open Graceful Degradation**: If SQLite is temporarily unavailable, or context returns empty, grading automatically falls back to standalone candidate evaluation without raising exceptions. Syntax errors in JSON parsing default safely to `"uncertain"`, retaining the document for downstream validation.
+
+---
+
+## 🔀 Opt-In Dialogue-Evidence Retrieval Pipeline
+
+In Tasks 35, 36, and 37, architectural analysis revealed that routing retrieved candidates through an isolated LLM-based `grade_documents` node acts as an irreversible filter: short, highly context-dependent replies (*"In Vault 9."*, *"14:00"*, *"Confirmed."*) risk permanent rejection before surrounding conversational context can be assembled.
+
+ChatLens introduces an **opt-in alternative retrieval architecture**:
+$$\textbf{Retrieve anchors} \longrightarrow \textbf{Assemble dialogue units} \longrightarrow \textbf{Rank complete units (RRF)} \longrightarrow \textbf{Select bounded top-K} \longrightarrow \textbf{Generate} \longrightarrow \textbf{Validate citations}$$
+
+This bypasses the LLM relevance grader as a hard pre-filter, instead assembling complete chronological dialogue windows around message anchors and scoring full conversational transcripts.
+
+```mermaid
+flowchart LR
+    subgraph RETRIEVE["1. Hybrid Retrieval"]
+        R1["Message Anchors + Chunks<br/>(BM25 + Chroma)"]
+    end
+
+    subgraph ASSEMBLE["2. Evidence Unit Assembly"]
+        R1 --> ASMB["assemble_dialogue_evidence_units()<br/>SQLite context expansion (before=2, after=1)<br/>Preserves anchor & neighbor IDs"]
+    end
+
+    subgraph RANK["3. Dual-Signal RRF Reranking"]
+        ASMB --> RRF["rank_dialogue_evidence_units()<br/>Signal A: Original retrieval rank<br/>Signal B: Dense contextual similarity<br/>Fused Score = 0.5/(60+r_ret) + 0.5/(60+r_ctx)"]
+    end
+
+    subgraph BOUND["4. Bounded Selection"]
+        RRF --> TOP5["Select Top-5 Evidence Units<br/>Deterministic tie-breaking"]
+    end
+
+    subgraph GEN["5. Grounded Generation"]
+        TOP5 --> PROMPT["generate (qwen2.5:3b)<br/>Canonical [ID N] evidence"]
+        PROMPT --> VALID["check_grounded<br/>Mechanical + semantic validation"]
+    end
+
+    style R1 fill:#3b82f6,color:#fff
+    style ASMB fill:#8b5cf6,color:#fff
+    style RRF fill:#ec4899,color:#fff
+    style TOP5 fill:#f59e0b,color:#fff
+    style PROMPT fill:#10b981,color:#fff
+    style VALID fill:#065f46,color:#fff
+```
+
+### Key Architectural Invariants:
+1. **Preserved Citation Provenance**: Every turn in an assembled dialogue unit carries its original `message_id`, `sender`, and `timestamp`. The anchor message is clearly marked with `[ANCHOR: message_id]` to distinguish the retrieved claim from neighboring context.
+2. **Contextual Transcript Scoring (Signal B)**: Dense cosine similarity is computed between the user query and the *complete assembled transcript*, enabling short elliptical messages to rank well when their surrounding context satisfies the query.
+3. **Deterministic Reciprocal Rank Fusion (RRF)**:
+   $$\text{fused\_score}(d) = \frac{0.5}{60 + \text{rank}_{\text{ret}}(d)} + \frac{0.5}{60 + \text{rank}_{\text{ctx}}(d)}$$
+   Ties are broken deterministically via `(-fused_score, -contextual_similarity, retrieval_rank, anchor_message_id)`.
+4. **Safe Degradation**: If embeddings cannot be calculated or an error occurs, the ranker falls back safely to pure retrieval order (`contextual_ranking_status="fallback_retrieval_order"`). Candidates are never silently discarded.
+5. **Zero Interference with Production**: The experimental path is disabled by default. When disabled, the production graph runs `grade_documents` and the legacy pipeline with zero behavioral drift.
+
+### Activating the Experiment:
+
+- **Via Environment Variable**:
+  ```bash
+  export CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT=1
+  ```
+- **Via Python API**:
+  ```python
+  from rag_graph import ask
+
+  response = ask(
+      "Where did Alex leave the keys?",
+      dialogue_evidence_mode=True
+  )
+  print(f"Evidence Mode: {response['evidence_mode']}") # "dialogue_evidence_unit"
+  ```
 
 ---
 
@@ -745,8 +818,17 @@ python -m pytest test_universal_benchmark.py
 # 7. Run the query router classification tests
 python -m pytest test_query_router.py
 
-# 8. Execute all 66 offline grading, sandboxing, and evaluation tests in one pass
-python -m pytest test_run_context_grading_live.py test_context_grading_evaluation.py test_bm03_comparison_harness.py test_controlled_grading_comparison.py test_relevance_grading.py
+# 8. Run the deterministic dialogue evidence unit assembly tests (Task 36)
+python -m pytest test_context_expander.py -v
+
+# 9. Run the opt-in dialogue-evidence retrieval pipeline tests (Task 37)
+python -m pytest test_dialogue_evidence_pipeline.py -v
+
+# 10. Run citation integrity, fail-closed validation, and grounding tests
+python -m pytest test_citation_integrity.py -v
+
+# 11. Execute all offline grading, sandboxing, and evaluation tests in one pass
+python -m pytest test_run_context_grading_live.py test_context_grading_evaluation.py test_bm03_comparison_harness.py test_controlled_grading_comparison.py test_relevance_grading.py test_context_expander.py test_dialogue_evidence_pipeline.py test_citation_integrity.py
 ```
 
 ### Multi-Case Live Grading Evaluation Runner
@@ -795,6 +877,9 @@ python benchmark_suite.py
 - [x] Controlled live grading evaluation runner with explicit confirmation gate and dry-run default.
 - [x] Strict runtime LLM inference budget enforcement (`BudgetEnforcingLLMWrapper`) preventing runaway model calls.
 - [x] Deterministic metrics engine (attribution precision/recall, citation validity, abstention).
+- [x] Deterministic dialogue evidence unit assembly preserving exact message anchor provenance and chronological boundaries (Task 36).
+- [x] Opt-in dialogue-evidence retrieval pipeline with dual-signal RRF contextual ranking, top-K bounding, and zero-breakage production gating (Task 37).
+- [x] Mechanical and semantic citation integrity suite with fail-closed validation for synthetic, legacy, and chunk evidence.
 
 ### 🚀 Upcoming Roadmap
 - [ ] Execute authorized live multi-case grading evaluation against local `qwen2.5:3b`.

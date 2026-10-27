@@ -622,13 +622,64 @@ def format_candidate_structure_aware(
         return f"{header}\n{cand_line}"
 
 
+def format_candidate_dialogue_unit(
+    idx: int,
+    document: Document,
+    preceding_context: Optional[str] = None,
+) -> str:
+    """
+    Dialogue-unit formatter for relevance grading evaluation.
+    Presents the candidate message together with its preceding conversational
+    context as an ordered dialogue exchange, framing the candidate as the
+    response being evaluated within the ongoing conversation rather than as
+    an isolated utterance.
+
+    Preserves exact message IDs, timestamps, speaker labels, multiline bodies,
+    indentation, blank lines, and punctuation.
+    If preceding context is unavailable, falls back safely to a clearly labelled
+    standalone candidate without fabricating conversation turns.
+    """
+    source = document.metadata.get("source", "unknown")
+    msg_id = document.metadata.get("message_id")
+    chunk_id = document.metadata.get("chunk_id")
+
+    cand_line = _normalize_message_line(document.page_content)
+
+    preceding_messages = _parse_preceding_messages(preceding_context)
+    normalized_preceding = [
+        _normalize_message_line(msg)
+        for msg in preceding_messages
+    ]
+
+    if normalized_preceding:
+        if source == "hybrid_search" and msg_id is not None:
+            header = f"[Candidate {idx}] (Dialogue Unit | Response Message ID: {msg_id})"
+        elif source == "conversation_chunk" and chunk_id is not None:
+            header = f"[Candidate {idx}] (Dialogue Unit | Chunk ID: {chunk_id})"
+        else:
+            header = f"[Candidate {idx}] (Dialogue Unit)"
+
+        exchange = list(normalized_preceding)
+        exchange.append(f"[Response to Evaluate] {cand_line}")
+        return f"{header}\nDialogue Exchange:\n" + "\n".join(exchange)
+    else:
+        if source == "hybrid_search" and msg_id is not None:
+            header = f"[Candidate {idx}] (Standalone Message ID: {msg_id})"
+        elif source == "conversation_chunk" and chunk_id is not None:
+            header = f"[Candidate {idx}] (Standalone Conversation Chunk ID: {chunk_id})"
+        else:
+            header = f"[Candidate {idx}] (Standalone Candidate | Source: {source})"
+
+        return f"{header}\n{cand_line}"
+
+
 # ---------------------------------------------------------------------
 # Single Case Evaluation
 # ---------------------------------------------------------------------
 
 def evaluate_case_condition(
     case: ContextGradingCase,
-    condition: str,  # "context_aware", "standalone", "control_prompt", "treatment_prompt", "control_structure", "treatment_structure"
+    condition: str,  # "context_aware", "standalone", "control_prompt", "treatment_prompt", "control_structure", "treatment_structure", "control_structure_prompt", "treatment_structure_prompt", "control_dialogue_unit", "treatment_dialogue_unit"
     grader_llm: Any,
     database_path: str,
     prompt_template: Optional[str] = None,
@@ -670,7 +721,14 @@ def evaluate_case_condition(
                 database_path=database_path,
                 prompt_template=prompt_template,
             )
-    elif condition in ("control_structure", "treatment_structure"):
+    elif condition in (
+        "control_structure",
+        "treatment_structure",
+        "control_structure_prompt",
+        "treatment_structure_prompt",
+        "control_dialogue_unit",
+        "treatment_dialogue_unit",
+    ):
         graded_batch = grade_candidate_batch(
             question=case.query,
             batch_docs=[doc],
@@ -696,10 +754,17 @@ def evaluate_case_condition(
         prompt = wrapper.captured_prompts[prompt_count_before]
     else:
         prompt = ""
+    if "Retrieved Candidates:\n" in prompt and "Evaluation Guidelines:" in prompt:
+        cand_block = prompt.split("Retrieved Candidates:\n")[1].split("Evaluation Guidelines:")[0]
+    else:
+        cand_block = prompt
+
     has_preceding_context = (
-        "Preceding Conversational Context:" in prompt
-        or "Chronological Conversation Transcript" in prompt
-        or "[Turn 1]" in prompt
+        "Preceding Conversational Context:" in cand_block
+        or "Chronological Conversation Transcript" in cand_block
+        or "[Turn 1]" in cand_block
+        or "Dialogue Exchange:" in cand_block
+        or "Dialogue Unit" in cand_block
     )
 
     if graded_batch:
@@ -830,7 +895,67 @@ def run_context_grading_suite(
 
     try:
         for case in eval_cases:
-            if mode == "structure_experiment":
+            if mode == "dialogue_unit_experiment":
+                # Single shared context lookup per candidate
+                doc = build_candidate_document(case)
+                resolved_context = rag_graph.get_grading_preceding_context(
+                    doc, database_path=str(env.db_path)
+                )
+
+                # Condition A: Control (Standard format_candidate_for_grader + Production GRADE_PROMPT_TEMPLATE)
+                res_a = evaluate_case_condition(
+                    case=case,
+                    condition="control_dialogue_unit",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+                    candidate_formatter=rag_graph.format_candidate_for_grader,
+                    preceding_context=resolved_context,
+                )
+                results_a.append(res_a)
+
+                # Condition B: Treatment (format_candidate_dialogue_unit + EXACT SAME Production GRADE_PROMPT_TEMPLATE)
+                res_b = evaluate_case_condition(
+                    case=case,
+                    condition="treatment_dialogue_unit",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+                    candidate_formatter=format_candidate_dialogue_unit,
+                    preceding_context=resolved_context,
+                )
+                results_b.append(res_b)
+            elif mode == "structure_prompt_experiment":
+                # Single shared context lookup per candidate
+                doc = build_candidate_document(case)
+                resolved_context = rag_graph.get_grading_preceding_context(
+                    doc, database_path=str(env.db_path)
+                )
+
+                # Condition A: Control (format_candidate_structure_aware + Production GRADE_PROMPT_TEMPLATE)
+                res_a = evaluate_case_condition(
+                    case=case,
+                    condition="control_structure_prompt",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+                    candidate_formatter=format_candidate_structure_aware,
+                    preceding_context=resolved_context,
+                )
+                results_a.append(res_a)
+
+                # Condition B: Treatment (format_candidate_structure_aware + EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE)
+                res_b = evaluate_case_condition(
+                    case=case,
+                    condition="treatment_structure_prompt",
+                    grader_llm=enforcing_wrapper,
+                    database_path=str(env.db_path),
+                    prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+                    candidate_formatter=format_candidate_structure_aware,
+                    preceding_context=resolved_context,
+                )
+                results_b.append(res_b)
+            elif mode == "structure_experiment":
                 # Single shared context lookup per candidate
                 doc = build_candidate_document(case)
                 resolved_context = rag_graph.get_grading_preceding_context(
@@ -901,7 +1026,13 @@ def run_context_grading_suite(
         is_complete = False
         termination_reason = str(exc)
 
-    if mode == "structure_experiment":
+    if mode == "dialogue_unit_experiment":
+        name_a = "Control (Standard Formatter + Production Prompt)"
+        name_b = "Treatment (Dialogue-Unit Formatter + Production Prompt)"
+    elif mode == "structure_prompt_experiment":
+        name_a = "Control (Production Prompt + Structured Transcript)"
+        name_b = "Treatment (Structure-Aware Prompt + Structured Transcript)"
+    elif mode == "structure_experiment":
         name_a = "Control Formatter (Standard)"
         name_b = "Treatment Formatter (Structure-Aware)"
     elif mode == "prompt_experiment":
@@ -919,7 +1050,7 @@ def run_context_grading_suite(
     invariant = []
 
     for ra, rb in zip(results_a, results_b):
-        if mode in ("prompt_experiment", "structure_experiment"):
+        if mode in ("prompt_experiment", "structure_experiment", "structure_prompt_experiment", "dialogue_unit_experiment"):
             if ra.parsed_decision != ra.expected_label and rb.parsed_decision == rb.expected_label:
                 recovered.append(ra.case_id)
             elif ra.parsed_decision == ra.expected_label and rb.parsed_decision != rb.expected_label:
@@ -1083,9 +1214,21 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["prompt_experiment", "structure_experiment", "context_comparison"],
+        choices=[
+            "dialogue_unit_experiment",
+            "prompt_experiment",
+            "structure_experiment",
+            "structure_prompt_experiment",
+            "context_comparison",
+        ],
         default="prompt_experiment",
-        help="Evaluation mode: 'prompt_experiment' (Control vs Treatment Prompt with Context), 'structure_experiment' (Standard vs Structure-Aware Formatter with identical prompt), or 'context_comparison' (Context-Aware vs Standalone). Default: prompt_experiment.",
+        help=(
+            "Evaluation mode: 'dialogue_unit_experiment' (Standard vs Dialogue-Unit Formatter with identical production prompt), "
+            "'prompt_experiment' (Control vs Treatment Prompt with Context), "
+            "'structure_experiment' (Standard vs Structure-Aware Formatter with identical prompt), "
+            "'structure_prompt_experiment' (Production vs Structure-Aware Prompt with identical structure-aware transcript), "
+            "or 'context_comparison' (Context-Aware vs Standalone). Default: prompt_experiment."
+        ),
     )
 
     args = parser.parse_args()

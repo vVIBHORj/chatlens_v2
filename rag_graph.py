@@ -88,6 +88,8 @@ Requirements:
 # =====================================================================
 
 import json
+import math
+import os
 import re
 from dataclasses import dataclass
 from typing import List, Optional, TypedDict, Dict, Tuple, Any, Set, Callable
@@ -101,6 +103,7 @@ from langgraph.graph import StateGraph, END
 
 from hybrid_retriever import hybrid_search
 from analytics import build_style_profile
+from context_expander import assemble_dialogue_evidence_units
 
 
 from chat_database import (
@@ -142,6 +145,13 @@ SEMANTIC_EXPANSION_MAX_WORDS = 6
 
 SEMANTIC_EXPANSION_MAX_CHARS = 35
 
+# Opt-in dialogue evidence experiment configuration
+DIALOGUE_EVIDENCE_ENV_VAR = "CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT"
+TOP_K_EVIDENCE_UNITS = 5
+RRF_K_CONTEXTUAL = 60
+WEIGHT_RETRIEVAL = 0.5
+WEIGHT_CONTEXTUAL = 0.5
+
 
 # =====================================================================
 # LLM
@@ -181,6 +191,12 @@ class GraphState(TypedDict, total=False):
     invalid_citation_ids: Optional[List[int]]
     available_citation_ids: Optional[List[int]]
     grader_status: Optional[str]
+
+    # Opt-in dialogue evidence experiment fields
+    evidence_mode: Optional[str]
+    dialogue_evidence_mode: Optional[bool]
+    database_path: Optional[str]
+    embedding_function: Optional[Any]
 
 # =====================================================================
 # Scope classification
@@ -1901,6 +1917,243 @@ def route_by_scope(
 
 
 # =====================================================================
+# Opt-In Dialogue Evidence Pipeline Helpers
+# =====================================================================
+
+def is_dialogue_evidence_enabled(state: Optional[GraphState] = None) -> bool:
+    """
+    Check whether the opt-in dialogue-evidence retrieval pipeline is enabled.
+    Disabled by default. Enabled if:
+      - state.get("dialogue_evidence_mode") is True, or
+      - state.get("use_dialogue_evidence") is True, or
+      - CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT environment variable is set to '1' or 'true'.
+    """
+    if state is not None:
+        if state.get("dialogue_evidence_mode") is not None:
+            return bool(state["dialogue_evidence_mode"])
+        if state.get("use_dialogue_evidence") is not None:
+            return bool(state["use_dialogue_evidence"])
+
+    env_val = os.environ.get(DIALOGUE_EVIDENCE_ENV_VAR, "0").strip().lower()
+    return env_val in ("1", "true", "yes", "on")
+
+
+def compute_cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
+    """Compute cosine similarity between two floating-point vectors."""
+    if not vec1 or not vec2 or len(vec1) != len(vec2):
+        return 0.0
+    dot = sum(a * b for a, b in zip(vec1, vec2))
+    norm1 = math.sqrt(sum(a * a for a in vec1))
+    norm2 = math.sqrt(sum(b * b for b in vec2))
+    if norm1 == 0.0 or norm2 == 0.0:
+        return 0.0
+    return dot / (norm1 * norm2)
+
+
+def rank_dialogue_evidence_units(
+    question: str,
+    evidence_units: List[Document],
+    embedding_function: Optional[Any] = None,
+) -> List[Document]:
+    """
+    Ranks assembled dialogue evidence units using Reciprocal Rank Fusion (RRF)
+    combining:
+      Signal A: Original retrieval ranking from hybrid search (protects lexical/dense search work).
+      Signal B: Contextual evidence semantic similarity (scores query against complete dialogue transcript).
+
+    Formula:
+      fused_score(d) = (WEIGHT_RETRIEVAL / (RRF_K + rank_retrieval(d))) +
+                       (WEIGHT_CONTEXTUAL / (RRF_K + rank_contextual(d)))
+
+    Tie-breaking:
+      Deterministic ordering by (-fused_score, original_rank, anchor_id).
+
+    Fallback:
+      If contextual embeddings cannot be calculated (e.g., service unavailable or error),
+      falls back safely to Signal A (retrieval order) without discarding candidates.
+    """
+    if not evidence_units:
+        return []
+
+    # 1. Establish Signal A: original retrieval rank (1-indexed based on input order)
+    docs_with_rank = []
+    for idx, doc in enumerate(evidence_units, start=1):
+        new_doc = Document(
+            page_content=doc.page_content,
+            metadata=dict(doc.metadata) if doc.metadata else {},
+        )
+        new_doc.metadata["retrieval_rank"] = idx
+        docs_with_rank.append(new_doc)
+
+    # 2. Establish Signal B: contextual similarity using embedding interface
+    embedder = embedding_function
+    if embedder is None:
+        try:
+            from vectorstore import get_embeddings
+            embedder = get_embeddings()
+        except Exception:
+            embedder = None
+
+    contextual_success = False
+    if embedder is not None and question and question.strip():
+        try:
+            q_emb = embedder.embed_query(question.strip())
+            texts = [d.page_content for d in docs_with_rank]
+            doc_embs = embedder.embed_documents(texts)
+
+            if len(doc_embs) == len(docs_with_rank):
+                for doc, d_emb in zip(docs_with_rank, doc_embs):
+                    sim = compute_cosine_similarity(q_emb, d_emb)
+                    doc.metadata["contextual_similarity"] = round(sim, 4)
+                contextual_success = True
+        except Exception as e:
+            print(f"[CONTEXTUAL RANKING WARNING] Could not compute contextual embeddings: {e}")
+            contextual_success = False
+
+    # 3. Calculate Contextual Ranks and RRF Fusion
+    if contextual_success:
+        # Sort by contextual_similarity DESC to assign contextual ranks
+        def context_sort_key(d: Document):
+            sim = d.metadata.get("contextual_similarity", -1.0)
+            ret_rank = d.metadata.get("retrieval_rank", 999999)
+            anchor_id = d.metadata.get("anchor_message_id") or 999999
+            try:
+                aid = int(anchor_id)
+            except (ValueError, TypeError):
+                aid = 999999
+            return (-sim, ret_rank, aid)
+
+        docs_by_context = sorted(docs_with_rank, key=context_sort_key)
+        for c_rank, doc in enumerate(docs_by_context, start=1):
+            doc.metadata["contextual_rank"] = c_rank
+            doc.metadata["contextual_ranking_status"] = "success"
+            doc.metadata["contextual_ranking_fallback"] = False
+
+        # Calculate Fused Score
+        for doc in docs_with_rank:
+            r_ret = doc.metadata.get("retrieval_rank", len(docs_with_rank))
+            r_ctx = doc.metadata.get("contextual_rank", len(docs_with_rank))
+            fused = (WEIGHT_RETRIEVAL / (RRF_K_CONTEXTUAL + r_ret)) + (
+                WEIGHT_CONTEXTUAL / (RRF_K_CONTEXTUAL + r_ctx)
+            )
+            doc.metadata["fused_score"] = round(fused, 6)
+    else:
+        # Fallback to pure retrieval ranking
+        for doc in docs_with_rank:
+            r_ret = doc.metadata.get("retrieval_rank", len(docs_with_rank))
+            fused = 1.0 / (RRF_K_CONTEXTUAL + r_ret)
+            doc.metadata["fused_score"] = round(fused, 6)
+            doc.metadata["contextual_rank"] = None
+            doc.metadata["contextual_similarity"] = None
+            doc.metadata["contextual_ranking_status"] = "fallback_retrieval_order"
+            doc.metadata["contextual_ranking_fallback"] = True
+
+    # 4. Final Deterministic Ordering
+    def final_sort_key(d: Document):
+        fused = d.metadata.get("fused_score", 0.0)
+        sim = d.metadata.get("contextual_similarity")
+        sim_val = float(sim) if sim is not None else -1.0
+        ret_rank = d.metadata.get("retrieval_rank", 999999)
+        anchor_id = d.metadata.get("anchor_message_id")
+        try:
+            aid = int(anchor_id) if anchor_id is not None else 999999
+        except (ValueError, TypeError):
+            aid = 999999
+        return (-fused, -sim_val, ret_rank, aid)
+
+    ranked_docs = sorted(docs_with_rank, key=final_sort_key)
+    return ranked_docs
+
+
+def assemble_and_rank_evidence(
+    state: GraphState,
+    embedding_function: Optional[Any] = None,
+    database_path: Optional[str] = None,
+) -> GraphState:
+    """
+    Opt-in LangGraph node for dialogue-evidence pipeline:
+      1. Assembles retrieved message anchors into chronological dialogue units.
+      2. Ranks complete evidence units using hybrid retrieval + contextual transcript similarity.
+      3. Bounds evidence to TOP_K_EVIDENCE_UNITS.
+    """
+    documents = state.get("documents", [])
+    question = state.get("original_question") or state.get("question", "")
+    db_path = database_path or state.get("database_path")
+
+    print("\n" + "=" * 70)
+    print("EXPERIMENTAL DIALOGUE EVIDENCE UNIT ASSEMBLY & RERANKING")
+    print("=" * 70)
+    print(f"Retrieved candidate documents: {len(documents)}")
+
+    if not documents:
+        print("No candidates retrieved to assemble.")
+        return {
+            **state,
+            "documents": [],
+            "evidence_mode": "dialogue_evidence_unit",
+        }
+
+    # 1. Assemble dialogue units using Task 36 helper
+    evidence_units = assemble_dialogue_evidence_units(
+        documents,
+        before=2,
+        after=1,
+        database_path=db_path,
+    )
+    print(f"Assembled dialogue evidence units: {len(evidence_units)}")
+
+    # 2. Contextually rank evidence units
+    embedder = embedding_function or state.get("embedding_function")
+    ranked_units = rank_dialogue_evidence_units(
+        question=question,
+        evidence_units=evidence_units,
+        embedding_function=embedder,
+    )
+
+    # 3. Select bounded top-K evidence units
+    bounded_units = ranked_units[:TOP_K_EVIDENCE_UNITS]
+    print(f"Selected top-{len(bounded_units)} bounded evidence units for generation:")
+    for idx, unit in enumerate(bounded_units, start=1):
+        anchor_id = unit.metadata.get("anchor_message_id") or unit.metadata.get("message_id")
+        fused = unit.metadata.get("fused_score", 0.0)
+        ret_rank = unit.metadata.get("retrieval_rank")
+        ctx_rank = unit.metadata.get("contextual_rank")
+        print(f"  #{idx} Anchor ID={anchor_id} | fused_score={fused:.6f} (ret_rank={ret_rank}, ctx_rank={ctx_rank})")
+
+    return {
+        **state,
+        "documents": bounded_units,
+        "evidence_mode": "dialogue_evidence_unit",
+    }
+
+
+def route_post_retrieval(state: GraphState) -> str:
+    """
+    Routing decision immediately after retrieval:
+    - If dialogue evidence experiment is enabled: routes to assemble_and_rank_evidence.
+    - Otherwise (default production behavior): routes to grade_documents.
+    """
+    if is_dialogue_evidence_enabled(state):
+        return "assemble_and_rank_evidence"
+    return "grade_documents"
+
+
+def decide_post_assembly(state: GraphState) -> str:
+    """
+    Routing decision immediately after dialogue evidence unit assembly & ranking:
+    - If no documents remain and rewrites remain: routes to rewrite_query.
+    - Otherwise: proceeds directly to grounded generation.
+    """
+    documents = state.get("documents", [])
+    rewrite_count = state.get("rewrite_count", 0)
+
+    if not documents and rewrite_count < MAX_REWRITES:
+        return "rewrite_query"
+
+    return "generate"
+
+
+# =====================================================================
 # Build graph
 # =====================================================================
 
@@ -1942,6 +2195,11 @@ def build_graph():
     workflow.add_node(
         "expand_context",
         expand_context,
+    )
+
+    workflow.add_node(
+        "assemble_and_rank_evidence",
+        assemble_and_rank_evidence,
     )
 
     workflow.add_node(
@@ -1998,20 +2256,41 @@ def build_graph():
     )
 
     # -------------------------------------------------------------
-    # Retrieval path
+    # Retrieval path (conditional post-retrieval routing)
     # -------------------------------------------------------------
 
-    workflow.add_edge(
+    workflow.add_conditional_edges(
         "retrieve",
-        "grade_documents",
+        route_post_retrieval,
+        {
+            "grade_documents":
+                "grade_documents",
+
+            "assemble_and_rank_evidence":
+                "assemble_and_rank_evidence",
+        },
     )
 
+    # Default production path: relevance grading -> decision
     workflow.add_conditional_edges(
         "grade_documents",
         decide_to_generate,
         {
             "generate":
                 "expand_context",
+
+            "rewrite_query":
+                "rewrite_query",
+        },
+    )
+
+    # Experimental dialogue evidence path: assembly & ranking -> decision
+    workflow.add_conditional_edges(
+        "assemble_and_rank_evidence",
+        decide_post_assembly,
+        {
+            "generate":
+                "generate",
 
             "rewrite_query":
                 "rewrite_query",
@@ -2060,6 +2339,8 @@ def build_graph():
 def ask(
     question: str,
     df: Optional[pd.DataFrame] = None,
+    dialogue_evidence_mode: Optional[bool] = None,
+    database_path: Optional[str] = None,
 ) -> dict:
     """
     Run the complete ChatLens-RAG pipeline.
@@ -2074,6 +2355,13 @@ def ask(
 
         Required for broad/whole-conversation analysis.
 
+    dialogue_evidence_mode:
+        Optional boolean override for opt-in dialogue evidence experiment.
+        Defaults to None (falls back to CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT env var).
+
+    database_path:
+        Optional explicit database path for isolated environments.
+
     Returns
     -------
     dict
@@ -2083,6 +2371,7 @@ def ask(
         rewrites_used
         scope
         query_spec
+        evidence_mode
     """
 
     if not question or not question.strip():
@@ -2110,6 +2399,9 @@ def ask(
         "invalid_citation_ids": [],
         "available_citation_ids": [],
         "grader_status": None,
+        "evidence_mode": "standard",
+        "dialogue_evidence_mode": dialogue_evidence_mode,
+        "database_path": database_path,
     }
 
     # Run the LangGraph pipeline
@@ -2142,6 +2434,8 @@ def ask(
         "available_citation_ids": result.get("available_citation_ids", []),
 
         "grader_status": result.get("grader_status"),
+
+        "evidence_mode": result.get("evidence_mode", "standard"),
     }
 
 

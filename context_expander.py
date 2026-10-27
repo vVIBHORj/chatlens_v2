@@ -1,12 +1,18 @@
 from __future__ import annotations
+import copy
+import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Set
+
+from langchain_core.documents import Document
 
 from chat_database import (
     get_message,
     get_chronological_context,
+    get_connection,
 )
 
 # ============================================================
@@ -758,6 +764,367 @@ def print_context_regions(
                 f"{message.sender}: "
                 f"{message.message}"
             )
+
+
+# ============================================================
+# DIALOGUE EVIDENCE UNIT ASSEMBLY
+# ============================================================
+
+def _extract_document_message_id(document: Document) -> Optional[int]:
+    """
+    Extract integer message ID from a Document's metadata or page_content header.
+    Returns None if no valid ID can be resolved.
+    """
+    if not document:
+        return None
+
+    if hasattr(document, "metadata") and document.metadata:
+        mid = document.metadata.get("message_id")
+        if mid is not None:
+            try:
+                return int(mid)
+            except (ValueError, TypeError):
+                pass
+
+    if hasattr(document, "page_content") and document.page_content:
+        m = re.search(r"\[(?:ID|message_id)\s*=?\s*(\d+)\]", document.page_content, re.IGNORECASE)
+        if m:
+            try:
+                return int(m.group(1))
+            except (ValueError, TypeError):
+                pass
+
+    return None
+
+
+def _format_evidence_timestamp(raw_timestamp: Any) -> str:
+    """Format timestamp string into readable ISO format or preserve original text."""
+    if not raw_timestamp:
+        return ""
+    text = str(raw_timestamp).strip()
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.strftime("%d/%m/%Y %I:%M %p")
+    except Exception:
+        return text
+
+
+def _format_evidence_message_line(row: Any) -> str:
+    """Format a single message row into canonical [ID <id>] [<timestamp>] <sender>: <text> representation."""
+    msg_id = row["id"]
+    raw_ts = row["timestamp"]
+    ts_str = _format_evidence_timestamp(raw_ts)
+    sender = row["sender"] or ""
+    body = row["message"] or ""
+    return f"[ID {msg_id}] [{ts_str}] {sender}: {body}"
+
+
+def assemble_dialogue_evidence_units(
+    anchor_documents: Optional[List[Document]],
+    before: int = 2,
+    after: int = 1,
+    database_path: Optional[str] = None,
+) -> List[Document]:
+    """
+    Converts retrieved chat-message anchors into bounded chronological dialogue
+    evidence units before relevance filtering.
+
+    Preserves:
+      - Original message text, sender, timestamp, and message ID.
+      - Exact anchor identity to distinguish retrieved targets from contextual neighbors.
+      - Surrounding turns in deterministic chronological order (timestamp ASC, id ASC).
+      - Input documents without in-place mutation.
+      - Full citation provenance: contextual inclusion does not alter author/statement mapping.
+
+    Safety:
+      - Requires an explicit database_path; never falls back to the production database.
+      - Fails open by safely preserving unexpanded standalone units if lookup fails or DB path is missing.
+      - Preserves existing conversation-chunk documents without redundant expansion.
+      - Deduplicates identical input anchors while preserving distinct overlapping windows.
+    """
+    if not anchor_documents or not isinstance(anchor_documents, (list, tuple)):
+        return []
+
+    before_count = max(0, int(before))
+    after_count = max(0, int(after))
+
+    evidence_units: List[Document] = []
+    seen_anchors: Set[Any] = set()
+
+    # Safety: do not attempt context expansion if database_path is omitted or empty.
+    # We must NEVER fall back to production chat_data.db.
+    can_query_db = bool(database_path and isinstance(database_path, str) and database_path.strip())
+    db_exists = can_query_db and os.path.exists(database_path)
+
+    for doc in anchor_documents:
+        if not doc or not isinstance(doc, Document):
+            continue
+
+        doc_meta = dict(doc.metadata) if doc.metadata else {}
+        source = doc_meta.get("source", "unknown")
+        chunk_id = doc_meta.get("chunk_id")
+        msg_id = _extract_document_message_id(doc)
+
+        # -------------------------------------------------------------
+        # Deduplication of identical anchors
+        # -------------------------------------------------------------
+        if source == "conversation_chunk" or chunk_id is not None:
+            anchor_key = ("chunk", chunk_id if chunk_id is not None else doc.page_content[:120])
+        elif msg_id is not None:
+            anchor_key = ("message", msg_id)
+        else:
+            anchor_key = ("raw", doc.page_content)
+
+        if anchor_key in seen_anchors:
+            continue
+        seen_anchors.add(anchor_key)
+
+        # -------------------------------------------------------------
+        # 1. Conversation Chunks: preserve as-is without second expansion
+        # -------------------------------------------------------------
+        if source == "conversation_chunk" or chunk_id is not None:
+            chunk_meta = copy.deepcopy(doc_meta)
+            chunk_meta["context_expanded"] = False
+            chunk_meta["context_method"] = "preexisting_chunk"
+            chunk_meta["evidence_unit_status"] = "preserved_chunk"
+            chunk_meta["anchor_type"] = "conversation_chunk"
+            evidence_units.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata=chunk_meta,
+                )
+            )
+            continue
+
+        # -------------------------------------------------------------
+        # 2. Malformed Metadata: no valid integer message ID
+        # -------------------------------------------------------------
+        if msg_id is None:
+            malformed_meta = copy.deepcopy(doc_meta)
+            malformed_meta["context_expanded"] = False
+            malformed_meta["context_method"] = "standalone_unexpanded"
+            malformed_meta["evidence_unit_status"] = "unexpanded_malformed_metadata"
+            malformed_meta["included_message_ids"] = []
+            evidence_units.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata=malformed_meta,
+                )
+            )
+            continue
+
+        # -------------------------------------------------------------
+        # 3. Missing or Nonexistent Database Path: Fail Safely
+        # -------------------------------------------------------------
+        if not can_query_db:
+            missing_db_meta = copy.deepcopy(doc_meta)
+            missing_db_meta["context_expanded"] = False
+            missing_db_meta["context_method"] = "standalone_unexpanded"
+            missing_db_meta["evidence_unit_status"] = "unexpanded_missing_database_path"
+            missing_db_meta["expansion_error"] = "database_path was omitted or empty; expansion aborted to prevent production fallback"
+            missing_db_meta["anchor_message_id"] = msg_id
+            missing_db_meta["included_message_ids"] = [msg_id]
+            evidence_units.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata=missing_db_meta,
+                )
+            )
+            continue
+
+        if not db_exists:
+            no_db_meta = copy.deepcopy(doc_meta)
+            no_db_meta["context_expanded"] = False
+            no_db_meta["context_method"] = "standalone_unexpanded"
+            no_db_meta["evidence_unit_status"] = "unexpanded_database_not_found"
+            no_db_meta["expansion_error"] = f"Database file does not exist: {database_path}"
+            no_db_meta["anchor_message_id"] = msg_id
+            no_db_meta["included_message_ids"] = [msg_id]
+            evidence_units.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata=no_db_meta,
+                )
+            )
+            continue
+
+        # -------------------------------------------------------------
+        # 4. Resolve Anchor & Retrieve Chronological Dialogue Unit
+        # -------------------------------------------------------------
+        try:
+            conn = sqlite3.connect(database_path)
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            # Target anchor
+            cursor.execute(
+                """
+                SELECT id, timestamp, sender, message
+                FROM messages
+                WHERE id = ?
+                """,
+                (msg_id,),
+            )
+            target_row = cursor.fetchone()
+
+            if target_row is None:
+                conn.close()
+                missing_anchor_meta = copy.deepcopy(doc_meta)
+                missing_anchor_meta["context_expanded"] = False
+                missing_anchor_meta["context_method"] = "standalone_unexpanded"
+                missing_anchor_meta["evidence_unit_status"] = "unexpanded_anchor_not_found"
+                missing_anchor_meta["expansion_error"] = f"Message ID {msg_id} not found in database"
+                missing_anchor_meta["anchor_message_id"] = msg_id
+                missing_anchor_meta["included_message_ids"] = [msg_id]
+                evidence_units.append(
+                    Document(
+                        page_content=doc.page_content,
+                        metadata=missing_anchor_meta,
+                    )
+                )
+                continue
+
+            target_ts = target_row["timestamp"]
+            has_timestamp = bool(target_ts and str(target_ts).strip())
+
+            # Retrieve preceding messages (deterministic timestamp + id tie-breaker)
+            if has_timestamp and before_count > 0:
+                cursor.execute(
+                    """
+                    SELECT id, timestamp, sender, message
+                    FROM messages
+                    WHERE
+                        timestamp IS NOT NULL
+                        AND (
+                            timestamp < ?
+                            OR (timestamp = ? AND id < ?)
+                        )
+                    ORDER BY
+                        timestamp DESC,
+                        id DESC
+                    LIMIT ?
+                    """,
+                    (target_ts, target_ts, msg_id, before_count),
+                )
+                before_rows = list(reversed(cursor.fetchall()))
+            elif before_count > 0:
+                cursor.execute(
+                    """
+                    SELECT id, timestamp, sender, message
+                    FROM messages
+                    WHERE id < ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (msg_id, before_count),
+                )
+                before_rows = list(reversed(cursor.fetchall()))
+            else:
+                before_rows = []
+
+            # Retrieve following messages (deterministic timestamp + id tie-breaker)
+            if has_timestamp and after_count > 0:
+                cursor.execute(
+                    """
+                    SELECT id, timestamp, sender, message
+                    FROM messages
+                    WHERE
+                        timestamp IS NOT NULL
+                        AND (
+                            timestamp > ?
+                            OR (timestamp = ? AND id > ?)
+                        )
+                    ORDER BY
+                        timestamp ASC,
+                        id ASC
+                    LIMIT ?
+                    """,
+                    (target_ts, target_ts, msg_id, after_count),
+                )
+                after_rows = list(cursor.fetchall())
+            elif after_count > 0:
+                cursor.execute(
+                    """
+                    SELECT id, timestamp, sender, message
+                    FROM messages
+                    WHERE id > ?
+                    ORDER BY id ASC
+                    LIMIT ?
+                    """,
+                    (msg_id, after_count),
+                )
+                after_rows = list(cursor.fetchall())
+            else:
+                after_rows = []
+
+            conn.close()
+
+            # Assemble chronological messages and remove duplicate IDs within unit
+            raw_combined = before_rows + [target_row] + after_rows
+            seen_unit_ids: Set[int] = set()
+            deduped_rows = []
+            for r in raw_combined:
+                rid = int(r["id"])
+                if rid not in seen_unit_ids:
+                    seen_unit_ids.add(rid)
+                    deduped_rows.append(r)
+
+            # Deterministic sorting rule: (timestamp ASC, id ASC)
+            deduped_rows.sort(
+                key=lambda r: (
+                    str(r["timestamp"] or ""),
+                    int(r["id"]),
+                )
+            )
+
+            # Format evidence unit content
+            context_lines = [_format_evidence_message_line(r) for r in deduped_rows]
+            anchor_text = doc.page_content.strip()
+
+            unit_page_content = (
+                "[RETRIEVED ANCHOR]\n"
+                f"{anchor_text}\n\n"
+                "[CHRONOLOGICAL CONTEXT]\n"
+                + "\n".join(context_lines)
+            )
+
+            # Build evidence unit metadata preserving anchor identity and citation provenance
+            unit_meta = copy.deepcopy(doc_meta)
+            unit_meta["context_expanded"] = True
+            unit_meta["context_method"] = "dialogue_unit"
+            unit_meta["evidence_unit_status"] = "expanded"
+            unit_meta["anchor_message_id"] = msg_id
+            unit_meta["anchor_sender"] = target_row["sender"] or ""
+            unit_meta["anchor_timestamp"] = target_row["timestamp"]
+            unit_meta["context_messages_before"] = len(before_rows)
+            unit_meta["context_messages_after"] = len(after_rows)
+            unit_meta["context_start_message_id"] = int(deduped_rows[0]["id"])
+            unit_meta["context_end_message_id"] = int(deduped_rows[-1]["id"])
+            unit_meta["included_message_ids"] = [int(r["id"]) for r in deduped_rows]
+
+            evidence_units.append(
+                Document(
+                    page_content=unit_page_content,
+                    metadata=unit_meta,
+                )
+            )
+
+        except Exception as e:
+            fallback_meta = copy.deepcopy(doc_meta)
+            fallback_meta["context_expanded"] = False
+            fallback_meta["context_method"] = "standalone_unexpanded"
+            fallback_meta["evidence_unit_status"] = "unexpanded_error"
+            fallback_meta["expansion_error"] = str(e)
+            fallback_meta["anchor_message_id"] = msg_id
+            fallback_meta["included_message_ids"] = [msg_id]
+            evidence_units.append(
+                Document(
+                    page_content=doc.page_content,
+                    metadata=fallback_meta,
+                )
+            )
+
+    return evidence_units
 
 
 # ============================================================

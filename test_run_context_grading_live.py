@@ -28,6 +28,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from langchain_core.documents import Document
 from langchain_core.messages import AIMessage
 
 import chat_database
@@ -54,6 +55,7 @@ from run_context_grading_live import (
     EXPERIMENTAL_GRADE_PROMPT_TEMPLATE,
     EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
     format_candidate_structure_aware,
+    format_candidate_dialogue_unit,
 )
 
 
@@ -1390,3 +1392,619 @@ def test_offline_study_invariants_across_cases():
         assert case_9.candidate_text in cand_9_fmt
         assert case_12.candidate_text == "Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving to cold storage."
         assert case_12.candidate_text in cand_12_fmt
+
+
+# ---------------------------------------------------------------------
+# Task 29: Isolated Structure-Prompt Experiment Tests
+# ---------------------------------------------------------------------
+
+def test_structure_prompt_experiment_mode_isolates_only_prompt_template_and_reuses_context():
+    """
+    Task 29 (Items 1, 2, 3, 4, 7): Verifies that structure_prompt_experiment mode:
+      1. Uses format_candidate_structure_aware for both conditions.
+      2. The ONLY experimental difference is the prompt template (Control vs Treatment).
+      3. Context lookup occurs strictly ONCE per case (12 total lookups).
+      4. Query, candidate text, IDs, chronology, and target markers are identical.
+      5. Shared budget enforces exactly 24 attempted calls (12 cases x 2 conditions).
+    """
+    mock_llm = DeterministicMockGraderLLM()
+    lookup_count = 0
+    orig_lookup = rag_graph.get_grading_preceding_context
+
+    def spy_lookup(*args, **kwargs):
+        nonlocal lookup_count
+        lookup_count += 1
+        return orig_lookup(*args, **kwargs)
+
+    with SafeContextGradingEnvironment() as env:
+        with patch("rag_graph.get_grading_preceding_context", side_effect=spy_lookup):
+            report = run_context_grading_suite(
+                grader_llm=mock_llm,
+                env=env,
+                cases=EVALUATION_CASES,
+                max_budget=24,
+                mode="structure_prompt_experiment",
+            )
+
+    assert report.is_complete is True
+    assert report.cases_evaluated == 12
+
+    # CRITICAL: Context lookup is performed strictly ONCE per candidate (12 times total, NOT 24)
+    assert lookup_count == 12, f"Expected exactly 12 context lookups, got {lookup_count}"
+
+    assert report.metrics_a.condition_name == "Control (Production Prompt + Structured Transcript)"
+    assert report.metrics_b.condition_name == "Treatment (Structure-Aware Prompt + Structured Transcript)"
+
+    # Shared call budget: exactly 24 calls attempted (12 cases x 2 conditions)
+    assert report.attempted_calls == 24
+    assert mock_llm.call_count == 24
+
+    # Verify per-case isolation and exact formatting identity across all 12 cases
+    for res_ctrl, res_treat in zip(report.condition_a_results, report.condition_b_results):
+        assert res_ctrl.case_id == res_treat.case_id
+        assert res_ctrl.candidate_id == res_treat.candidate_id
+        assert res_ctrl.candidate_text == res_treat.candidate_text
+        assert res_ctrl.query == res_treat.query
+        assert res_ctrl.expected_label == res_treat.expected_label
+        assert res_ctrl.has_preceding_context == res_treat.has_preceding_context
+
+        # Extract the candidates_text block from both prompts
+        # Candidates block starts after "Retrieved Candidates:\n" and ends before "\n\nEvaluation Guidelines:"
+        ctrl_cand_part = res_ctrl.prompt.split("Retrieved Candidates:\n")[1].split("\n\nEvaluation Guidelines:")[0]
+        treat_cand_part = res_treat.prompt.split("Retrieved Candidates:\n")[1].split("\n\nEvaluation Guidelines:")[0]
+
+        # Invariant: Formatted candidate text MUST BE 100% BYTE-FOR-BYTE IDENTICAL
+        assert ctrl_cand_part == treat_cand_part, (
+            f"Case {res_ctrl.case_id}: Formatted candidate text differs between Control and Treatment!\n"
+            f"Control:\n{ctrl_cand_part}\nTreatment:\n{treat_cand_part}"
+        )
+
+        # Invariant: The ONLY difference is the prompt template guidelines
+        # Control has production guidelines
+        assert "1. Evaluate each candidate individually." in res_ctrl.prompt
+        assert "3. Conversational chats are informal: short replies (e.g., 'yes', '9pm', 'sure')" in res_ctrl.prompt
+        assert "When a candidate is formatted as a Chronological Conversation Transcript" not in res_ctrl.prompt
+
+        # Treatment has structure-aware experimental prompt guidelines
+        assert "When a candidate is formatted as a Chronological Conversation Transcript with a marked target message" in res_treat.prompt
+        assert "Use the preceding turns to resolve references, antecedents, pronouns, entities, and confirmations in the marked target message." in res_treat.prompt
+        assert "Preceding turns are supporting context for interpreting the marked target message, NOT independent candidates to grade." in res_treat.prompt
+
+
+def test_structure_prompt_experiment_case_12_negative_control_exact_identity():
+    """
+    Task 29 (Item 5): Negative Control Verification for CASE-12 under structure_prompt_experiment.
+    Verifies that:
+      - CASE-12 has identical candidate formatting in both conditions.
+      - CASE-12 has zero transcript turns and no conversation transcript header.
+      - Fails explicitly if candidate formatting differs between Control and Treatment.
+    """
+    case_12 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-012-Ordinary-Length-Bypass")
+
+    with SafeContextGradingEnvironment() as env:
+        report = run_context_grading_suite(
+            grader_llm=DeterministicMockGraderLLM(),
+            env=env,
+            cases=[case_12],
+            max_budget=2,
+            mode="structure_prompt_experiment",
+        )
+
+    res_ctrl = report.condition_a_results[0]
+    res_treat = report.condition_b_results[0]
+
+    # Extract candidates_text
+    ctrl_cand = res_ctrl.prompt.split("Retrieved Candidates:\n")[1].split("\n\nEvaluation Guidelines:")[0]
+    treat_cand = res_treat.prompt.split("Retrieved Candidates:\n")[1].split("\n\nEvaluation Guidelines:")[0]
+
+    # Verify no transcript turns in candidate representation
+    assert "[Turn" not in ctrl_cand
+    assert "[Turn" not in treat_cand
+    assert "Chronological Conversation Transcript" not in ctrl_cand
+    assert "Chronological Conversation Transcript" not in treat_cand
+
+    # Must be 100% identical byte-for-byte
+    assert ctrl_cand == treat_cand
+
+    expected_single_msg = (
+        "[Candidate 1] (Single Message ID: 125 | TARGET MESSAGE TO EVALUATE)\n"
+        "[ID 125] [14/10/2026 10:15 AM] Dev_Compliance: Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving to cold storage."
+    )
+    assert ctrl_cand == expected_single_msg
+
+
+def test_structure_prompt_experiment_cli_dry_run_and_mode_dispatch(capsys):
+    """
+    Task 29 (Item 7): Verifies CLI --mode structure_prompt_experiment executes safely in dry-run mode
+    with 0 model calls and complete sandbox isolation.
+    """
+    with patch.object(sys, "argv", ["run_context_grading_live.py", "--mode", "structure_prompt_experiment"]):
+        with patch("langchain_ollama.ChatOllama") as mock_ollama:
+            exit_code = main()
+            assert exit_code == 0
+            mock_ollama.assert_not_called()
+
+    captured = capsys.readouterr().out
+    assert "Evaluation Mode:          structure_prompt_experiment" in captured
+    assert "Planned Inference Calls:  24 (12 cases x 2 conditions)" in captured
+    assert "DRY-RUN VERIFICATION SUCCESSFUL" in captured
+    assert "Zero live model calls or network endpoints were contacted." in captured
+
+
+def test_structure_prompt_experiment_mock_decisions_and_malformed_handling():
+    """
+    Task 29 (Item 6): Verifies mocked relevant, irrelevant, uncertain, and malformed
+    decision handling under control_structure_prompt and treatment_structure_prompt.
+    """
+    case_9 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-09-Multi-Message-Exchange")
+
+    with SafeContextGradingEnvironment() as env:
+        doc = build_candidate_document(case_9)
+        ctx = rag_graph.get_grading_preceding_context(doc, database_path=str(env.db_path))
+
+        # 1. Test Control with mocked relevant response
+        class MockCtrlRelevant:
+            def invoke(self, prompt, *args, **kwargs):
+                return AIMessage(content=json.dumps([{"candidate": 1, "decision": "relevant", "reason": "Control relevant"}]))
+
+        res_ctrl = evaluate_case_condition(
+            case=case_9,
+            condition="control_structure_prompt",
+            grader_llm=MockCtrlRelevant(),
+            database_path=str(env.db_path),
+            prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+            candidate_formatter=format_candidate_structure_aware,
+            preceding_context=ctx,
+        )
+        assert res_ctrl.parsed_decision == "relevant"
+        assert res_ctrl.status == "success"
+
+        # 2. Test Treatment with mocked uncertain response
+        class MockTreatUncertain:
+            def invoke(self, prompt, *args, **kwargs):
+                return AIMessage(content=json.dumps([{"candidate": 1, "decision": "uncertain", "reason": "Treatment uncertain"}]))
+
+        res_treat = evaluate_case_condition(
+            case=case_9,
+            condition="treatment_structure_prompt",
+            grader_llm=MockTreatUncertain(),
+            database_path=str(env.db_path),
+            prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+            candidate_formatter=format_candidate_structure_aware,
+            preceding_context=ctx,
+        )
+        assert res_treat.parsed_decision == "uncertain"
+        assert res_treat.status == "success"
+
+        # 3. Test Treatment with malformed output failing open safely
+        class MockMalformed:
+            def invoke(self, prompt, *args, **kwargs):
+                return AIMessage(content="[CORRUPT_NOT_JSON]")
+
+        res_malformed = evaluate_case_condition(
+            case=case_9,
+            condition="treatment_structure_prompt",
+            grader_llm=MockMalformed(),
+            database_path=str(env.db_path),
+            prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+            candidate_formatter=format_candidate_structure_aware,
+            preceding_context=ctx,
+        )
+        assert res_malformed.parsed_decision == "uncertain"
+        assert res_malformed.status == "failure"
+        assert res_malformed.reasoning == "parsing_fallback"
+
+
+def test_production_graph_and_defaults_remain_unchanged():
+    """
+    Task 29 (Item 8): Verifies that production graph defaults and behavior are completely unaltered:
+      - rag_graph.GRADE_PROMPT_TEMPLATE is unchanged.
+      - grade_candidate_batch default prompt_template is None (resolving to GRADE_PROMPT_TEMPLATE).
+      - grade_candidate_batch default candidate_formatter is None (resolving to format_candidate_for_grader).
+    """
+    # 1. GRADE_PROMPT_TEMPLATE verification
+    assert "Evaluation Guidelines:\n1. Evaluate each candidate individually." in rag_graph.GRADE_PROMPT_TEMPLATE
+    assert "3. Conversational chats are informal: short replies (e.g., 'yes', '9pm', 'sure')" in rag_graph.GRADE_PROMPT_TEMPLATE
+    assert "When a candidate is formatted as a Chronological Conversation Transcript" not in rag_graph.GRADE_PROMPT_TEMPLATE
+
+    # 2. Signature and default arguments of grade_candidate_batch
+    sig = inspect.signature(rag_graph.grade_candidate_batch)
+    assert sig.parameters["prompt_template"].default is None
+    assert sig.parameters["candidate_formatter"].default is None
+    assert sig.parameters["preceding_contexts"].default is None
+
+
+# ---------------------------------------------------------------------
+# Task 32: Isolated Dialogue-Unit Relevance Experiment Tests
+# ---------------------------------------------------------------------
+
+def test_format_candidate_dialogue_unit_cases_1_2_4():
+    """
+    Task 32 (Item 4): Verifies that format_candidate_dialogue_unit formats:
+      - CASE-01: the certificate-storage question and "In Vault 9." in the same ordered dialogue unit.
+      - CASE-02: the maintenance-window context and "9pm." preserved faithfully.
+      - CASE-04: the staging-deployment question and its short answer presented together.
+    """
+    with SafeContextGradingEnvironment() as env:
+        # 1. CASE-01: Terse location
+        c1 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-01-Terse-Location")
+        doc_1 = build_candidate_document(c1)
+        ctx_1 = rag_graph.get_grading_preceding_context(doc_1, database_path=str(env.db_path))
+
+        out_1 = format_candidate_dialogue_unit(1, doc_1, preceding_context=ctx_1)
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 102)" in out_1
+        assert "Dialogue Exchange:\n" in out_1
+        assert "[ID 101] [14/10/2026 09:10 AM] Dev_Alex: Where did we store the backup SSL certificate?" in out_1
+        assert "[Response to Evaluate] [ID 102] [14/10/2026 09:11 AM] Dev_Sam: In Vault 9." in out_1
+        # Chronological order: question appears before candidate answer
+        idx_q1 = out_1.index("Where did we store the backup SSL certificate?")
+        idx_a1 = out_1.index("[Response to Evaluate]")
+        assert idx_q1 < idx_a1
+
+        # 2. CASE-02: Short numerical / time
+        c2 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-02-Short-Time")
+        doc_2 = build_candidate_document(c2)
+        ctx_2 = rag_graph.get_grading_preceding_context(doc_2, database_path=str(env.db_path))
+
+        out_2 = format_candidate_dialogue_unit(1, doc_2, preceding_context=ctx_2)
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 104)" in out_2
+        assert "When are we kicking off the production deployment window tonight?" in out_2
+        assert "[Response to Evaluate] [ID 104] [14/10/2026 02:31 PM] Dev_Lead: 9pm." in out_2
+        idx_q2 = out_2.index("When are we kicking off the production deployment window tonight?")
+        idx_a2 = out_2.index("[Response to Evaluate]")
+        assert idx_q2 < idx_a2
+
+        # 3. CASE-04: Yes/no confirmation
+        c4 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-04-Yes-No-Confirmation")
+        doc_4 = build_candidate_document(c4)
+        ctx_4 = rag_graph.get_grading_preceding_context(doc_4, database_path=str(env.db_path))
+
+        out_4 = format_candidate_dialogue_unit(1, doc_4, preceding_context=ctx_4)
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 108)" in out_4
+        assert "Did the database migration script finish successfully on staging?" in out_4
+        assert "[Response to Evaluate] [ID 108] [14/10/2026 04:20 PM] Dev_Sarah: Yes, completely clean." in out_4
+        idx_q4 = out_4.index("Did the database migration script finish successfully on staging?")
+        idx_a4 = out_4.index("[Response to Evaluate]")
+        assert idx_q4 < idx_a4
+
+
+def test_format_candidate_dialogue_unit_case_05_and_case_08_unrelated_intact():
+    """
+    Task 32 (Item 4): Verifies that format_candidate_dialogue_unit does not mutate
+    or invent facts for unrelated candidates:
+      - CASE-05: unrelated message does not acquire facts from the keys context.
+      - CASE-08: unrelated deployment-failure/weather message remains intact.
+    """
+    with SafeContextGradingEnvironment() as env:
+        # 1. CASE-05 fixture: cafeteria keys context + kitchen counter candidate
+        c5 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-05-Misleading-Context")
+        doc_5 = build_candidate_document(c5)
+        ctx_5 = rag_graph.get_grading_preceding_context(doc_5, database_path=str(env.db_path))
+
+        out_5 = format_candidate_dialogue_unit(1, doc_5, preceding_context=ctx_5)
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 110)" in out_5
+        assert "Where did you leave the office cafeteria keys?" in out_5
+        assert "[Response to Evaluate] [ID 110] [14/10/2026 12:05 PM] Dev_Sam: On the kitchen counter." in out_5
+
+        # 2. CASE-05 variation: library meeting message with keys context
+        doc_lib = Document(
+            page_content="[ID 502] [2026-10-14T17:00:00] Dev_Friend: Let's meet at the library at 5pm.",
+            metadata={"source": "hybrid_search", "message_id": 502, "sender": "Dev_Friend"},
+        )
+        out_lib = format_candidate_dialogue_unit(1, doc_lib, preceding_context=ctx_5)
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 502)" in out_lib
+        assert "Where did you leave the office cafeteria keys?" in out_lib
+        assert "[Response to Evaluate] [ID 502] [14/10/2026 05:00 PM] Dev_Friend: Let's meet at the library at 5pm." in out_lib
+        # Assert the candidate part itself does not acquire facts about keys
+        cand_part = out_lib.split("[Response to Evaluate]")[1]
+        assert "keys" not in cand_part.lower()
+        assert "cafeteria" not in cand_part.lower()
+
+        # 3. CASE-08: firewall question context + weather candidate
+        c8 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-08-Unrelated-Candidate-Matching-Context")
+        doc_8 = build_candidate_document(c8)
+        # Bypassed lookup (length > 6 words) -> None
+        ctx_8_bypassed = rag_graph.get_grading_preceding_context(doc_8, database_path=str(env.db_path))
+        assert ctx_8_bypassed is None
+
+        # Standalone formatting when bypassed
+        out_8_bypassed = format_candidate_dialogue_unit(1, doc_8, preceding_context=ctx_8_bypassed)
+        assert "[Candidate 1] (Standalone Message ID: 116)" in out_8_bypassed
+        assert "Dev_Dana: I think the weather is going to be stormy this evening." in out_8_bypassed
+
+        # When preceding context is provided (e.g. from fixture preceding_messages)
+        raw_ctx_8 = "[ID 115] [2026-10-14T17:04:00] Dev_Security: Who approved the firewall port change yesterday?"
+        out_8 = format_candidate_dialogue_unit(1, doc_8, preceding_context=raw_ctx_8)
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 116)" in out_8
+        assert "Who approved the firewall port change yesterday?" in out_8
+        assert "[Response to Evaluate] [ID 116] [14/10/2026 05:05 PM] Dev_Dana: I think the weather is going to be stormy this evening." in out_8
+
+        # 4. CASE-08 variation: deployment-failure message
+        doc_fail = Document(
+            page_content="[ID 802] [2026-10-14T17:05:00] Dev_CI: The deployment pipeline failed again.",
+            metadata={"source": "hybrid_search", "message_id": 802, "sender": "Dev_CI"},
+        )
+        out_fail = format_candidate_dialogue_unit(1, doc_fail, preceding_context=raw_ctx_8)
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 802)" in out_fail
+        assert "[Response to Evaluate] [ID 802] [14/10/2026 05:05 PM] Dev_CI: The deployment pipeline failed again." in out_fail
+        cand_fail_part = out_fail.split("[Response to Evaluate]")[1]
+        assert "firewall" not in cand_fail_part.lower()
+
+
+def test_format_candidate_dialogue_unit_case_09_multi_turn_chronology():
+    """
+    Task 32 (Item 4): Verifies that format_candidate_dialogue_unit includes all necessary
+    preceding turns and the target message in chronological order for multi-turn exchanges (CASE-09).
+    """
+    with SafeContextGradingEnvironment() as env:
+        c9 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-09-Multi-Message-Exchange")
+        doc_9 = build_candidate_document(c9)
+        ctx_9 = rag_graph.get_grading_preceding_context(doc_9, database_path=str(env.db_path))
+
+        out_9 = format_candidate_dialogue_unit(1, doc_9, preceding_context=ctx_9)
+
+        # Header asserts dialogue unit with target response ID
+        assert "[Candidate 1] (Dialogue Unit | Response Message ID: 119)" in out_9
+        assert "Dialogue Exchange:\n" in out_9
+
+        # Both preceding messages must be present
+        assert "[ID 117] [14/10/2026 01:40 PM] Dev_Monitor: Rack C4 power sensor is throwing warnings." in out_9
+        assert "[ID 118] [14/10/2026 01:41 PM] Dev_Ops: Can anyone confirm on site?" in out_9
+
+        # Target message must be present as the evaluated response
+        assert "[Response to Evaluate] [ID 119] [14/10/2026 01:42 PM] Dev_Facilities: Confirmed, heavy voltage drops." in out_9
+
+        # Strictly chronological order: Turn 1 < Turn 2 < Response to Evaluate
+        pos_turn1 = out_9.index("Rack C4 power sensor is throwing warnings.")
+        pos_turn2 = out_9.index("Can anyone confirm on site?")
+        pos_cand = out_9.index("[Response to Evaluate]")
+
+        assert pos_turn1 < pos_turn2 < pos_cand, "Dialogue turns are not in strict chronological order!"
+
+
+def test_format_candidate_dialogue_unit_case_12_no_context_fallback():
+    """
+    Task 32 (Item 4): Verifies that format_candidate_dialogue_unit safely falls back
+    to a clearly labelled standalone candidate when context is unavailable (CASE-12),
+    without fabricating conversation turns.
+    """
+    case_12 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-012-Ordinary-Length-Bypass")
+    doc_12 = build_candidate_document(case_12)
+
+    # 1. With None preceding context
+    out_none = format_candidate_dialogue_unit(1, doc_12, preceding_context=None)
+    assert "[Candidate 1] (Standalone Message ID: 125)" in out_none
+    assert "[ID 125] [14/10/2026 10:15 AM] Dev_Compliance: Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving to cold storage." in out_none
+    assert "Dialogue Exchange:" not in out_none
+    assert "[Response to Evaluate]" not in out_none
+    assert "[Turn" not in out_none
+
+    # 2. With empty / whitespace preceding context
+    out_empty = format_candidate_dialogue_unit(1, doc_12, preceding_context="   \n  \t  ")
+    assert "[Candidate 1] (Standalone Message ID: 125)" in out_empty
+    assert "Dialogue Exchange:" not in out_empty
+    assert "[Response to Evaluate]" not in out_empty
+
+    # 3. Verify exact output equality between None and whitespace
+    assert out_none == out_empty
+
+
+def test_format_candidate_dialogue_unit_multiline_fidelity_and_edge_cases():
+    """
+    Task 32 (Item 4): Verifies multiline message bodies, blank lines, indentation,
+    sender labels, IDs, punctuation, and malformed inputs are preserved faithfully.
+    """
+    # 1. Multiline preceding context with indentation and trailing spaces
+    multiline_ctx = (
+        "[ID 201] [2026-10-14T09:00:00] Dev_Alice: Config details:\n"
+        "  port: 8080\n"
+        "  host: localhost\n\n"
+        "[ID 202] [2026-10-14T09:01:00] Dev_Bob: Verified config."
+    )
+    # Multiline candidate with code block and punctuation
+    cand_doc = Document(
+        page_content="[ID 203] [2026-10-14T09:02:00] Dev_Charlie: Looks good!\n```bash\ncurl http://localhost:8080\n```",
+        metadata={"source": "hybrid_search", "message_id": 203, "sender": "Dev_Charlie"},
+    )
+
+    formatted = format_candidate_dialogue_unit(1, cand_doc, preceding_context=multiline_ctx)
+    assert "[Candidate 1] (Dialogue Unit | Response Message ID: 203)" in formatted
+    assert "Dialogue Exchange:\n" in formatted
+    assert "  port: 8080\n  host: localhost" in formatted
+    assert "[Response to Evaluate] [ID 203] [14/10/2026 09:02 AM] Dev_Charlie: Looks good!\n```bash\ncurl http://localhost:8080\n```" in formatted
+
+    # 2. Conversation chunk candidate source
+    chunk_doc = Document(
+        page_content="[ID 301] [2026-10-14T10:00:00] Dev_Lead: Team discussion on database indexes.",
+        metadata={"source": "conversation_chunk", "chunk_id": "chunk_99"},
+    )
+    formatted_chunk = format_candidate_dialogue_unit(2, chunk_doc, preceding_context=None)
+    assert "[Candidate 2] (Standalone Conversation Chunk ID: chunk_99)" in formatted_chunk
+
+    # 3. Missing metadata fallback
+    no_meta_doc = Document(
+        page_content="Simple text message without metadata.",
+        metadata={},
+    )
+    formatted_no_meta = format_candidate_dialogue_unit(3, no_meta_doc, preceding_context=None)
+    assert "[Candidate 3] (Standalone Candidate | Source: unknown)" in formatted_no_meta
+    assert "Simple text message without metadata." in formatted_no_meta
+
+    # 4. Malformed preceding context without standard header
+    malformed_ctx = "Raw unformatted log line without message ID"
+    formatted_malformed = format_candidate_dialogue_unit(4, cand_doc, preceding_context=malformed_ctx)
+    assert "[Candidate 4] (Dialogue Unit | Response Message ID: 203)" in formatted_malformed
+    assert "Raw unformatted log line without message ID" in formatted_malformed
+
+
+def test_dialogue_unit_experiment_mode_isolates_only_candidate_representation_and_reuses_context():
+    """
+    Task 32 (Items 3, 4): Verifies that dialogue_unit_experiment mode:
+      1. Uses format_candidate_for_grader (Control) vs format_candidate_dialogue_unit (Treatment).
+      2. Both conditions use the EXACT SAME production GRADE_PROMPT_TEMPLATE.
+      3. Context lookup occurs strictly ONCE per case (12 total lookups).
+      4. Query, candidate identity, model settings, parser, and decision policy are identical.
+      5. Shared call budget enforces exactly 24 attempted calls (12 cases x 2 conditions).
+    """
+    mock_llm = DeterministicMockGraderLLM()
+    lookup_count = 0
+    orig_lookup = rag_graph.get_grading_preceding_context
+
+    def spy_lookup(*args, **kwargs):
+        nonlocal lookup_count
+        lookup_count += 1
+        return orig_lookup(*args, **kwargs)
+
+    with SafeContextGradingEnvironment() as env:
+        with patch("rag_graph.get_grading_preceding_context", side_effect=spy_lookup):
+            report = run_context_grading_suite(
+                grader_llm=mock_llm,
+                env=env,
+                cases=EVALUATION_CASES,
+                max_budget=24,
+                mode="dialogue_unit_experiment",
+            )
+
+    assert report.is_complete is True
+    assert report.cases_evaluated == 12
+
+    # Context lookup is performed strictly ONCE per candidate (12 times total, NOT 24)
+    assert lookup_count == 12, f"Expected exactly 12 context lookups, got {lookup_count}"
+
+    assert report.metrics_a.condition_name == "Control (Standard Formatter + Production Prompt)"
+    assert report.metrics_b.condition_name == "Treatment (Dialogue-Unit Formatter + Production Prompt)"
+
+    # Shared call budget: exactly 24 calls attempted (12 cases x 2 conditions)
+    assert report.attempted_calls == 24
+    assert mock_llm.call_count == 24
+
+    # Verify per-case isolation and exact prompt template identity across all 12 cases
+    for res_ctrl, res_treat in zip(report.condition_a_results, report.condition_b_results):
+        assert res_ctrl.case_id == res_treat.case_id
+        assert res_ctrl.candidate_id == res_treat.candidate_id
+        assert res_ctrl.candidate_text == res_treat.candidate_text
+        assert res_ctrl.query == res_treat.query
+        assert res_ctrl.expected_label == res_treat.expected_label
+        assert res_ctrl.has_preceding_context == res_treat.has_preceding_context
+
+        # Invariant: Prompt guidelines in Control and Treatment MUST BE 100% BYTE-FOR-BYTE IDENTICAL
+        # Both use production GRADE_PROMPT_TEMPLATE
+        ctrl_guidelines = res_ctrl.prompt.split("Evaluation Guidelines:")[1]
+        treat_guidelines = res_treat.prompt.split("Evaluation Guidelines:")[1]
+        assert ctrl_guidelines == treat_guidelines, (
+            f"Case {res_ctrl.case_id}: Evaluation guidelines differ between Control and Treatment!"
+        )
+
+        assert "1. Evaluate each candidate individually." in res_ctrl.prompt
+        assert "1. Evaluate each candidate individually." in res_treat.prompt
+        assert "When a candidate is formatted as a Chronological Conversation Transcript" not in res_treat.prompt
+
+        # The candidate representation differs between Control and Treatment for cases with context
+        ctrl_cand = res_ctrl.prompt.split("Retrieved Candidates:\n")[1].split("\n\nEvaluation Guidelines:")[0]
+        treat_cand = res_treat.prompt.split("Retrieved Candidates:\n")[1].split("\n\nEvaluation Guidelines:")[0]
+
+        if res_ctrl.has_preceding_context:
+            assert "Preceding Conversational Context:" in ctrl_cand
+            assert "Candidate Message to Evaluate:" in ctrl_cand
+            assert "Dialogue Exchange:" in treat_cand
+            assert "[Response to Evaluate]" in treat_cand
+        else:
+            # For cases without context (CASE-12), both format as standalone
+            assert "[Response to Evaluate]" not in treat_cand
+            assert "Dialogue Exchange:" not in treat_cand
+
+
+def test_dialogue_unit_experiment_cli_dry_run_and_mode_dispatch(capsys):
+    """
+    Task 32 (Item 4): Verifies CLI --mode dialogue_unit_experiment executes safely in dry-run mode
+    with 0 model calls and complete sandbox isolation.
+    """
+    with patch.object(sys, "argv", ["run_context_grading_live.py", "--mode", "dialogue_unit_experiment"]):
+        with patch("langchain_ollama.ChatOllama") as mock_ollama:
+            exit_code = main()
+            assert exit_code == 0
+            mock_ollama.assert_not_called()
+
+    captured = capsys.readouterr().out
+    assert "Evaluation Mode:          dialogue_unit_experiment" in captured
+    assert "Planned Inference Calls:  24 (12 cases x 2 conditions)" in captured
+    assert "DRY-RUN VERIFICATION SUCCESSFUL" in captured
+    assert "Zero live model calls or network endpoints were contacted." in captured
+
+
+def test_dialogue_unit_experiment_mock_decisions_and_malformed_handling():
+    """
+    Task 32 (Item 4): Verifies mocked relevant, irrelevant, uncertain, and malformed
+    decision handling under control_dialogue_unit and treatment_dialogue_unit.
+    """
+    case_1 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-01-Terse-Location")
+
+    with SafeContextGradingEnvironment() as env:
+        doc = build_candidate_document(case_1)
+        ctx = rag_graph.get_grading_preceding_context(doc, database_path=str(env.db_path))
+
+        # 1. Test Control with mocked relevant response
+        class MockCtrlRelevant:
+            def invoke(self, prompt, *args, **kwargs):
+                return AIMessage(content=json.dumps([{"candidate": 1, "decision": "relevant", "reason": "Control relevant"}]))
+
+        res_ctrl = evaluate_case_condition(
+            case=case_1,
+            condition="control_dialogue_unit",
+            grader_llm=MockCtrlRelevant(),
+            database_path=str(env.db_path),
+            prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+            candidate_formatter=rag_graph.format_candidate_for_grader,
+            preceding_context=ctx,
+        )
+        assert res_ctrl.parsed_decision == "relevant"
+        assert res_ctrl.status == "success"
+
+        # 2. Test Treatment with mocked relevant response
+        class MockTreatRelevant:
+            def invoke(self, prompt, *args, **kwargs):
+                return AIMessage(content=json.dumps([{"candidate": 1, "decision": "relevant", "reason": "Treatment relevant"}]))
+
+        res_treat = evaluate_case_condition(
+            case=case_1,
+            condition="treatment_dialogue_unit",
+            grader_llm=MockTreatRelevant(),
+            database_path=str(env.db_path),
+            prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+            candidate_formatter=format_candidate_dialogue_unit,
+            preceding_context=ctx,
+        )
+        assert res_treat.parsed_decision == "relevant"
+        assert res_treat.status == "success"
+
+        # 3. Test Treatment with malformed output failing open safely
+        class MockMalformed:
+            def invoke(self, prompt, *args, **kwargs):
+                return AIMessage(content="[NOT_VALID_JSON]")
+
+        res_malformed = evaluate_case_condition(
+            case=case_1,
+            condition="treatment_dialogue_unit",
+            grader_llm=MockMalformed(),
+            database_path=str(env.db_path),
+            prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+            candidate_formatter=format_candidate_dialogue_unit,
+            preceding_context=ctx,
+        )
+        assert res_malformed.parsed_decision == "uncertain"
+        assert res_malformed.status == "failure"
+        assert res_malformed.reasoning == "parsing_fallback"
+
+
+def test_dialogue_unit_experiment_flags_case_07_for_separate_adjudication():
+    """
+    Task 32 (Item 4): Confirms that CASE-07 ground-truth label remains strictly 'irrelevant'
+    as defined in EVALUATION_CASES, and is flagged for separate relevance-label adjudication
+    rather than being silently modified.
+    """
+    case_7 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-07-Self-Contained-Irrelevant")
+    assert case_7.expected_label == "irrelevant"
+    assert case_7.category == "Self-Contained Negative"
+    # Confirmation: Expected label in fixture has NOT been modified
+    assert case_7.expected_standalone == "irrelevant"
+    assert case_7.expected_context_aware == "irrelevant"

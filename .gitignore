@@ -2,6 +2,9 @@
 *.db
 *.sqlite
 *.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
 chat_data.db
 eval_sandbox.db
 tech_ops_chat.db
@@ -16,12 +19,23 @@ sample_chat.txt
 tech_ops_chat.txt
 *.log
 
-# Python cache & build outputs
+# Evaluation outputs & scratch files
+eval_output/
+eval_results/
+evaluation_reports/
+scratch/
+*.jsonl
+
+# Python cache, tests & build outputs
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 build/
 dist/
 *.egg-info/
