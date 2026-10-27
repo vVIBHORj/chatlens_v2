@@ -83,6 +83,39 @@ EXPERIMENTAL_GRADE_PROMPT_TEMPLATE = (
 )
 
 
+# ---------------------------------------------------------------------
+# Isolated Experimental Structure-Aware Prompt Variant (Offline Study)
+# ---------------------------------------------------------------------
+
+EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE = (
+    "You are a conservative relevance grader for a WhatsApp chat archive retrieval system.\n"
+    "Assess whether each retrieved candidate contains information relevant to answering the user's question, "
+    "or could plausibly serve as helpful conversational context.\n\n"
+    "User Question:\n"
+    "{question}\n\n"
+    "Retrieved Candidates:\n"
+    "{candidates_text}\n\n"
+    "Evaluation Guidelines:\n"
+    "1. Evaluate each candidate individually.\n"
+    "2. Candidates may be single messages, conversation transcript chunks, or chronological conversation transcripts with a marked target message.\n"
+    "3. When a candidate is formatted as a Chronological Conversation Transcript with a marked target message (e.g., '[Turn N (TARGET MESSAGE TO EVALUATE)]'):\n"
+    "   - Use the preceding turns to resolve references, antecedents, pronouns, entities, and confirmations in the marked target message.\n"
+    "   - The target message is relevant if the preceding dialogue establishes its meaning and the target message helps answer or resolve the user question.\n"
+    "4. Preceding turns are supporting context for interpreting the marked target message, NOT independent candidates to grade. An unrelated or off-topic target message does not become relevant merely because preceding turns discuss the user question.\n"
+    "5. Conversational chats are informal: terse replies, brief confirmations, numerical answers, typos, emojis, slang, and indirect statements may be relevant context.\n"
+    "6. Do NOT reject a candidate solely because of zero lexical keyword overlap, short length, or emojis.\n"
+    "7. If a candidate is clearly and unambiguously about a completely unrelated topic, mark 'irrelevant'.\n"
+    "8. If a candidate is helpful or directly answers the question (either on its own or through reference resolution with preceding turns), mark 'relevant'.\n"
+    "9. If you are uncertain or the context is ambiguous, mark 'uncertain'.\n"
+    "10. Do not invent probabilities or numeric scores.\n\n"
+    "Output MUST be a valid JSON array of objects with keys:\n"
+    '- "candidate": integer candidate number (1, 2, ...)\n'
+    '- "decision": exactly "relevant", "irrelevant", or "uncertain"\n'
+    '- "reason": brief explanation (1 sentence)\n\n'
+    "JSON Response:\n"
+)
+
+
 DEFAULT_MODEL = "qwen2.5:3b"
 DEFAULT_MAX_CALLS = 24
 DEFAULT_TIMEOUT_SECONDS = 30.0

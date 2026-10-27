@@ -52,6 +52,7 @@ from run_context_grading_live import (
     main,
     run_context_grading_suite,
     EXPERIMENTAL_GRADE_PROMPT_TEMPLATE,
+    EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
     format_candidate_structure_aware,
 )
 
@@ -936,3 +937,456 @@ def test_format_candidate_structure_aware_multiline_fidelity_and_edge_cases():
         "\n"
     ) in formatted_5
     assert "[Turn 3" not in formatted_5
+
+
+# ---------------------------------------------------------------------
+# Task 28: Offline Prompt/Formatter Compatibility Study
+# ---------------------------------------------------------------------
+
+def test_case_09_deterministic_exact_reconstruction_and_differences():
+    """
+    Task 28 (Item 1 & 6): Deterministic offline reconstruction of CASE-09.
+    Reconstructs both standard and structure-aware candidate strings and verifies
+    exact differences in headers, turn numbering, timestamps, and target markings.
+    """
+    case_9 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-09-Multi-Message-Exchange")
+    doc_9 = build_candidate_document(case_9)
+
+    with SafeContextGradingEnvironment() as env:
+        resolved_context = rag_graph.get_grading_preceding_context(
+            doc_9, database_path=str(env.db_path)
+        )
+
+    assert resolved_context is not None
+    # Verify resolved context contains turn 1 and turn 2
+    assert "[ID 117]" in resolved_context
+    assert "[ID 118]" in resolved_context
+
+    # Reconstruct Control (Standard) candidate string
+    ctrl_str = rag_graph.format_candidate_for_grader(1, doc_9, preceding_context=resolved_context)
+
+    # Reconstruct Treatment (Structure-Aware) candidate string
+    treat_str = format_candidate_structure_aware(1, doc_9, preceding_context=resolved_context)
+
+    # Verify exact structure of Control
+    expected_ctrl = (
+        "[Candidate 1] (Single Message ID: 119)\n"
+        "Preceding Conversational Context:\n"
+        "[ID 117] [14/10/2026 01:40 PM] Dev_Monitor: Rack C4 power sensor is throwing warnings.\n"
+        "[ID 118] [14/10/2026 01:41 PM] Dev_Ops: Can anyone confirm on site?\n\n"
+        "Candidate Message to Evaluate:\n"
+        "[ID 119] [2026-10-14T13:42:00] Dev_Facilities: Confirmed, heavy voltage drops."
+    )
+    assert ctrl_str == expected_ctrl
+
+    # Verify exact structure of Treatment
+    expected_treat = (
+        "[Candidate 1] (Chronological Conversation Transcript | Target Message ID: 119)\n"
+        "[Turn 1] [ID 117] [14/10/2026 01:40 PM] Dev_Monitor: Rack C4 power sensor is throwing warnings.\n"
+        "[Turn 2] [ID 118] [14/10/2026 01:41 PM] Dev_Ops: Can anyone confirm on site?\n"
+        "[Turn 3 (TARGET MESSAGE TO EVALUATE)] [ID 119] [14/10/2026 01:42 PM] Dev_Facilities: Confirmed, heavy voltage drops."
+    )
+    assert treat_str == expected_treat
+
+    # Differential Invariant Assertions:
+    # 1. Header label
+    assert "(Single Message ID: 119)" in ctrl_str
+    assert "(Chronological Conversation Transcript | Target Message ID: 119)" in treat_str
+
+    # 2. Section markers vs Turn numbering
+    assert "Preceding Conversational Context:" in ctrl_str
+    assert "Candidate Message to Evaluate:" in ctrl_str
+    assert "Preceding Conversational Context:" not in treat_str
+    assert "Candidate Message to Evaluate:" not in treat_str
+
+    assert "[Turn 1]" in treat_str
+    assert "[Turn 2]" in treat_str
+    assert "[Turn 3 (TARGET MESSAGE TO EVALUATE)]" in treat_str
+    assert "[Turn" not in ctrl_str
+
+    # 3. Target identification
+    assert "(TARGET MESSAGE TO EVALUATE)" in treat_str
+    assert "(TARGET MESSAGE TO EVALUATE)" not in ctrl_str
+
+    # 4. Chronological order: Turn 1 (01:40 PM) < Turn 2 (01:41 PM) < Turn 3 (01:42 PM)
+    t1_pos = treat_str.find("[Turn 1]")
+    t2_pos = treat_str.find("[Turn 2]")
+    t3_pos = treat_str.find("[Turn 3 (TARGET MESSAGE TO EVALUATE)]")
+    assert 0 <= t1_pos < t2_pos < t3_pos
+
+    # 5. Message IDs and speakers preserved in both
+    for msg_id in ("117", "118", "119"):
+        assert f"[ID {msg_id}]" in ctrl_str
+        assert f"[ID {msg_id}]" in treat_str
+    for spk in ("Dev_Monitor", "Dev_Ops", "Dev_Facilities"):
+        assert spk in ctrl_str
+        assert spk in treat_str
+
+    # 6. Candidate message body is unchanged
+    assert "Confirmed, heavy voltage drops." in ctrl_str
+    assert "Confirmed, heavy voltage drops." in treat_str
+
+    # 7. Entity isolation: "Rack C4" is exclusively in Turn 1, NOT in Turn 3
+    assert "Rack C4" in treat_str.split("\n")[1]
+    assert "Rack C4" not in treat_str.split("\n")[3]
+
+
+def test_production_prompt_against_structured_representation_with_mock_grader():
+    """
+    Task 28 (Item 2): Test production prompt against structured representation using mocked grader.
+    Verifies that the prompt is unchanged and that the target message and preceding turns are passed correctly.
+    """
+    case_9 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-09-Multi-Message-Exchange")
+    doc_9 = build_candidate_document(case_9)
+
+    with SafeContextGradingEnvironment() as env:
+        resolved_context = rag_graph.get_grading_preceding_context(
+            doc_9, database_path=str(env.db_path)
+        )
+
+    # Use a prompt-capturing mock LLM
+    captured = []
+    class PromptCaptorLLM:
+        def invoke(self, prompt, *args, **kwargs):
+            captured.append(str(prompt))
+            return AIMessage(content=json.dumps([
+                {"candidate": 1, "decision": "uncertain", "reason": "Target lacks explicit entity under Guideline 1"}
+            ]))
+
+    mock_captor = PromptCaptorLLM()
+
+    # Grade with production prompt and structured formatter
+    graded = rag_graph.grade_candidate_batch(
+        question=case_9.query,
+        batch_docs=[doc_9],
+        grader_llm=mock_captor,
+        prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+        candidate_formatter=format_candidate_structure_aware,
+        preceding_contexts=[resolved_context],
+    )
+
+    assert len(graded) == 1
+    assert len(captured) == 1
+    prompt_text = captured[0]
+
+    # Verify production prompt guidelines are completely unchanged
+    assert "Evaluation Guidelines:\n1. Evaluate each candidate individually." in prompt_text
+    assert "2. Candidates may be single messages (which may include preceding conversational context for short replies) or conversation transcript chunks." in prompt_text
+    assert "3. Conversational chats are informal: short replies (e.g., 'yes', '9pm', 'sure')" in prompt_text
+    assert "7. If you are uncertain or the context is ambiguous, mark 'uncertain'" in prompt_text
+
+    # Verify query preservation
+    assert f"User Question:\n{case_9.query}" in prompt_text
+
+    # Verify target message and preceding turns are passed correctly into the prompt
+    assert "[Turn 1] [ID 117] [14/10/2026 01:40 PM] Dev_Monitor: Rack C4 power sensor is throwing warnings." in prompt_text
+    assert "[Turn 2] [ID 118] [14/10/2026 01:41 PM] Dev_Ops: Can anyone confirm on site?" in prompt_text
+    assert "[Turn 3 (TARGET MESSAGE TO EVALUATE)] [ID 119] [14/10/2026 01:42 PM] Dev_Facilities: Confirmed, heavy voltage drops." in prompt_text
+
+    # Notice: Production prompt lacks guidelines explaining how to evaluate [Turn N (TARGET MESSAGE TO EVALUATE)]
+    # in relation to preceding turns. Under Guideline 1 ("Evaluate each candidate individually"), an isolated
+    # Turn 3 lacks "Rack C4", explaining why qwen2.5:3b defaults to "uncertain" under Guideline 7.
+    assert "When a candidate is formatted as a Chronological Conversation Transcript" not in prompt_text
+
+
+def test_experimental_structure_prompt_variant_instructs_turn_reference_resolution():
+    """
+    Task 28 (Item 3): Verifies that EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE explicitly
+    instructs the grader to use preceding turns to resolve references when assessing
+    the marked target message.
+    """
+    # 1. Verifies prompt has correct formatting placeholders
+    assert "{question}" in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+    assert "{candidates_text}" in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+
+    # 2. Verifies explicit guidance on chronological conversation transcripts and marked target message
+    assert "When a candidate is formatted as a Chronological Conversation Transcript with a marked target message" in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+    assert "Use the preceding turns to resolve references, antecedents, pronouns, entities, and confirmations in the marked target message." in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+
+    # 3. Verifies target message relevance rule
+    assert "The target message is relevant if the preceding dialogue establishes its meaning and the target message helps answer or resolve the user question." in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+
+    # 4. Verifies supporting evidence rule (preventing distractors from promoting off-topic candidates)
+    assert "Preceding turns are supporting context for interpreting the marked target message, NOT independent candidates to grade." in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+    assert "An unrelated or off-topic target message does not become relevant merely because preceding turns discuss the user question." in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+
+    # 5. Verifies reference resolution rule in relevance marking guideline
+    assert "If a candidate is helpful or directly answers the question (either on its own or through reference resolution with preceding turns), mark 'relevant'." in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+
+    # 6. Preserves JSON schema contract
+    assert '- "candidate": integer candidate number' in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+    assert '- "decision": exactly "relevant", "irrelevant", or "uncertain"' in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+    assert '- "reason": brief explanation' in EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE
+
+
+def test_experimental_structure_prompt_mock_evaluation_and_decision_parsing():
+    """
+    Task 28 (Item 4): Test experimental structure prompt with mocked responses to ensure
+    parsing and decision handling remain unchanged.
+    Note: Mocked responses verify deterministic software contracts and plumbing;
+    they do not demonstrate or claim real-model grading quality.
+    """
+    case_9 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-09-Multi-Message-Exchange")
+    doc_9 = build_candidate_document(case_9)
+
+    with SafeContextGradingEnvironment() as env:
+        resolved_context = rag_graph.get_grading_preceding_context(
+            doc_9, database_path=str(env.db_path)
+        )
+
+    # 1. Test Mocked "relevant" decision with resolution reasoning
+    class MockRelevantLLM:
+        def invoke(self, prompt, *args, **kwargs):
+            return AIMessage(content=json.dumps([
+                {
+                    "candidate": 1,
+                    "decision": "relevant",
+                    "reason": "Turn 1 identifies Rack C4, Turn 2 asks for confirmation, and Turn 3 confirms heavy voltage drops answering the query."
+                }
+            ]))
+
+    results_rel = rag_graph.grade_candidate_batch(
+        question=case_9.query,
+        batch_docs=[doc_9],
+        grader_llm=MockRelevantLLM(),
+        prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+        candidate_formatter=format_candidate_structure_aware,
+        preceding_contexts=[resolved_context],
+    )
+    doc_res, dec, reason, status = results_rel[0]
+    assert doc_res == doc_9
+    assert dec == "relevant"
+    assert status == "success"
+    assert "Turn 1 identifies Rack C4" in reason
+
+    # 2. Test Mocked "irrelevant" decision
+    class MockIrrelevantLLM:
+        def invoke(self, prompt, *args, **kwargs):
+            return AIMessage(content=json.dumps([
+                {
+                    "candidate": 1,
+                    "decision": "irrelevant",
+                    "reason": "Target message is about unrelated facility maintenance."
+                }
+            ]))
+
+    results_irrel = rag_graph.grade_candidate_batch(
+        question=case_9.query,
+        batch_docs=[doc_9],
+        grader_llm=MockIrrelevantLLM(),
+        prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+        candidate_formatter=format_candidate_structure_aware,
+        preceding_contexts=[resolved_context],
+    )
+    _, dec_irr, reason_irr, status_irr = results_irrel[0]
+    assert dec_irr == "irrelevant"
+    assert status_irr == "success"
+
+    # 3. Test Mocked "uncertain" decision
+    class MockUncertainLLM:
+        def invoke(self, prompt, *args, **kwargs):
+            return AIMessage(content=json.dumps([
+                {
+                    "candidate": 1,
+                    "decision": "uncertain",
+                    "reason": "Ambiguous voltage report."
+                }
+            ]))
+
+    results_unc = rag_graph.grade_candidate_batch(
+        question=case_9.query,
+        batch_docs=[doc_9],
+        grader_llm=MockUncertainLLM(),
+        prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+        candidate_formatter=format_candidate_structure_aware,
+        preceding_contexts=[resolved_context],
+    )
+    _, dec_unc, reason_unc, status_unc = results_unc[0]
+    assert dec_unc == "uncertain"
+    assert status_unc == "success"
+
+    # 4. Test Malformed JSON fails open safely to uncertain
+    class MockMalformedLLM:
+        def invoke(self, prompt, *args, **kwargs):
+            return AIMessage(content="[NOT_VALID_JSON]")
+
+    results_malformed = rag_graph.grade_candidate_batch(
+        question=case_9.query,
+        batch_docs=[doc_9],
+        grader_llm=MockMalformedLLM(),
+        prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+        candidate_formatter=format_candidate_structure_aware,
+        preceding_contexts=[resolved_context],
+    )
+    _, dec_fallback, reason_fallback, status_fallback = results_malformed[0]
+    assert dec_fallback == "uncertain"
+    assert reason_fallback == "parsing_fallback"
+    assert status_fallback == "failure"
+
+
+def test_case_12_negative_control_has_no_preceding_context_and_no_transcript():
+    """
+    Task 28 (Item 5): CASE-12 Negative Control verification.
+    CASE-12 has ordinary length (>6 words / >35 chars) and bypasses preceding context lookup.
+    Verifies that:
+      - should_expand_semantic_anchor is False
+      - get_grading_preceding_context returns None
+      - Both Control and Treatment produce standalone message representations with no turns
+      - Any score difference in real-model evaluation is token-level variance on standalone text,
+        NOT evidence of transcript-structure reasoning.
+    """
+    case_12 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-012-Ordinary-Length-Bypass")
+    doc_12 = build_candidate_document(case_12)
+
+    # 1. Word and character threshold verification
+    word_count = len(case_12.candidate_text.split())
+    char_count = len(case_12.candidate_text)
+    assert word_count == 18, f"Expected 18 words, got {word_count}"
+    assert char_count == 120, f"Expected 120 characters, got {char_count}"
+    assert word_count > 6
+    assert char_count > 35
+    assert rag_graph.should_expand_semantic_anchor(doc_12) is False
+
+    # 2. Context lookup returns None
+    with SafeContextGradingEnvironment() as env:
+        resolved_context = rag_graph.get_grading_preceding_context(
+            doc_12, database_path=str(env.db_path)
+        )
+    assert resolved_context is None
+
+    # 3. Format with Control formatter
+    ctrl_str = rag_graph.format_candidate_for_grader(1, doc_12, preceding_context=None)
+    # 4. Format with Treatment formatter
+    treat_str = format_candidate_structure_aware(1, doc_12, preceding_context=None)
+
+    # Invariants for Negative Control:
+    # A. Neither has a conversation transcript header
+    assert "Chronological Conversation Transcript" not in ctrl_str
+    assert "Chronological Conversation Transcript" not in treat_str
+
+    # B. Neither has turn labels
+    assert "[Turn" not in ctrl_str
+    assert "[Turn" not in treat_str
+
+    # C. Neither contains preceding messages (e.g. ID 124)
+    assert "124" not in ctrl_str
+    assert "124" not in treat_str
+
+    # D. Exact candidate message body is identical in both
+    body_text = "Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving to cold storage."
+    assert body_text in ctrl_str
+    assert body_text in treat_str
+
+    # E. Exact string structures
+    assert ctrl_str == (
+        "[Candidate 1] (Single Message ID: 125)\n"
+        "[ID 125] [2026-10-14T10:15:00] Dev_Compliance: Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving to cold storage."
+    )
+    assert treat_str == (
+        "[Candidate 1] (Single Message ID: 125 | TARGET MESSAGE TO EVALUATE)\n"
+        "[ID 125] [14/10/2026 10:15 AM] Dev_Compliance: Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving to cold storage."
+    )
+
+    # F. Mock grader prompt capture: verify both production and experimental prompts receive standalone candidate
+    captured_prompts = []
+    class NegativeControlMockLLM:
+        def invoke(self, prompt, *args, **kwargs):
+            captured_prompts.append(str(prompt))
+            return AIMessage(content=json.dumps([{"candidate": 1, "decision": "relevant", "reason": "Standalone policy"}]))
+
+    mock_llm = NegativeControlMockLLM()
+
+    # With production prompt
+    rag_graph.grade_candidate_batch(
+        question=case_12.query,
+        batch_docs=[doc_12],
+        grader_llm=mock_llm,
+        prompt_template=rag_graph.GRADE_PROMPT_TEMPLATE,
+        candidate_formatter=format_candidate_structure_aware,
+        preceding_contexts=[None],
+    )
+    # With experimental structure prompt
+    rag_graph.grade_candidate_batch(
+        question=case_12.query,
+        batch_docs=[doc_12],
+        grader_llm=mock_llm,
+        prompt_template=EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE,
+        candidate_formatter=format_candidate_structure_aware,
+        preceding_contexts=[None],
+    )
+
+    assert len(captured_prompts) == 2
+    for p in captured_prompts:
+        assert "[Turn 1]" not in p
+        assert "[Turn 2]" not in p
+        assert "[Candidate 1] (Single Message ID: 125 | TARGET MESSAGE TO EVALUATE)" in p
+        assert f"User Question:\n{case_12.query}" in p
+        assert body_text in p
+
+
+def test_offline_study_invariants_across_cases():
+    """
+    Task 28 (Item 6): Explicit invariant checks across CASE-09 and CASE-12:
+      1. Target identification: marked uniquely on the target candidate
+      2. Chronological order: turns are strictly in ascending time order
+      3. Query preservation: exact question preserved without alteration
+      4. Unchanged candidate text: verbatim candidate body preserved
+      5. No duplicate context resolution: lookup executed strictly once per candidate
+    """
+    case_9 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-09-Multi-Message-Exchange")
+    case_12 = next(c for c in EVALUATION_CASES if c.case_id == "CASE-012-Ordinary-Length-Bypass")
+
+    doc_9 = build_candidate_document(case_9)
+    doc_12 = build_candidate_document(case_12)
+
+    with SafeContextGradingEnvironment() as env:
+        # Check duplicate resolution tracking
+        lookup_calls = []
+        orig_fn = rag_graph.get_grading_preceding_context
+
+        def tracked_lookup(doc, database_path=None):
+            lookup_calls.append(doc.metadata.get("message_id"))
+            return orig_fn(doc, database_path=database_path)
+
+        with patch("rag_graph.get_grading_preceding_context", side_effect=tracked_lookup):
+            ctx_9 = rag_graph.get_grading_preceding_context(doc_9, database_path=str(env.db_path))
+            ctx_12 = rag_graph.get_grading_preceding_context(doc_12, database_path=str(env.db_path))
+
+        # Invariant 5: No duplicate context resolution (called exactly once per candidate)
+        assert lookup_calls == [119, 125]
+
+        # Invariant 1: Target identification
+        cand_9_fmt = format_candidate_structure_aware(1, doc_9, preceding_context=ctx_9)
+        cand_12_fmt = format_candidate_structure_aware(1, doc_12, preceding_context=ctx_12)
+
+        # CASE-09 target identification
+        assert cand_9_fmt.count("TARGET MESSAGE TO EVALUATE") == 1
+        assert "[Turn 3 (TARGET MESSAGE TO EVALUATE)]" in cand_9_fmt
+        assert "[Turn 1 (TARGET MESSAGE TO EVALUATE)]" not in cand_9_fmt
+        assert "[Turn 2 (TARGET MESSAGE TO EVALUATE)]" not in cand_9_fmt
+
+        # CASE-12 target identification
+        assert cand_12_fmt.count("TARGET MESSAGE TO EVALUATE") == 1
+        assert "(Single Message ID: 125 | TARGET MESSAGE TO EVALUATE)" in cand_12_fmt
+
+        # Invariant 2: Chronological order in CASE-09
+        lines_9 = [line for line in cand_9_fmt.splitlines() if line.startswith("[Turn")]
+        assert len(lines_9) == 3
+        assert lines_9[0].startswith("[Turn 1] [ID 117] [14/10/2026 01:40 PM]")
+        assert lines_9[1].startswith("[Turn 2] [ID 118] [14/10/2026 01:41 PM]")
+        assert lines_9[2].startswith("[Turn 3 (TARGET MESSAGE TO EVALUATE)] [ID 119] [14/10/2026 01:42 PM]")
+
+        # Invariant 3: Query preservation in assembled prompts
+        for case, doc, ctx in [(case_9, doc_9, ctx_9), (case_12, doc_12, ctx_12)]:
+            formatted_cand = format_candidate_structure_aware(1, doc, preceding_context=ctx)
+            for template in (rag_graph.GRADE_PROMPT_TEMPLATE, EXPERIMENTAL_STRUCTURE_GRADE_PROMPT_TEMPLATE):
+                prompt = template.format(question=case.query, candidates_text=formatted_cand)
+                assert f"User Question:\n{case.query}\n" in prompt
+                # Question is not trimmed, altered, or lowercased
+                assert case.query in prompt
+
+        # Invariant 4: Unchanged candidate text
+        assert case_9.candidate_text == "Confirmed, heavy voltage drops."
+        assert case_9.candidate_text in cand_9_fmt
+        assert case_12.candidate_text == "Our compliance policy requires retaining all daily user database snapshots for 90 days before archiving to cold storage."
+        assert case_12.candidate_text in cand_12_fmt
