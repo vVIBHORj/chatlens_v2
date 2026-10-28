@@ -8,11 +8,18 @@
 chat_data.db
 eval_sandbox.db
 tech_ops_chat.db
+*sandbox*.db
+*isolated*.db
+*test*.db
 
 # Vector databases & local embeddings cache
 chroma_db/
 tech_ops_chroma/
 eval_chroma/
+eval_chroma_*/
+sandbox_*/
+chatlens_bm03_*/
+chatlens_eval_*/
 
 # Data exports & raw chats
 sample_chat.txt
@@ -25,6 +32,9 @@ eval_results/
 evaluation_reports/
 scratch/
 *.jsonl
+temp_*.py
+scratch_*.py
+inspect_*.py
 
 # Python cache, tests & build outputs
 __pycache__/
@@ -39,6 +49,8 @@ htmlcov/
 build/
 dist/
 *.egg-info/
+*.tmp
+*.temp
 
 # Environment variables & secrets
 .env
@@ -50,10 +62,13 @@ dist/
 .idea/
 *.swp
 *.swo
+.ipynb_checkpoints/
 
 # OS generated files
 .DS_Store
 Thumbs.db
+ehthumbs.db
+desktop.ini
 
 # Virtual environments
 venv/

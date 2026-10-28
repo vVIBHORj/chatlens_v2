@@ -147,6 +147,18 @@ SEMANTIC_EXPANSION_MAX_CHARS = 35
 
 # Opt-in dialogue evidence experiment configuration
 DIALOGUE_EVIDENCE_ENV_VAR = "CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT"
+CONTEXTUAL_GRADING_ENV_VAR = "CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT"
+RETRIEVAL_STRATEGY_ENV_VAR = "CHATLENS_RETRIEVAL_STRATEGY"
+
+STRATEGY_BASELINE = "baseline"
+STRATEGY_DIALOGUE_EVIDENCE = "dialogue_evidence"
+STRATEGY_CONTEXTUAL_GRADING = "contextual_grading"
+VALID_RETRIEVAL_STRATEGIES = {
+    STRATEGY_BASELINE,
+    STRATEGY_DIALOGUE_EVIDENCE,
+    STRATEGY_CONTEXTUAL_GRADING,
+}
+
 TOP_K_EVIDENCE_UNITS = 5
 RRF_K_CONTEXTUAL = 60
 WEIGHT_RETRIEVAL = 0.5
@@ -192,11 +204,15 @@ class GraphState(TypedDict, total=False):
     available_citation_ids: Optional[List[int]]
     grader_status: Optional[str]
 
-    # Opt-in dialogue evidence experiment fields
+    # Opt-in dialogue evidence & contextual grading experiment fields
     evidence_mode: Optional[str]
     dialogue_evidence_mode: Optional[bool]
+    contextual_grading_mode: Optional[bool]
+    retrieval_strategy: Optional[str]
+    grader_llm: Optional[Any]
     database_path: Optional[str]
     embedding_function: Optional[Any]
+    contextual_grading_decisions: Optional[List[Dict[str, Any]]]
 
 # =====================================================================
 # Scope classification
@@ -950,7 +966,7 @@ def grade_candidate_batch(
     grader_llm: Optional[Any] = None,
     database_path: Optional[str] = None,
     prompt_template: Optional[str] = None,
-    candidate_formatter: Optional[Callable[[int, Document, Optional[str]], str]] = None,
+    candidate_formatter: Optional[Callable[..., str]] = None,
     preceding_contexts: Optional[List[Optional[str]]] = None,
 ) -> List[Tuple[Document, str, str, str]]:
     """
@@ -970,14 +986,19 @@ def grade_candidate_batch(
             get_grading_preceding_context(doc, database_path=database_path)
             for doc in batch_docs
         ]
-    formatted_chunks = [
-        active_formatter(
-            idx,
-            doc,
-            preceding_context=ctx,
-        )
-        for idx, doc, ctx in zip(indices, batch_docs, contexts)
-    ]
+    formatted_chunks = []
+    for idx, doc, ctx in zip(indices, batch_docs, contexts):
+        try:
+            chunk = active_formatter(idx, doc, preceding_context=ctx)
+        except TypeError as te:
+            if "unexpected keyword argument" in str(te) or "preceding_context" in str(te):
+                try:
+                    chunk = active_formatter(idx, doc, ctx)
+                except TypeError:
+                    chunk = active_formatter(idx, doc)
+            else:
+                raise
+        formatted_chunks.append(chunk)
     candidates_text = "\n\n---\n\n".join(formatted_chunks)
     active_template = prompt_template if prompt_template is not None else GRADE_PROMPT_TEMPLATE
     prompt = active_template.format(
@@ -1045,13 +1066,15 @@ def grade_documents(
     any_failure = False
     any_success = False
 
+    active_grader = grader_llm or state.get("grader_llm")
+
     # Process in bounded batches
     for batch_start in range(0, len(documents), GRADE_BATCH_SIZE):
         batch = documents[batch_start : batch_start + GRADE_BATCH_SIZE]
         graded_results = grade_candidate_batch(
             question,
             batch,
-            grader_llm=grader_llm,
+            grader_llm=active_grader,
             database_path=db_path,
         )
 
@@ -1484,9 +1507,11 @@ def build_generation_prompt(
             citation_rule = (
                 "7. CITATION INTEGRITY & PRECISE EVIDENCE ATTRIBUTION:\n"
                 "   - Strict Claim-to-Message Attribution: Cite a message ID ONLY if that specific message's own text "
-                "directly contains and supports the factual claim. Do NOT cite a message merely because it appears in the "
-                "same conversation chunk, adjacent context, or permitted list. Verify that the message ID attached to the "
-                "specific statement directly matches what you are citing.\n"
+                "directly contains and supports the factual claim. Every factual claim must be supported by the specific message containing the relevant fact.\n"
+                "   - Reply vs. Preceding Question: When a short reply answers a preceding question, cite ONLY the reply message that supplies the answer, "
+                "NOT the preceding question, request, or suggestion. Do not cite a preceding question merely because it mentions the same topic or entity, "
+                "and do not add extra citations simply to provide conversational background.\n"
+                "   - Multi-Message Claims: When a claim genuinely requires multiple messages to establish the fact, cite only the messages strictly necessary to support that claim.\n"
                 "   - Permitted IDs Only: Cite ONLY message IDs explicitly present in the supplied evidence. "
                 "Never invent, infer, or extrapolate a message ID. "
                 f"Permitted citation IDs in this context: [{ids_str}]. Any citation outside this permitted list is strictly invalid.\n"
@@ -1496,11 +1521,13 @@ def build_generation_prompt(
                 "Cite ONLY the smallest relevant set of message IDs directly supporting each claim. "
                 "NEVER list, clump, or prefix message IDs at the beginning of the answer or before a sentence.\n"
                 "   - Explicit Abstention Without Citations: If the supplied evidence does not contain information to answer the question, "
-                "respond clearly in natural language and state that the information was not found in the conversation. "
-                "In an abstention, do NOT output any citation brackets, message IDs, or placeholder citations."
+                "respond clearly in natural language and state that the information was not found or not mentioned in the conversation. "
+                "In an abstention, do NOT output any citation brackets, message IDs, or placeholder citations. "
+                "Never attach an unrelated message ID to an abstention merely because the message exists in context."
             )
             citation_reminder = (
                 f"Cite ONLY the exact message ID whose text directly supports each claim, chosen strictly from [{ids_str}]. "
+                "When a reply answers a question, cite the reply containing the answer, NOT the preceding question. "
                 "Format every citation inside brackets as [ID <number>] placed directly after the claim it supports. "
                 "Verify the message ID belongs to the actual supporting statement, not an adjacent message. "
                 "Never start your answer with an ID. "
@@ -1534,7 +1561,9 @@ def build_generation_prompt(
         "STRICT GROUNDING RULES:\n\n"
 
         "1. Use ONLY information explicitly present in the context. "
-        "Do NOT add any knowledge or assumptions from outside the context.\n\n"
+        "Do NOT add any knowledge or assumptions from outside the context. "
+        "Do NOT infer an absent fact from unrelated or merely similar messages (e.g., do not confuse dev credentials with production secrets, or car keys with API keys). "
+        "When the supplied evidence does not establish the requested fact, clearly state that the available conversation does not establish or mention it.\n\n"
 
         "2. Distinguish message types carefully:\n"
         "   - STATEMENT: Direct assertion of fact\n"
@@ -1558,9 +1587,10 @@ def build_generation_prompt(
         "phrasing and ambiguity rather than inventing an interpretation. If a message is an unexplained equation, "
         "shorthand, or unclear slang, report it neutrally without asserting an unverified meaning.\n\n"
 
-        "6. Avoid broad, overreaching introductory claims such as 'they discussed various topics including X, Y, Z' "
-        "unless each item was genuinely discussed. Do not feel obliged to mention every retrieved message; "
-        "summarize only the specific points directly supported and relevant to the question.\n\n"
+        "6. Preserve Exact Facts in Short Replies: Short, numerical, temporal, location, and confirmation replies "
+        "must retain the exact relevant fact (such as exact times, IP addresses, locations, and confirmation words like 'clean' or 'yes'). "
+        "For example, when a reply states 'Yes, completely clean', preserve the confirmation that it was clean. "
+        "Do not omit critical qualifiers or add names, events, causes, statuses, or conclusions unsupported by the cited message.\n\n"
 
         f"{citation_rule}\n\n"
 
@@ -1617,17 +1647,31 @@ def generate(
 
     try:
         response = active_llm.invoke(prompt)
-        answer = response.content.strip() if hasattr(response, "content") else str(response).strip()
+        raw_answer = response.content.strip() if hasattr(response, "content") else str(response).strip()
     except Exception as e:
-        answer = (
+        raw_answer = (
             "I was unable to generate the answer "
             f"because the local language model returned "
             f"an error: {e}"
         )
 
+    answer = raw_answer
+    raw_citations_stripped = False
+
+    # Clean abstention representation enforcement:
+    # If the generated response is purely an abstention stating that information is not found/mentioned,
+    # strip any extraneous citation brackets that the model mistakenly attached.
+    if is_pure_abstention(raw_answer):
+        cleaned_answer = re.sub(r"\s*\[(?:ID|message_id)\s*=?\s*\d+\]", "", raw_answer, flags=re.IGNORECASE).strip()
+        if cleaned_answer != raw_answer:
+            raw_citations_stripped = True
+            answer = cleaned_answer
+
     return {
         **state,
+        "raw_generation": raw_answer,
         "generation": answer,
+        "abstention_citations_stripped": raw_citations_stripped,
     }
 
 
@@ -1659,6 +1703,60 @@ class CitationValidationResult:
             "missing_citations": self.missing_citations,
             "details": self.details,
         }
+
+
+def is_pure_abstention(answer: str) -> bool:
+    """
+    Check if the answer is purely an explicit abstention stating that the requested
+    information was not found, not mentioned, or not discussed in the conversation.
+    Ensures:
+      - Does not match if any sentence contains a substantive positive claim.
+      - Does not match mixed answers (substantive claim + absent claim).
+      - Does not match questions.
+      - Matches only when all substantive content indicates lack of information in the context.
+    """
+    if not answer or not isinstance(answer, str):
+        return False
+
+    raw_text = answer.strip()
+    if not raw_text or "?" in raw_text:
+        return False
+
+    # Extract clauses and sentences: split on sentence ends, semicolons, and contrastive conjunctions
+    # First remove bracketed citations to evaluate the prose
+    prose = re.sub(r"\[(?:ID|message_id)\s*=?\s*\d+\]", "", raw_text, flags=re.IGNORECASE).strip()
+    clauses = [
+        c.strip()
+        for c in re.split(r"(?:[.!?]+|\s*;\s*|,\s*(?:but|however|although|while|though|yet)\s+|\b(?:but|however|although|while|though)\b)", prose)
+        if c.strip()
+    ]
+    if not clauses:
+        return False
+
+    abstention_patterns = [
+        r"\b(?:was|is|were)\s+not\s+(?:found|mentioned|discussed|stated|provided|recorded)\b",
+        r"\bdoes\s+not\s+(?:mention|state|contain|discuss|provide|record|indicate)\b",
+        r"\b(?:no|insufficient)\s+(?:information|evidence|mention|data|record)\b",
+        r"\bnot\s+found\s+in\s+the\s+(?:conversation|provided|archive|context|messages)\b",
+        r"\bunable\s+to\s+(?:find|determine|answer)\b",
+        r"\bcannot\s+(?:find|determine|be\s+determined|answer)\b",
+        r"\bthere\s+is\s+no\s+(?:mention|information|evidence)\b",
+        r"\bno\s+mention\s+of\b",
+    ]
+
+    def clause_is_abstention(s: str) -> bool:
+        s_lower = s.lower()
+        return any(re.search(pat, s_lower) for pat in abstention_patterns)
+
+    # In a pure abstention, every non-trivial clause must express lack of information
+    # or be an explanatory clause of the abstention (e.g. "so its storage location cannot be determined")
+    for s in clauses:
+        if not clause_is_abstention(s):
+            if re.search(r"\b(?:so|therefore|hence|as\s+a\s+result)\b.*?\b(?:cannot|unknown|unclear|undetermined)\b", s, re.IGNORECASE):
+                continue
+            return False
+
+    return True
 
 
 def extract_answer_citations(answer: str) -> Tuple[List[int], List[str]]:
@@ -1739,20 +1837,28 @@ def validate_citations(
     valid_cited_ids = [cid for cid in cited_ids if cid in available_ids_set]
     invalid_cited_ids = [cid for cid in cited_ids if cid not in available_ids_set]
 
-    # For specific retrieval queries, citations are expected; report missing citations
-    missing_citations = (scope != "broad" and not has_citations and len(available_ids) > 0)
+    # For specific retrieval queries, citations are expected; report missing citations unless the answer is an explicit abstention
+    is_abstention = is_pure_abstention(answer)
+    missing_citations = (scope != "broad" and not has_citations and len(available_ids) > 0 and not is_abstention)
 
     all_cited_valid = (
         has_citations
         and len(invalid_cited_ids) == 0
         and len(malformed_citations) == 0
+        and not is_abstention
     )
 
     if not has_citations:
-        if missing_citations:
+        if is_abstention:
+            details = "Valid abstention: No citations provided for absent information."
+        elif missing_citations:
             details = "No citations provided in answer for specific retrieval query."
         else:
             details = "No citations provided."
+    elif is_abstention:
+        details = (
+            f"Citation validation warning: citations attached to an explicit abstention ({cited_ids})."
+        )
     elif len(invalid_cited_ids) > 0 or len(malformed_citations) > 0:
         details = (
             f"Citation validation failed: {len(invalid_cited_ids)} invalid IDs "
@@ -1840,9 +1946,10 @@ def check_grounded(
         "3. Unsupported Claims: If the answer asserts events, numbers, participants, or actions that are contradicted "
         "by context or not mentioned, mark 'no'. Do not infer completed actions from mere venue or topic mentions.\n"
         "4. Citation Attribution: When the answer cites [ID X], verify that the message labelled [ID X] in context "
-        "actually contains or directly supports that claim. If the fact is in a different message, mark 'no'.\n"
-        "5. Explicit Abstentions: If the answer states that the requested information was not found in the conversation, "
-        "mark 'yes' if the context indeed lacks that information.\n\n"
+        "actually contains or directly supports that claim. If the fact is in a different message, or if [ID X] is cited "
+        "for a preceding question rather than the reply supplying the answer, mark 'no'.\n"
+        "5. Explicit Abstentions: If the answer states that the requested information was not found or not mentioned in the conversation, "
+        "mark 'yes' if the context indeed lacks that information and no irrelevant citations are attached. If the answer states that information was not found but attaches an unrelated citation, mark 'no'.\n\n"
 
         f"CONTEXT:\n"
         f"{context}\n\n"
@@ -1920,22 +2027,96 @@ def route_by_scope(
 # Opt-In Dialogue Evidence Pipeline Helpers
 # =====================================================================
 
-def is_dialogue_evidence_enabled(state: Optional[GraphState] = None) -> bool:
+def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
     """
-    Check whether the opt-in dialogue-evidence retrieval pipeline is enabled.
-    Disabled by default. Enabled if:
-      - state.get("dialogue_evidence_mode") is True, or
-      - state.get("use_dialogue_evidence") is True, or
-      - CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT environment variable is set to '1' or 'true'.
+    Resolve which retrieval strategy to execute:
+      1. 'baseline' (default production route: grade_documents -> expand_context)
+      2. 'dialogue_evidence' (opt-in rank-only treatment: assemble -> rank)
+      3. 'contextual_grading' (opt-in prototype: assemble -> grade -> rank)
+
+    Precedence:
+      1. Explicit state keys: 'retrieval_strategy', 'contextual_grading_mode', 'dialogue_evidence_mode'.
+      2. Environment variables: CHATLENS_RETRIEVAL_STRATEGY, CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT, CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT.
+      3. Default fallback: 'baseline'.
+
+    Conflict policy:
+      - If multiple conflicting modes are explicitly asserted simultaneously, raises ValueError.
     """
     if state is not None:
-        if state.get("dialogue_evidence_mode") is not None:
-            return bool(state["dialogue_evidence_mode"])
-        if state.get("use_dialogue_evidence") is not None:
-            return bool(state["use_dialogue_evidence"])
+        ctx_flag = state.get("contextual_grading_mode")
+        diag_flag = state.get("dialogue_evidence_mode")
+        legacy_diag_flag = state.get("use_dialogue_evidence")
+        if diag_flag is None and legacy_diag_flag is not None:
+            diag_flag = legacy_diag_flag
 
-    env_val = os.environ.get(DIALOGUE_EVIDENCE_ENV_VAR, "0").strip().lower()
-    return env_val in ("1", "true", "yes", "on")
+        strat_val = state.get("retrieval_strategy")
+        if strat_val is not None:
+            norm_strat = str(strat_val).strip().lower()
+            if norm_strat not in VALID_RETRIEVAL_STRATEGIES:
+                raise ValueError(
+                    f"Unknown retrieval_strategy: {strat_val!r}. "
+                    f"Must be one of: {sorted(VALID_RETRIEVAL_STRATEGIES)}"
+                )
+            if norm_strat == STRATEGY_BASELINE and (bool(ctx_flag) or bool(diag_flag)):
+                raise ValueError("Conflicting configuration: retrieval_strategy='baseline' but experimental mode flag is True.")
+            if norm_strat == STRATEGY_DIALOGUE_EVIDENCE and bool(ctx_flag):
+                raise ValueError("Conflicting configuration: retrieval_strategy='dialogue_evidence' but contextual_grading_mode is True.")
+            if norm_strat == STRATEGY_CONTEXTUAL_GRADING and bool(diag_flag):
+                raise ValueError("Conflicting configuration: retrieval_strategy='contextual_grading' but dialogue_evidence_mode is True.")
+            return norm_strat
+
+        if bool(ctx_flag) and bool(diag_flag):
+            raise ValueError(
+                "Conflicting retrieval experiment flags: both dialogue_evidence_mode and "
+                "contextual_grading_mode are enabled. Please specify only one strategy."
+            )
+        if bool(ctx_flag):
+            return STRATEGY_CONTEXTUAL_GRADING
+        if bool(diag_flag):
+            return STRATEGY_DIALOGUE_EVIDENCE
+        if ctx_flag is False and diag_flag is False:
+            return STRATEGY_BASELINE
+
+    # Check environment variables
+    env_strat = os.environ.get(RETRIEVAL_STRATEGY_ENV_VAR, "").strip().lower()
+    if env_strat:
+        if env_strat not in VALID_RETRIEVAL_STRATEGIES:
+            raise ValueError(
+                f"Unknown CHATLENS_RETRIEVAL_STRATEGY env var: {env_strat!r}. "
+                f"Must be one of: {sorted(VALID_RETRIEVAL_STRATEGIES)}"
+            )
+        return env_strat
+
+    env_ctx = os.environ.get(CONTEXTUAL_GRADING_ENV_VAR, "0").strip().lower() in ("1", "true", "yes", "on")
+    env_diag = os.environ.get(DIALOGUE_EVIDENCE_ENV_VAR, "0").strip().lower() in ("1", "true", "yes", "on")
+
+    if env_ctx and env_diag:
+        raise ValueError(
+            "Conflicting environment variables: both CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT and "
+            "CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT are active. Please activate only one experiment."
+        )
+    if env_ctx:
+        return STRATEGY_CONTEXTUAL_GRADING
+    if env_diag:
+        return STRATEGY_DIALOGUE_EVIDENCE
+
+    return STRATEGY_BASELINE
+
+
+def is_dialogue_evidence_enabled(state: Optional[GraphState] = None) -> bool:
+    """Check whether the opt-in rank-only dialogue-evidence retrieval pipeline is active."""
+    try:
+        return resolve_retrieval_strategy(state) == STRATEGY_DIALOGUE_EVIDENCE
+    except ValueError:
+        return False
+
+
+def is_contextual_grading_enabled(state: Optional[GraphState] = None) -> bool:
+    """Check whether the opt-in contextual-grading retrieval pipeline is active."""
+    try:
+        return resolve_retrieval_strategy(state) == STRATEGY_CONTEXTUAL_GRADING
+    except ValueError:
+        return False
 
 
 def compute_cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
@@ -2127,13 +2308,181 @@ def assemble_and_rank_evidence(
     }
 
 
+def format_candidate_for_contextual_grader(
+    idx: int,
+    document: Document,
+    preceding_context: Optional[str] = None,
+    *args: Any,
+    **kwargs: Any,
+) -> str:
+    """Format an assembled dialogue evidence unit for the relevance grader."""
+    anchor_id = (
+        document.metadata.get("anchor_message_id")
+        or document.metadata.get("message_id")
+        or "unknown"
+    )
+    header = f"[Candidate {idx}] (Dialogue Evidence Unit | Anchor ID: {anchor_id})"
+    return f"{header}\n{document.page_content.strip()}"
+
+
+def assemble_grade_rank_evidence(
+    state: GraphState,
+    grader_llm: Optional[Any] = None,
+    embedding_function: Optional[Any] = None,
+    database_path: Optional[str] = None,
+) -> GraphState:
+    """
+    Opt-in LangGraph node for third retrieval strategy: Contextual Grading After Evidence Assembly.
+    Pipeline:
+      1. Assembles retrieved message anchors into chronological dialogue units.
+      2. Relevance grades the complete assembled evidence units in bounded batches.
+      3. Retains units marked 'relevant' or 'uncertain' (fails open on grader failure).
+      4. Ranks retained units using hybrid retrieval + contextual transcript similarity (RRF).
+      5. Bounds evidence to TOP_K_EVIDENCE_UNITS.
+    """
+    documents = state.get("documents", [])
+    question = state.get("original_question") or state.get("question", "")
+    db_path = database_path or state.get("database_path")
+
+    print("\n" + "=" * 70)
+    print("EXPERIMENTAL CONTEXTUAL RELEVANCE GRADING AFTER EVIDENCE ASSEMBLY")
+    print("=" * 70)
+    print(f"Retrieved candidate documents: {len(documents)}")
+
+    if not documents:
+        print("No candidates retrieved to assemble and grade.")
+        return {
+            **state,
+            "documents": [],
+            "evidence_mode": "contextual_grading",
+            "retrieval_strategy": STRATEGY_CONTEXTUAL_GRADING,
+            "grader_status": "success",
+        }
+
+    # 1. Assemble complete dialogue units using context_expander helper
+    evidence_units = assemble_dialogue_evidence_units(
+        documents,
+        before=2,
+        after=1,
+        database_path=db_path,
+    )
+    print(f"Assembled dialogue evidence units: {len(evidence_units)}")
+
+    if not evidence_units:
+        return {
+            **state,
+            "documents": [],
+            "evidence_mode": "contextual_grading",
+            "retrieval_strategy": STRATEGY_CONTEXTUAL_GRADING,
+            "grader_status": "success",
+        }
+
+    # 2. Grade assembled units conservatively using LLM relevance grader
+    active_llm = grader_llm or state.get("grader_llm") or llm
+    kept_units: List[Document] = []
+    grading_decisions: List[Dict[str, Any]] = []
+    rejected_count = 0
+    any_failure = False
+    any_success = False
+
+    for batch_start in range(0, len(evidence_units), GRADE_BATCH_SIZE):
+        batch = evidence_units[batch_start : batch_start + GRADE_BATCH_SIZE]
+        graded_results = grade_candidate_batch(
+            question=question,
+            batch_docs=batch,
+            grader_llm=active_llm,
+            database_path=db_path,
+            candidate_formatter=format_candidate_for_contextual_grader,
+            preceding_contexts=[None] * len(batch),
+        )
+
+        for doc, decision, reason, grader_status in graded_results:
+            if grader_status == "failure":
+                any_failure = True
+            else:
+                any_success = True
+
+            new_metadata = dict(doc.metadata)
+            new_metadata["relevance_decision"] = decision
+            new_metadata["relevance_reason"] = reason
+            new_metadata["grader_status"] = grader_status
+            new_metadata["grader_failure"] = (grader_status == "failure")
+
+            updated_doc = Document(
+                page_content=doc.page_content,
+                metadata=new_metadata,
+            )
+
+            anchor_id = new_metadata.get("anchor_message_id") or new_metadata.get("message_id") or "?"
+            grading_decisions.append({
+                "anchor_message_id": anchor_id,
+                "included_message_ids": new_metadata.get("included_message_ids", []),
+                "decision": decision,
+                "reason": reason,
+                "grader_status": grader_status,
+                "grader_failure": (grader_status == "failure"),
+            })
+            if decision == "irrelevant":
+                rejected_count += 1
+                print(f"  [REJECTED] DialogueUnit Anchor={anchor_id}: {reason}")
+            else:
+                kept_units.append(updated_doc)
+                status_note = f" (grader_{grader_status})" if grader_status == "failure" else ""
+                print(f"  [{decision.upper()}{status_note}] DialogueUnit Anchor={anchor_id}: {reason}")
+
+    if any_failure and any_success:
+        overall_grader_status = "degraded"
+    elif any_failure:
+        overall_grader_status = "failed"
+    else:
+        overall_grader_status = "success"
+
+    print(
+        f"Contextual grading summary: kept {len(kept_units)}/{len(evidence_units)} "
+        f"evidence units ({rejected_count} rejected as irrelevant, status={overall_grader_status})."
+    )
+
+    # 3. Contextual RRF ranking ONLY on retained units (rejected candidates can never re-enter)
+    if kept_units:
+        embedder = embedding_function or state.get("embedding_function")
+        ranked_units = rank_dialogue_evidence_units(
+            question=question,
+            evidence_units=kept_units,
+            embedding_function=embedder,
+        )
+        bounded_units = ranked_units[:TOP_K_EVIDENCE_UNITS]
+    else:
+        bounded_units = []
+
+    print(f"Selected top-{len(bounded_units)} bounded evidence units for generation:")
+    for idx, unit in enumerate(bounded_units, start=1):
+        anchor_id = unit.metadata.get("anchor_message_id") or unit.metadata.get("message_id")
+        fused = unit.metadata.get("fused_score", 0.0)
+        ret_rank = unit.metadata.get("retrieval_rank")
+        ctx_rank = unit.metadata.get("contextual_rank")
+        print(f"  #{idx} Anchor ID={anchor_id} | fused_score={fused:.6f} (ret_rank={ret_rank}, ctx_rank={ctx_rank})")
+
+    return {
+        **state,
+        "documents": bounded_units,
+        "evidence_mode": "contextual_grading",
+        "retrieval_strategy": STRATEGY_CONTEXTUAL_GRADING,
+        "grader_status": overall_grader_status,
+        "contextual_grading_decisions": grading_decisions,
+    }
+
+
 def route_post_retrieval(state: GraphState) -> str:
     """
     Routing decision immediately after retrieval:
-    - If dialogue evidence experiment is enabled: routes to assemble_and_rank_evidence.
+    - If contextual grading experiment is enabled: routes to assemble_grade_rank_evidence.
+    - Else if dialogue evidence experiment is enabled: routes to assemble_and_rank_evidence.
     - Otherwise (default production behavior): routes to grade_documents.
     """
-    if is_dialogue_evidence_enabled(state):
+    strategy = resolve_retrieval_strategy(state)
+    if strategy == STRATEGY_CONTEXTUAL_GRADING:
+        return "assemble_grade_rank_evidence"
+    if strategy == STRATEGY_DIALOGUE_EVIDENCE:
         return "assemble_and_rank_evidence"
     return "grade_documents"
 
@@ -2141,6 +2490,21 @@ def route_post_retrieval(state: GraphState) -> str:
 def decide_post_assembly(state: GraphState) -> str:
     """
     Routing decision immediately after dialogue evidence unit assembly & ranking:
+    - If no documents remain and rewrites remain: routes to rewrite_query.
+    - Otherwise: proceeds directly to grounded generation.
+    """
+    documents = state.get("documents", [])
+    rewrite_count = state.get("rewrite_count", 0)
+
+    if not documents and rewrite_count < MAX_REWRITES:
+        return "rewrite_query"
+
+    return "generate"
+
+
+def decide_post_contextual_grading(state: GraphState) -> str:
+    """
+    Routing decision immediately after contextual grading & ranking:
     - If no documents remain and rewrites remain: routes to rewrite_query.
     - Otherwise: proceeds directly to grounded generation.
     """
@@ -2200,6 +2564,11 @@ def build_graph():
     workflow.add_node(
         "assemble_and_rank_evidence",
         assemble_and_rank_evidence,
+    )
+
+    workflow.add_node(
+        "assemble_grade_rank_evidence",
+        assemble_grade_rank_evidence,
     )
 
     workflow.add_node(
@@ -2268,6 +2637,9 @@ def build_graph():
 
             "assemble_and_rank_evidence":
                 "assemble_and_rank_evidence",
+
+            "assemble_grade_rank_evidence":
+                "assemble_grade_rank_evidence",
         },
     )
 
@@ -2288,6 +2660,19 @@ def build_graph():
     workflow.add_conditional_edges(
         "assemble_and_rank_evidence",
         decide_post_assembly,
+        {
+            "generate":
+                "generate",
+
+            "rewrite_query":
+                "rewrite_query",
+        },
+    )
+
+    # Experimental contextual grading path: assembly -> grading -> ranking -> decision
+    workflow.add_conditional_edges(
+        "assemble_grade_rank_evidence",
+        decide_post_contextual_grading,
         {
             "generate":
                 "generate",
@@ -2340,6 +2725,10 @@ def ask(
     question: str,
     df: Optional[pd.DataFrame] = None,
     dialogue_evidence_mode: Optional[bool] = None,
+    contextual_grading_mode: Optional[bool] = None,
+    retrieval_strategy: Optional[str] = None,
+    grader_llm: Optional[Any] = None,
+    embedding_function: Optional[Any] = None,
     database_path: Optional[str] = None,
 ) -> dict:
     """
@@ -2359,6 +2748,20 @@ def ask(
         Optional boolean override for opt-in dialogue evidence experiment.
         Defaults to None (falls back to CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT env var).
 
+    contextual_grading_mode:
+        Optional boolean override for opt-in contextual grading experiment.
+        Defaults to None (falls back to CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT env var).
+
+    retrieval_strategy:
+        Optional explicit strategy name ('baseline', 'dialogue_evidence', 'contextual_grading').
+        Defaults to None (falls back to CHATLENS_RETRIEVAL_STRATEGY env var).
+
+    grader_llm:
+        Optional custom grader LLM instance (e.g. for offline testing).
+
+    embedding_function:
+        Optional custom embeddings instance for contextual ranking.
+
     database_path:
         Optional explicit database path for isolated environments.
 
@@ -2372,12 +2775,22 @@ def ask(
         scope
         query_spec
         evidence_mode
+        retrieval_strategy
+        grader_status
     """
 
     if not question or not question.strip():
         raise ValueError(
             "Question cannot be empty."
         )
+
+    # Validate strategy configuration early to fail closed on conflicting inputs
+    test_state: GraphState = {
+        "dialogue_evidence_mode": dialogue_evidence_mode,
+        "contextual_grading_mode": contextual_grading_mode,
+        "retrieval_strategy": retrieval_strategy,
+    }
+    resolved_strategy = resolve_retrieval_strategy(test_state)
 
     graph = build_graph()
 
@@ -2401,6 +2814,10 @@ def ask(
         "grader_status": None,
         "evidence_mode": "standard",
         "dialogue_evidence_mode": dialogue_evidence_mode,
+        "contextual_grading_mode": contextual_grading_mode,
+        "retrieval_strategy": resolved_strategy,
+        "grader_llm": grader_llm,
+        "embedding_function": embedding_function,
         "database_path": database_path,
     }
 
@@ -2411,6 +2828,10 @@ def ask(
 
     return {
         "answer": result["generation"],
+
+        "raw_answer": result.get("raw_generation", result["generation"]),
+
+        "abstention_citations_stripped": result.get("abstention_citations_stripped", False),
 
         "grounded": result["grounded"],
 
@@ -2436,6 +2857,10 @@ def ask(
         "grader_status": result.get("grader_status"),
 
         "evidence_mode": result.get("evidence_mode", "standard"),
+
+        "retrieval_strategy": result.get("retrieval_strategy", resolved_strategy),
+
+        "contextual_grading_decisions": result.get("contextual_grading_decisions", []),
     }
 
 
