@@ -29,6 +29,8 @@
 - [🔀 Opt-In Dialogue-Evidence Retrieval Pipeline (Mode A)](#-opt-in-dialogue-evidence-retrieval-pipeline-mode-a)
 - [⚖️ Opt-In Contextual Grading Retrieval Strategy (Mode B)](#️-opt-in-contextual-grading-retrieval-strategy-mode-b)
 - [📊 Live Comparative Evaluation: Dialogue Evidence vs. Contextual Grading (Task 44)](#-live-comparative-evaluation-dialogue-evidence-vs-contextual-grading-task-44)
+- [📊 Task 50 Live Comparative Evaluation: Production Baseline vs. Contextual Grading V1](#-task-50-live-comparative-evaluation-production-baseline-vs-contextual-grading-v1)
+- [🔬 Task 51 & 52: Grader Prompt Audit & Reproducible Static Evidence Cache](#-task-51--52-grader-prompt-audit--reproducible-static-evidence-cache)
 - [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
 - [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
 - [🧭 Deterministic Query Routing](#-deterministic-query-routing)
@@ -488,6 +490,52 @@ In `CASE-05` (*Query: "Where is the staging API key stored?"*), the conversation
 Under **Mode A (Dialogue Evidence)**, the dialogue unit around `[ID 8]` was retrieved and ranked directly into prompt context. The generation model misattributed the cafeteria keys location to the staging API key, hallucinating: *"The staging API key is stored on the kitchen counter [ID 8]."*
 Under **Mode B (Contextual Grading)**, the complete dialogue unit was presented to the grader node prior to ranking. The grader recognized that the preceding context specifically concerned *cafeteria keys* rather than *staging API keys*, marked the candidate as `irrelevant`, and excluded it from generation. The model cleanly abstained: *"I do not have enough information to answer where the staging API key is stored."*
 
+## 📊 Task 50 Live Comparative Evaluation: Production Baseline vs. Contextual Grading V1
+
+Task 50 conducted a controlled live comparison between **Mode A (Production Baseline)** and **Mode B (Contextual Grading V1)** across all 12 canonical evaluation cases using local Ollama models (`qwen2.5:3b` at temperature `0.0` and `qwen3-embedding:0.6b`).
+
+Both modes were evaluated under the clarified Task 48/49 scoring contract (`evaluation_scoring.py`), separating citation-ID validity from attribution precision, evaluating joint context support, and strictly enforcing the 84-call budget ceiling.
+
+### Key Evaluation Findings
+- **Accuracy Jump (+25.0%)**: Contextual Grading V1 achieved **66.7% strict accuracy (8/12)** compared to the Production Baseline's **41.7% (5/12)**.
+- **Evidence Recall Preservation**: Contextual Grading V1 retained **100.0% evidence recall (7/7)** on all answerable cases compared to Baseline's **71.4% (5/7)**. Baseline dropped terse answers (`CASE-01`, `CASE-02`) during individual document grading because fragments like *"In Vault 9."* or *"9pm."* lack standalone semantic relevance without chronological context.
+- **Groundedness Pass Rate**: Contextual Grading V1 achieved **100.0% groundedness pass rate (7/7)** on answerable cases versus Baseline's **71.4% (5/7)**.
+- **Citation Validity**: Both modes achieved **100.0% citation validity** with zero invented or hallucinated message IDs.
+- **Distractor Survival Profile**: Across the 5 unanswerable cases, both modes produced 3 false positives (`CASE-08`, `CASE-010`, `CASE-011`) due to model tendencies to treat conversational questions as evidence of approval (`CASE-08`), treat ambiguous *"Maybe."* statements as affirmative proof (`CASE-010`), and conflate development tokens with production secrets (`CASE-011`).
+
+| Metric | Mode A (Production Baseline) | Mode B (Contextual Grading V1) | Delta / Behavioral Significance |
+| :--- | :---: | :---: | :--- |
+| **Strict Accuracy (Clarified Contract)** | 41.7% (5/12) | **66.7% (8/12)** | **+25.0%**: Decisive end-to-end improvement |
+| **Answerable Evidence Recall** | 71.4% (5/7) | **100.0% (7/7)** | **+28.6%**: Eliminates loss of short context-dependent replies |
+| **Groundedness Pass Rate** | 71.4% (5/7) | **100.0% (7/7)** | **+28.6%**: Context-assembled answers pass verification |
+| **Citation-ID Validity Rate** | **100.0%** | **100.0%** | **100%**: Zero hallucinated message IDs |
+| **Mean Attribution Precision** | **1.000** | **1.000** | Perfect citation relevance when citations provided |
+| **Mean Attribution Recall** | 0.714 | **1.000** | **+0.286**: Fully attributes all joint supporting messages |
+| **Correct Abstention Rate** | 40.0% (2/5) | 40.0% (2/5) | Baseline and V1 both abstained on CASE-05 and CASE-07 |
+| **Total LLM Invocations** | 24 calls | 36 calls | Total 60 calls used / 84 call ceiling strictly enforced |
+| **Median Latency per Case** | 8.01s | 8.35s | Minimal latency difference (+0.34s) |
+
+---
+
+## 🔬 Task 51 & 52: Grader Prompt Audit & Reproducible Static Evidence Cache
+
+Tasks 51 and 52 investigated the false positive profile of Contextual Grading V1 on unanswerable cases (`CASE-08`, `CASE-010`, `CASE-011`) and established a fully deterministic evaluation fixture for isolated grader experiments.
+
+### Task 51: Fail-Closed Preflight Audit
+- Task 51 initiated an audit of the Task 50 evaluation artifact to extract candidate evidence units for a targeted 24-call prompt diagnostic.
+- **Preflight Blocker Discovered**: Task 50 recorded anchor IDs, included message IDs, and grading decisions, but omitted raw candidate page content (`Document.page_content`).
+- **Fail-Closed Stop**: In accordance with Section 1 data integrity rules (*"If the complete evidence units cannot be recovered, stop before live inference and report the missing data"*), live inference was halted at **0 LLM calls** to prevent ungrounded reconstruction or unauthorized production DB access.
+
+### Task 52: Static Evidence Cache & Non-Leaking Evaluation Capture
+- **`evidence_cache.py` Module**: Implemented a standalone evidence cache generator and validator enforcing 10 invariant checks.
+- **Deterministic Reconstruction**: Reconstructed all 69 candidate units across the 12 canonical cases using the synthetic transcript definitions and native context expansion formatters. Labeled accurately as `DETERMINISTICALLY_RECONSTRUCTED`.
+- **100% Fidelity Alignment**: Reconstructed units match Task 50 metadata across all 69 candidates (candidate ordering, anchor IDs, neighbor message IDs, and historical decisions).
+- **Zero LLM Calls & Isolated Storage**: Cache built via `SafeEvaluationSandbox` using only local `qwen3-embedding:0.6b` (0 grading, generation, or groundedness calls; 0 production database touches).
+- **Safe Evaluation Capture in `rag_graph.py`**: Added optional `capture_eval_evidence` parameter to `assemble_grade_rank_evidence` and `ask()`. Defaults to `False` in production to ensure raw conversation text is never added to user-facing responses or general logs.
+- **Test Suite**: Added [`test_evidence_cache.py`](test_evidence_cache.py) with 16 comprehensive unit tests covering reconstruction, ordering, chunk handling, multiline preservation, stable SHA-256 hashes, atomic writes, and production path guards.
+
+---
+
 ## 🔎 Dual-Level Hybrid Retrieval Engine
 
 ChatLens rejects simple vector search in favor of a 3-way hybrid retrieval and evidence-scoring architecture that balances semantic nuance with keyword precision:
@@ -867,8 +915,19 @@ ChatLens-RAG/
 ├── run_context_grading_live.py        # Safe live evaluation runner with runtime budget enforcement
 ├── run_dialogue_evidence_live.py      # Live dialogue evidence evaluation runner (Mode A)
 ├── run_task44_comparison_live.py      # Task 44 live paired comparison runner (Mode A vs Mode B)
+- [x] Canonical evaluation metric contract separating citation validity from attribution and defining joint support (Tasks 48-49).
+- [x] Task 50 live paired comparison confirming Contextual Grading V1 +25.0% accuracy improvement (66.7% vs 41.7%) and 100% evidence recall.
+- [x] Task 51 fail-closed preflight audit identifying missing candidate text payloads in historical artifacts.
+- [x] Task 52 reproducible static evidence cache with 10-point invariant validation and non-leaking evaluation capture.
+├── run_task46_comparison_live.py     # Task 46 live paired comparison runner (V1 vs V2)
+├── run_task50_comparison_live.py     # Task 50 live paired comparison runner (Baseline vs Contextual V1)
+├── evaluation_scoring.py             # Canonical evaluation scoring & audit engine (Tasks 48/49)
+├── evidence_cache.py                 # Static evidence cache builder and 10-point validator (Task 52)
 │
 ├── test_contextual_grading_pipeline.py# 23 offline tests for Task 43 contextual grading prototype
+├── test_contextual_grading_v2.py     # 25 offline tests for Contextual Grading V2
+├── test_evaluation_scoring.py        # 26 tests for canonical metric contract & edge cases
+├── test_evidence_cache.py            # 16 tests for static evidence cache & evaluation capture
 ├── test_citation_remediation_task41.py# 15 tests for citation integrity & unanswerable abstention
 ├── test_dialogue_evidence_pipeline.py # 17 tests for dialogue evidence assembly & RRF ranking
 ├── test_dialogue_evidence_live_harness.py # 5 tests for live comparison harness & budget counter

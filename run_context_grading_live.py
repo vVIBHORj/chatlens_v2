@@ -1,7 +1,13 @@
 """
 run_context_grading_live.py
 ===========================
+[STATUS: HISTORICAL / DEPRECATED]
 Multi-Case Live Relevance Grading Evaluation Runner for ChatLens-RAG.
+
+Note: This runner evaluated early Task 38/40 grading behavior and is preserved
+for historical provenance only. Active evaluations run via run_task46_comparison_live.py
+and run_dialogue_evidence_live.py using canonical evaluation_scoring.py contracts.
+Do not use this file for new evaluation benchmarks.
 
 Evaluates real-model relevance grading behavior across the 12 deterministic
 synthetic evaluation cases from test_context_grading_evaluation.py under two

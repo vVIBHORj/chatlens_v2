@@ -1,7 +1,13 @@
 """
 run_task44_comparison_live.py
 =============================
+[STATUS: HISTORICAL / DEPRECATED]
 Task 44: Live Comparison of Dialogue Evidence vs. Contextual Grading.
+
+Note: This runner is preserved for historical experiment provenance only.
+Active paired evaluation is conducted via run_task46_comparison_live.py
+under the canonical evaluation contract in evaluation_scoring.py. Do not use
+this file for new evaluation benchmarks.
 
 Evaluates two opt-in retrieval strategies across the 12 canonical evaluation cases:
   - Mode A (Dialogue Evidence):

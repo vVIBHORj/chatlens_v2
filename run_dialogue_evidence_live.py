@@ -49,6 +49,12 @@ from chat_database import create_database, get_connection, save_messages
 from enrich import enrich_messages, to_dataframe
 from parser import parse_whatsapp_export
 from vectorstore import build_vectorstore, get_embeddings
+from evaluation_scoring import (
+    classify_case_outcome,
+    compute_citation_validity,
+    evaluate_citation_attribution,
+    evaluate_exact_facts_and_qualifiers,
+)
 
 
 # ============================================================================
@@ -99,6 +105,7 @@ class EvalCase:
     expected_supporting_ids: List[int]
     expected_answer_keywords: List[str]
     description: str
+    support_semantics: str = "joint"
 
 
 EVAL_CASES: List[EvalCase] = [
@@ -255,6 +262,7 @@ EVAL_CASES: List[EvalCase] = [
         expected_supporting_ids=[119, 117],
         expected_answer_keywords=["Rack C4", "C4"],
         description="Two preceding messages identify the entity (Rack C4) for candidate confirmation.",
+        support_semantics="joint",
     ),
     # 10. Ambiguous / unresolvable context
     EvalCase(
@@ -398,6 +406,16 @@ class TrackingEmbeddingsWrapper:
         self.document_batch_invocations += 1
         self.total_documents_embedded += len(texts)
         return self.inner_embedder.embed_documents(texts)
+
+    @property
+    def doc_batch_invocations(self) -> int:
+        """Alias for document_batch_invocations for backwards compatibility."""
+        return self.document_batch_invocations
+
+    @property
+    def total_docs_embedded(self) -> int:
+        """Alias for total_documents_embedded for backwards compatibility."""
+        return self.total_documents_embedded
 
 
 # ============================================================================
@@ -644,8 +662,11 @@ class CaseModeRunResult:
     # Groundedness & Attribution
     grounded: bool = False
     semantic_grounded: bool = False
-    attribution_precision: float = 0.0
-    attribution_recall: float = 0.0
+    attribution_precision: Optional[float] = None
+    attribution_recall: Optional[float] = None
+    citation_validity: Optional[float] = None
+    exact_fact_preserved: Optional[bool] = None
+    semantic_answer_correct: Optional[bool] = None
 
     # Classification & Pass Status
     classification: str = "UNKNOWN"  # TP, FP, TN, FN
@@ -676,8 +697,10 @@ class ModeSummaryMetrics:
 
     population_recall_terse: float = 0.0  # CASE-01, 02, 04
     overall_evidence_recall: float = 0.0
-    citation_validity_rate: float = 0.0
-    mean_attribution_precision: float = 0.0
+    citation_validity_rate: Optional[float] = None
+    mean_attribution_precision: Optional[float] = None  # Macro
+    citation_level_attribution_precision: Optional[float] = None  # Micro
+    mean_attribution_recall: float = 0.0  # Macro recall
     groundedness_pass_rate: float = 0.0
     correct_abstention_rate: float = 0.0
     false_positives_unanswerable: int = 0
@@ -692,7 +715,7 @@ class ModeSummaryMetrics:
 # ============================================================================
 
 def evaluate_run_metrics(res: CaseModeRunResult, case: EvalCase):
-    """Evaluates deterministic metrics on one case run."""
+    """Evaluates deterministic metrics on one case run using canonical scoring contract."""
     ans_lower = res.answer.lower()
 
     # Detect explicit abstention
@@ -703,39 +726,59 @@ def evaluate_run_metrics(res: CaseModeRunResult, case: EvalCase):
     ]
     res.abstention_detected = any(cue in ans_lower for cue in abstention_cues) or not res.valid_cited_ids
 
-    # Attribution precision & recall
-    if case.expected_supporting_ids:
-        # Answerable case
-        res.target_in_final_evidence = case.target_id in res.assembled_evidence_ids or case.target_id in res.retained_graded_ids
-        correct_ids_cited = [cid for cid in res.valid_cited_ids if cid in case.expected_supporting_ids]
-        res.attribution_recall = len(correct_ids_cited) / len(case.expected_supporting_ids)
-        res.attribution_precision = (
-            len(correct_ids_cited) / len(res.valid_cited_ids) if res.valid_cited_ids else 0.0
+    # Target in evidence
+    if case.expected_answerable:
+        res.target_in_final_evidence = (
+            case.target_id in res.assembled_evidence_ids or case.target_id in res.retained_graded_ids
         )
+    else:
+        res.target_in_final_evidence = True  # N/A for unanswerable
+
+    # Citation validity
+    res.citation_validity = compute_citation_validity(res.valid_cited_ids, res.invalid_cited_ids)
+
+    # Citation attribution precision & recall under canonical contract
+    support_semantics = getattr(case, "support_semantics", "joint")
+    res.attribution_precision, res.attribution_recall = evaluate_citation_attribution(
+        is_answerable=case.expected_answerable,
+        valid_cited_ids=res.valid_cited_ids,
+        expected_supporting_ids=case.expected_supporting_ids,
+        invalid_cited_ids=res.invalid_cited_ids,
+        support_semantics=support_semantics,
+    )
+
+    # Exact facts and semantic correctness
+    fact_eval = evaluate_exact_facts_and_qualifiers(
+        case_id=case.case_id,
+        answer=res.answer,
+        expected_keywords=case.expected_answer_keywords,
+    )
+    res.semantic_answer_correct = fact_eval["semantic_answer_correct"]
+    res.exact_fact_preserved = fact_eval["exact_fact_preserved"]
+
+    # Abstention correctness
+    has_citations = bool(res.valid_cited_ids or res.invalid_cited_ids)
+    if not case.expected_answerable:
+        res.correct_abstention = res.abstention_detected and not has_citations
+    else:
         res.correct_abstention = False
 
-        # Keyword match
-        has_kw = any(kw.lower() in ans_lower for kw in case.expected_answer_keywords)
-
-        if res.grounded and has_kw and res.attribution_precision == 1.0 and res.attribution_recall > 0:
-            res.classification = "TP"
-            res.passed = True
-        else:
-            res.classification = "FN"
-            res.passed = False
-    else:
-        # Unanswerable / Distractor case
-        res.correct_abstention = res.abstention_detected and len(res.valid_cited_ids) == 0
-        if res.correct_abstention:
-            res.classification = "TN"
-            res.passed = True
-            res.attribution_precision = 1.0
-            res.attribution_recall = 1.0
-        else:
-            res.classification = "FP"
-            res.passed = False
-            res.attribution_precision = 0.0
-            res.attribution_recall = 0.0
+    # Canonical classification
+    is_joint = (support_semantics == "joint") and (len(case.expected_supporting_ids) > 1)
+    res.classification = classify_case_outcome(
+        expected_answerable=case.expected_answerable,
+        target_in_final_evidence=res.target_in_final_evidence,
+        semantic_answer_correct=bool(res.semantic_answer_correct),
+        grounded=res.grounded,
+        attribution_precision=res.attribution_precision,
+        attribution_recall=res.attribution_recall,
+        correct_abstention=res.correct_abstention,
+        valid_cited_ids=res.valid_cited_ids,
+        invalid_cited_ids=res.invalid_cited_ids,
+        is_joint_supporting=is_joint,
+        expected_supporting_ids=case.expected_supporting_ids,
+    )
+    res.passed = (res.classification in ("TP", "TN"))
 
 
 def compute_mode_summary(results: List[CaseModeRunResult], mode_name: str) -> ModeSummaryMetrics:
@@ -767,21 +810,41 @@ def compute_mode_summary(results: List[CaseModeRunResult], mode_name: str) -> Mo
     if ans_runs:
         metrics.overall_evidence_recall = sum(1 for r in ans_runs if r.target_in_final_evidence) / len(ans_runs)
         metrics.groundedness_pass_rate = sum(1 for r in ans_runs if r.grounded) / len(ans_runs)
+        rec_list = [r.attribution_recall for r in ans_runs if r.attribution_recall is not None]
+        metrics.mean_attribution_recall = (sum(rec_list) / len(ans_runs)) if ans_runs else 0.0
 
     unans_runs = [r for r in results if not r.expected_answerable]
     if unans_runs:
         metrics.correct_abstention_rate = sum(1 for r in unans_runs if r.correct_abstention) / len(unans_runs)
         metrics.false_positives_unanswerable = sum(1 for r in unans_runs if r.classification == "FP")
 
-    valid_cit_runs = [r for r in results if r.valid_cited_ids or r.invalid_cited_ids]
-    if valid_cit_runs:
-        metrics.citation_validity_rate = sum(1 for r in valid_cit_runs if r.all_citations_valid) / len(valid_cit_runs)
+    # Aggregate citation validity
+    total_valid_cits = sum(len(r.valid_cited_ids) for r in results)
+    total_invalid_cits = sum(len(r.invalid_cited_ids) for r in results)
+    total_cits = total_valid_cits + total_invalid_cits
+    if total_cits > 0:
+        metrics.citation_validity_rate = total_valid_cits / total_cits
     else:
-        metrics.citation_validity_rate = 1.0
+        metrics.citation_validity_rate = None
 
-    metrics.mean_attribution_precision = (
-        sum(r.attribution_precision for r in results) / len(results) if results else 0.0
-    )
+    # Macro mean attribution precision across cases with citations
+    prec_list = [r.attribution_precision for r in results if r.attribution_precision is not None]
+    if prec_list:
+        metrics.mean_attribution_precision = sum(prec_list) / len(prec_list)
+    else:
+        metrics.mean_attribution_precision = None
+
+    # Micro citation-level attribution precision
+    supporting_citations = 0
+    for r in ans_runs:
+        exp_set = set(r.expected_supporting_ids)
+        vc_set = set(r.valid_cited_ids)
+        supporting_citations += len(vc_set.intersection(exp_set))
+    if total_cits > 0:
+        metrics.citation_level_attribution_precision = supporting_citations / total_cits
+    else:
+        metrics.citation_level_attribution_precision = None
+
     metrics.total_llm_calls = sum(r.llm_calls_made for r in results)
     metrics.mean_latency_seconds = sum(r.latency_seconds for r in results) / len(results)
     return metrics
