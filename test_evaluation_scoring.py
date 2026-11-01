@@ -15,9 +15,11 @@ import pytest
 
 from run_dialogue_evidence_live import EVAL_CASES, TrackingEmbeddingsWrapper
 from evaluation_scoring import (
+    ScoringContractError,
     atomic_save_json,
     atomic_save_markdown,
     classify_case_outcome,
+    classify_case_outcome_legacy,
     compute_citation_validity,
     compute_clarified_audit_metrics,
     evaluate_citation_attribution,
@@ -384,6 +386,8 @@ def test_answerable_case_with_retrieval_but_incorrect_output_not_true_positive()
         attribution_recall=0.0,
         correct_abstention=False,
         valid_cited_ids=[102],
+        exact_fact_preserved=False,
+        qualifier_preserved=True,
     )
     assert cls == "FN"
 
@@ -404,6 +408,8 @@ def test_misattributed_citations_prevent_full_true_positive():
         attribution_recall=1.0,
         correct_abstention=False,
         valid_cited_ids=[106, 105],
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
     )
     assert cls == "FN"
 
@@ -611,6 +617,8 @@ def test_multi_message_joint_necessity_partial_recall_not_true_positive():
         valid_cited_ids=[119],
         is_joint_supporting=True,
         expected_supporting_ids=[119, 117],
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
     )
     assert classification == "FN", "Missing a jointly necessary supporting message must classify as FN, not TP"
 
@@ -638,6 +646,8 @@ def test_alternative_supporting_messages_receive_credit():
         valid_cited_ids=[101],
         is_joint_supporting=False,
         expected_supporting_ids=[101, 102],
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
     )
     assert classification == "TP", "Complete citation of an alternative must yield TP"
 
@@ -665,6 +675,8 @@ def test_misattributed_extra_citations_prevent_full_attribution_precision():
         valid_cited_ids=[106, 105],
         is_joint_supporting=False,
         expected_supporting_ids=[106],
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
     )
     assert classification == "FN", "Over-citation / misattribution must prevent TP (classified as FN)"
 
@@ -732,6 +744,8 @@ def test_case03_and_case09_verified_evidence_semantics():
         valid_cited_ids=[119],
         is_joint_supporting=True,
         expected_supporting_ids=case09.expected_supporting_ids,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
     )
     assert class_9 == "FN"
 
@@ -775,4 +789,394 @@ def test_no_live_inference_or_production_storage_access():
         assert db_file.is_file()
     if chroma_dir.exists():
         assert chroma_dir.is_dir()
+
+
+# ============================================================================
+# TASK 58 STRICT FACT-FIDELITY SCORING TESTS
+# ============================================================================
+
+# 1. Semantic correctness true, exact fact true, qualifier true, valid citations -> TP.
+def test_task58_all_conditions_satisfied_yields_tp():
+    cls = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[102],
+        invalid_cited_ids=[],
+    )
+    assert cls == "TP"
+
+
+# 2. Semantic correctness true, exact fact false -> FN.
+def test_task58_semantic_true_exact_fact_false_yields_fn():
+    cls = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=False,  # Fact omitted!
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[102],
+    )
+    assert cls == "FN"
+
+
+# 3. Semantic correctness true, qualifier false -> FN.
+def test_task58_semantic_true_qualifier_false_yields_fn():
+    cls = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=False,  # Qualifier omitted!
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[108],
+    )
+    assert cls == "FN"
+
+
+# 4. Semantic correctness false despite valid citations -> FN.
+def test_task58_semantic_false_valid_citations_yields_fn():
+    cls = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=False,  # Semantic error!
+        exact_fact_preserved=False,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[102],
+    )
+    assert cls == "FN"
+
+
+# 5. Correct answer but missing one jointly required citation -> FN.
+def test_task58_missing_joint_citation_yields_fn():
+    cls = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=0.5,  # 1 of 2 cited
+        correct_abstention=False,
+        valid_cited_ids=[119],
+        is_joint_supporting=True,
+        expected_supporting_ids=[119, 117],
+    )
+    assert cls == "FN"
+
+
+# 6. Correct answer with all joint citations -> TP.
+def test_task58_all_joint_citations_yields_tp():
+    cls = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,  # Both cited
+        correct_abstention=False,
+        valid_cited_ids=[119, 117],
+        is_joint_supporting=True,
+        expected_supporting_ids=[119, 117],
+    )
+    assert cls == "TP"
+
+
+# 7. Unanswerable query correctly abstained -> TN.
+def test_task58_unanswerable_correctly_abstained_yields_tn():
+    cls = classify_case_outcome(
+        expected_answerable=False,
+        target_in_final_evidence=True,
+        semantic_answer_correct=False,
+        exact_fact_preserved=None,
+        qualifier_preserved=None,
+        grounded=False,
+        attribution_precision=None,
+        attribution_recall=None,
+        correct_abstention=True,
+        valid_cited_ids=[],
+        invalid_cited_ids=[],
+    )
+    assert cls == "TN"
+
+
+# 8. Unanswerable query answered -> FP.
+def test_task58_unanswerable_answered_yields_fp():
+    cls = classify_case_outcome(
+        expected_answerable=False,
+        target_in_final_evidence=True,
+        semantic_answer_correct=False,
+        exact_fact_preserved=None,
+        qualifier_preserved=None,
+        grounded=False,
+        attribution_precision=0.0,
+        attribution_recall=0.0,
+        correct_abstention=False,
+        valid_cited_ids=[110],
+        invalid_cited_ids=[],
+    )
+    assert cls == "FP"
+
+
+# 9. Required scoring field missing -> explicit scoring-contract error.
+def test_task58_missing_required_scoring_field_raises_error():
+    # Missing exact_fact_preserved
+    with pytest.raises(ScoringContractError) as exc_info:
+        classify_case_outcome(
+            expected_answerable=True,
+            target_in_final_evidence=True,
+            semantic_answer_correct=True,
+            grounded=True,
+            attribution_precision=1.0,
+            attribution_recall=1.0,
+            correct_abstention=False,
+            valid_cited_ids=[102],
+            exact_fact_preserved=None,
+            qualifier_preserved=True,
+        )
+    assert "exact_fact_preserved" in str(exc_info.value)
+
+    # Missing qualifier_preserved
+    with pytest.raises(ScoringContractError) as exc_info2:
+        classify_case_outcome(
+            expected_answerable=True,
+            target_in_final_evidence=True,
+            semantic_answer_correct=True,
+            grounded=True,
+            attribution_precision=1.0,
+            attribution_recall=1.0,
+            correct_abstention=False,
+            valid_cited_ids=[102],
+            exact_fact_preserved=True,
+            qualifier_preserved=None,
+        )
+    assert "qualifier_preserved" in str(exc_info2.value)
+
+    # Legacy compatibility function does NOT raise
+    legacy_cls = classify_case_outcome_legacy(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[102],
+    )
+    assert legacy_cls == "TP"
+
+
+# 10. Case without a qualifier requirement -> no false failure.
+def test_task58_case_without_qualifier_requirement_no_false_failure():
+    # CASE-01: Location question, no special qualifier
+    res = evaluate_exact_facts_and_qualifiers("CASE-01-Terse-Location", "In Vault 9", ["Vault 9"])
+    assert res["semantic_answer_correct"] is True
+    assert res["exact_fact_preserved"] is True
+    assert res["qualifier_preserved"] is True
+
+    cls = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=res["semantic_answer_correct"],
+        exact_fact_preserved=res["exact_fact_preserved"],
+        qualifier_preserved=res["qualifier_preserved"],
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[102],
+    )
+    assert cls == "TP"
+
+
+# 11. CASE-02: 9pm and 9 PM remain equivalent.
+def test_task58_case02_time_normalization():
+    # 9pm vs 9 PM
+    assert is_time_equivalent("The deployment is scheduled for 9 PM.", "9pm") is True
+    assert is_time_equivalent("The deployment is scheduled for 9pm.", "9 PM") is True
+    assert is_time_equivalent("Scheduled for 21:00 tonight.", "9pm") is True
+    # Different times remain distinct
+    assert is_time_equivalent("Scheduled for 8 PM.", "9pm") is False
+    assert is_time_equivalent("Scheduled for 9 AM.", "9pm") is False
+
+    res = evaluate_exact_facts_and_qualifiers("CASE-02-Short-Time", "Scheduled for 9 PM", ["9pm", "9:00", "21:00"])
+    assert res["semantic_answer_correct"] is True
+    assert res["exact_fact_preserved"] is True
+    assert res["qualifier_preserved"] is True
+
+
+# 12. CASE-04: "finished successfully" does not satisfy "completely clean" or explicit zero-error confirmation.
+def test_task58_case04_qualifier_discrimination():
+    ans_without_qualifier = "The database migration script finished successfully on staging as confirmed by Dev_Sarah [ID 108]."
+    res_without = evaluate_exact_facts_and_qualifiers("CASE-04-Yes-No-Confirmation", ans_without_qualifier, ["yes", "clean", "succeed"])
+    assert res_without["semantic_answer_correct"] is True
+    assert res_without["qualifier_preserved"] is False
+    assert res_without["exact_fact_preserved"] is False
+
+    cls_without = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=res_without["semantic_answer_correct"],
+        exact_fact_preserved=res_without["exact_fact_preserved"],
+        qualifier_preserved=res_without["qualifier_preserved"],
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[108],
+    )
+    assert cls_without == "FN", "Omission of 'completely clean' qualifier must classify as FN"
+
+    # Answer WITH qualifier
+    ans_with_qualifier = "Yes, the database migration finished completely clean on staging [ID 108]."
+    res_with = evaluate_exact_facts_and_qualifiers("CASE-04-Yes-No-Confirmation", ans_with_qualifier, ["yes", "clean", "succeed"])
+    assert res_with["semantic_answer_correct"] is True
+    assert res_with["qualifier_preserved"] is True
+    assert res_with["exact_fact_preserved"] is True
+
+    cls_with = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=res_with["semantic_answer_correct"],
+        exact_fact_preserved=res_with["exact_fact_preserved"],
+        qualifier_preserved=res_with["qualifier_preserved"],
+        grounded=True,
+        attribution_precision=1.0,
+        attribution_recall=1.0,
+        correct_abstention=False,
+        valid_cited_ids=[108],
+    )
+    assert cls_with == "TP", "Retention of 'completely clean' qualifier satisfies exact fact and yields TP"
+
+
+# 13. CASE-03: factual support [106] is distinguished from contextual message [105].
+def test_task58_case03_distractor_attribution():
+    from run_dialogue_evidence_live import EVAL_CASES
+    case03 = next(c for c in EVAL_CASES if c.case_id == "CASE-03-Pronoun-Anaphora")
+    assert case03.expected_supporting_ids == [106]
+
+    # Only 106 cited -> precision 1.0, recall 1.0 -> TP
+    prec_clean, rec_clean = evaluate_citation_attribution(
+        is_answerable=True,
+        valid_cited_ids=[106],
+        expected_supporting_ids=case03.expected_supporting_ids,
+        support_semantics="joint",
+    )
+    assert prec_clean == 1.0
+    assert rec_clean == 1.0
+    cls_clean = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=prec_clean,
+        attribution_recall=rec_clean,
+        correct_abstention=False,
+        valid_cited_ids=[106],
+        expected_supporting_ids=case03.expected_supporting_ids,
+    )
+    assert cls_clean == "TP"
+
+    # Contextual message [105] also cited -> precision 0.5 (< 1.0) -> FN
+    prec_polluted, rec_polluted = evaluate_citation_attribution(
+        is_answerable=True,
+        valid_cited_ids=[106, 105],
+        expected_supporting_ids=case03.expected_supporting_ids,
+        support_semantics="joint",
+    )
+    assert prec_polluted == 0.5
+    cls_polluted = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=prec_polluted,
+        attribution_recall=rec_polluted,
+        correct_abstention=False,
+        valid_cited_ids=[106, 105],
+        expected_supporting_ids=case03.expected_supporting_ids,
+    )
+    assert cls_polluted == "FN"
+
+
+# 14. CASE-09: both [117] and [119] remain mandatory.
+def test_task58_case09_joint_citations_mandatory():
+    from run_dialogue_evidence_live import EVAL_CASES
+    case09 = next(c for c in EVAL_CASES if c.case_id == "CASE-09-Multi-Message-Exchange")
+    assert set(case09.expected_supporting_ids) == {117, 119}
+    assert getattr(case09, "support_semantics", "joint") == "joint"
+
+    # Citing only 119 -> recall 0.5 -> FN
+    prec_partial, rec_partial = evaluate_citation_attribution(
+        is_answerable=True,
+        valid_cited_ids=[119],
+        expected_supporting_ids=case09.expected_supporting_ids,
+        support_semantics="joint",
+    )
+    assert prec_partial == 1.0
+    assert rec_partial == 0.5
+    cls_partial = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=prec_partial,
+        attribution_recall=rec_partial,
+        correct_abstention=False,
+        valid_cited_ids=[119],
+        is_joint_supporting=True,
+        expected_supporting_ids=case09.expected_supporting_ids,
+    )
+    assert cls_partial == "FN"
+
+    # Citing both 117 and 119 -> recall 1.0 -> TP
+    prec_full, rec_full = evaluate_citation_attribution(
+        is_answerable=True,
+        valid_cited_ids=[117, 119],
+        expected_supporting_ids=case09.expected_supporting_ids,
+        support_semantics="joint",
+    )
+    assert prec_full == 1.0
+    assert rec_full == 1.0
+    cls_full = classify_case_outcome(
+        expected_answerable=True,
+        target_in_final_evidence=True,
+        semantic_answer_correct=True,
+        exact_fact_preserved=True,
+        qualifier_preserved=True,
+        grounded=True,
+        attribution_precision=prec_full,
+        attribution_recall=rec_full,
+        correct_abstention=False,
+        valid_cited_ids=[117, 119],
+        is_joint_supporting=True,
+        expected_supporting_ids=case09.expected_supporting_ids,
+    )
+    assert cls_full == "TP"
 

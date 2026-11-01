@@ -83,20 +83,23 @@ def evaluate_exact_facts_and_qualifiers(
     
     For CASE-02-Short-Time:
       - Compares emitted answer with expected time using time-equivalence normalization (e.g. '9 PM' == '9pm').
+      - Qualifier requirement is satisfied (no special qualifier required).
     For CASE-04-Yes-No-Confirmation:
       - Evaluates whether answer affirmatively answers success query ('responds_to_success').
-      - Separately evaluates whether meaningful qualifier 'completely clean' is retained ('preserves_qualifier').
+      - Separately evaluates whether meaningful qualifier 'completely clean' (or explicit zero-error confirmation)
+        is retained ('preserves_qualifier').
       - Does NOT automatically count 'finished successfully' as exact-fact preservation when
         the target message contains 'completely clean'.
     For other cases:
       - Evaluates substring keyword presence.
+      - Qualifier requirement is explicitly reported as satisfied (True) rather than leaving an ambiguous missing value.
     """
     ans_lower = answer.lower()
     result = {
         "legacy_keyword_matched": any(kw.lower() in ans_lower for kw in expected_keywords) if expected_keywords else None,
         "semantic_answer_correct": False,
         "exact_fact_preserved": False,
-        "qualifier_preserved": None,
+        "qualifier_preserved": True,
         "notes": "",
     }
 
@@ -105,6 +108,7 @@ def evaluate_exact_facts_and_qualifiers(
         matched_time = any(is_time_equivalent(answer, kw) for kw in expected_keywords)
         result["semantic_answer_correct"] = matched_time
         result["exact_fact_preserved"] = matched_time
+        result["qualifier_preserved"] = True
         result["notes"] = "Time-equivalence normalized (e.g., '9 PM' equivalent to '9pm')."
 
     elif case_id == "CASE-04-Yes-No-Confirmation":
@@ -120,14 +124,22 @@ def evaluate_exact_facts_and_qualifiers(
         responds_to_success = any(re.search(pat, ans_lower) is not None for pat in affirmative_patterns)
         result["semantic_answer_correct"] = responds_to_success
 
-        # Check qualifier 'completely clean'
-        has_qualifier = "completely clean" in ans_lower or ("clean" in ans_lower and "yes" in ans_lower)
+        # Check qualifier 'completely clean' or explicit zero-error confirmation
+        clean_patterns = [
+            r"\bcompletely clean\b",
+            r"\bclean\b",
+            r"\bwithout\s+(?:any\s+)?errors?\b",
+            r"\bzero\s+errors?\b",
+            r"\bno\s+errors?\b",
+            r"\b0\s+errors?\b",
+        ]
+        has_qualifier = any(re.search(pat, ans_lower) is not None for pat in clean_patterns)
         result["qualifier_preserved"] = has_qualifier
-        result["exact_fact_preserved"] = has_qualifier
+        result["exact_fact_preserved"] = bool(responds_to_success and has_qualifier)
         if responds_to_success and not has_qualifier:
-            result["notes"] = "Responded to success query, but omitted specific qualifier 'completely clean'."
+            result["notes"] = "Responded to success query, but omitted specific qualifier 'completely clean' or zero-error confirmation."
         elif has_qualifier:
-            result["notes"] = "Preserved both success response and 'completely clean' qualifier."
+            result["notes"] = "Preserved both success response and 'completely clean'/zero-error qualifier."
         else:
             result["notes"] = "Did not confirm database migration success."
 
@@ -137,9 +149,11 @@ def evaluate_exact_facts_and_qualifiers(
             matched = any(kw.lower() in ans_lower for kw in expected_keywords)
             result["semantic_answer_correct"] = matched
             result["exact_fact_preserved"] = matched
+            result["qualifier_preserved"] = True
         else:
             result["semantic_answer_correct"] = True
             result["exact_fact_preserved"] = True
+            result["qualifier_preserved"] = True
 
     return result
 
@@ -241,6 +255,11 @@ def evaluate_citation_attribution(
 # 3. CANONICAL CONFUSION MATRIX CLASSIFICATION
 # ============================================================================
 
+class ScoringContractError(ValueError):
+    """Raised when mandatory evaluation scoring fields are missing under the strict scoring contract."""
+    pass
+
+
 def classify_case_outcome(
     expected_answerable: bool,
     target_in_final_evidence: bool,
@@ -255,22 +274,27 @@ def classify_case_outcome(
     is_joint_supporting: bool = False,
     expected_supporting_ids: Optional[List[int]] = None,
     require_full_recall: bool = False,
+    exact_fact_preserved: Optional[bool] = None,
+    qualifier_preserved: Optional[bool] = None,
+    strict_fidelity: bool = True,
 ) -> str:
     """
     Single, documented, deterministic classification function across all evaluation paths:
       - 'TP' (True Positive): Answerable query with retrieval success (target in evidence),
-                              semantic answer correctness, groundedness, and full valid attribution
+                              semantic answer correctness, exact required fact preservation,
+                              required qualifier preservation, groundedness, and full valid attribution
                               (attribution_precision == 1.0, and attribution_recall satisfying completeness:
                                full recall == 1.0 for jointly necessary multi-message support, or recall > 0.0).
-                              A correct answer with an unsupported or misattributed citation
-                              does NOT qualify as a TP (classified as FN).
+                              A correct answer that omits a required fact or qualifier, or includes
+                              an unsupported citation, does NOT qualify as a TP (classified as FN).
                               Missing any jointly necessary supporting message prevents full TP credit.
       - 'TN' (True Negative): Unanswerable query where the system appropriately abstains
                               with zero citations.
       - 'FP' (False Positive): Unanswerable query where the system asserts an answer or
                                emits citations (even to distractors).
       - 'FN' (False Negative): Answerable query where the system fails on any required dimension
-                               (retrieval failure, semantic error, ungroundedness, or misattribution).
+                               (retrieval failure, semantic error, fact omission, qualifier omission,
+                                ungroundedness, or misattribution).
       - 'UNCERTAIN': The evaluation record is ungradable, missing, or indeterminate.
     """
     if is_uncertain:
@@ -284,11 +308,19 @@ def classify_case_outcome(
             return "TN"
         return "FP"
     else:
-        # Answerable query: all 4 pillars required for full TP
-        # 1. Retrieval evidence recall
-        # 2. Semantic answer correctness
-        # 3. Groundedness
-        # 4. Valid attribution without misattribution
+        # Answerable query
+        if strict_fidelity:
+            if exact_fact_preserved is None:
+                raise ScoringContractError("Missing mandatory scoring field 'exact_fact_preserved' for answerable case under strict contract.")
+            if qualifier_preserved is None:
+                raise ScoringContractError("Missing mandatory scoring field 'qualifier_preserved' for answerable case under strict contract.")
+            if semantic_answer_correct is None:
+                raise ScoringContractError("Missing mandatory scoring field 'semantic_answer_correct' for answerable case under strict contract.")
+            if target_in_final_evidence is None:
+                raise ScoringContractError("Missing mandatory scoring field 'target_in_final_evidence' for answerable case under strict contract.")
+            if grounded is None:
+                raise ScoringContractError("Missing mandatory scoring field 'grounded' for answerable case under strict contract.")
+
         # For jointly necessary multi-message support, all required messages must be cited (recall == 1.0).
         needs_complete_recall = (
             is_joint_supporting
@@ -300,14 +332,62 @@ def classify_case_outcome(
         else:
             recall_ok = (attribution_recall is not None and attribution_recall > 0.0)
 
-        is_tp = (
-            target_in_final_evidence
-            and semantic_answer_correct
-            and grounded
-            and recall_ok
-            and (attribution_precision is not None and attribution_precision == 1.0)
-        )
+        if strict_fidelity:
+            is_tp = (
+                target_in_final_evidence
+                and semantic_answer_correct
+                and exact_fact_preserved
+                and qualifier_preserved
+                and grounded
+                and recall_ok
+                and (attribution_precision is not None and attribution_precision == 1.0)
+            )
+        else:
+            # Legacy compatibility path (semantic-only)
+            is_tp = (
+                target_in_final_evidence
+                and semantic_answer_correct
+                and grounded
+                and recall_ok
+                and (attribution_precision is not None and attribution_precision == 1.0)
+            )
         return "TP" if is_tp else "FN"
+
+
+def classify_case_outcome_legacy(
+    expected_answerable: bool,
+    target_in_final_evidence: bool,
+    semantic_answer_correct: bool,
+    grounded: bool,
+    attribution_precision: Optional[float],
+    attribution_recall: Optional[float],
+    correct_abstention: bool,
+    valid_cited_ids: List[int],
+    invalid_cited_ids: Optional[List[int]] = None,
+    is_uncertain: bool = False,
+    is_joint_supporting: bool = False,
+    expected_supporting_ids: Optional[List[int]] = None,
+    require_full_recall: bool = False,
+) -> str:
+    """Explicitly named legacy compatibility path for callers that do not use the strict fidelity contract."""
+    return classify_case_outcome(
+        expected_answerable=expected_answerable,
+        target_in_final_evidence=target_in_final_evidence,
+        semantic_answer_correct=semantic_answer_correct,
+        grounded=grounded,
+        attribution_precision=attribution_precision,
+        attribution_recall=attribution_recall,
+        correct_abstention=correct_abstention,
+        valid_cited_ids=valid_cited_ids,
+        invalid_cited_ids=invalid_cited_ids,
+        is_uncertain=is_uncertain,
+        is_joint_supporting=is_joint_supporting,
+        expected_supporting_ids=expected_supporting_ids,
+        require_full_recall=require_full_recall,
+        exact_fact_preserved=None,
+        qualifier_preserved=None,
+        strict_fidelity=False,
+    )
 
 
 # ============================================================================
@@ -674,6 +754,8 @@ def reconcile_task46_log_to_post_hoc_audit(
                 is_uncertain=(classification == "UNCERTAIN"),
                 is_joint_supporting=(len(expected_supporting) > 1),
                 expected_supporting_ids=expected_supporting,
+                exact_fact_preserved=fact_info["exact_fact_preserved"],
+                qualifier_preserved=fact_info["qualifier_preserved"],
             )
 
             rec_dict = {
@@ -831,6 +913,16 @@ def reconcile_task46_post_hoc_audit_to_clarified_contract(
 
             # Canonical confusion matrix classification
             rec["correct_abstention"] = (not c_ans and len(vc) == 0 and len(inv) == 0)
+            exact_fact = rec.get("exact_fact_preserved")
+            qual_pres = rec.get("qualifier_preserved")
+            if c_ans and qual_pres is None:
+                qual_pres = True if rec.get("case_id") != "CASE-04-Yes-No-Confirmation" else False
+            if c_ans and exact_fact is None:
+                exact_fact = bool(rec.get("semantic_answer_correct", False) and qual_pres)
+
+            rec["exact_fact_preserved"] = exact_fact
+            rec["qualifier_preserved"] = qual_pres
+
             rec["classification"] = classify_case_outcome(
                 expected_answerable=c_ans,
                 target_in_final_evidence=rec.get("target_in_final_evidence", False),
@@ -844,6 +936,8 @@ def reconcile_task46_post_hoc_audit_to_clarified_contract(
                 is_uncertain=(rec.get("classification") == "UNCERTAIN"),
                 is_joint_supporting=(len(exp) > 1),
                 expected_supporting_ids=exp,
+                exact_fact_preserved=exact_fact,
+                qualifier_preserved=qual_pres,
             )
             target_list.append(rec)
 

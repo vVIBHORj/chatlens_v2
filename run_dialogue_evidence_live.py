@@ -666,6 +666,7 @@ class CaseModeRunResult:
     attribution_recall: Optional[float] = None
     citation_validity: Optional[float] = None
     exact_fact_preserved: Optional[bool] = None
+    qualifier_preserved: Optional[bool] = None
     semantic_answer_correct: Optional[bool] = None
 
     # Classification & Pass Status
@@ -755,6 +756,7 @@ def evaluate_run_metrics(res: CaseModeRunResult, case: EvalCase):
     )
     res.semantic_answer_correct = fact_eval["semantic_answer_correct"]
     res.exact_fact_preserved = fact_eval["exact_fact_preserved"]
+    res.qualifier_preserved = fact_eval.get("qualifier_preserved", True)
 
     # Abstention correctness
     has_citations = bool(res.valid_cited_ids or res.invalid_cited_ids)
@@ -777,6 +779,8 @@ def evaluate_run_metrics(res: CaseModeRunResult, case: EvalCase):
         invalid_cited_ids=res.invalid_cited_ids,
         is_joint_supporting=is_joint,
         expected_supporting_ids=case.expected_supporting_ids,
+        exact_fact_preserved=res.exact_fact_preserved,
+        qualifier_preserved=res.qualifier_preserved,
     )
     res.passed = (res.classification in ("TP", "TN"))
 

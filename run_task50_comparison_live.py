@@ -130,6 +130,7 @@ class CaseExecutionRecord:
     # Classification & Accuracy
     semantic_answer_correct: bool = False
     exact_fact_preserved: Optional[bool] = None
+    qualifier_preserved: Optional[bool] = None
     classification: str = "UNKNOWN"  # TP, FP, TN, FN
     passed: bool = False
 
@@ -233,6 +234,7 @@ def evaluate_case_record(record: CaseExecutionRecord, case: EvalCase) -> None:
     )
     record.semantic_answer_correct = bool(fact_eval["semantic_answer_correct"])
     record.exact_fact_preserved = fact_eval["exact_fact_preserved"]
+    record.qualifier_preserved = fact_eval.get("qualifier_preserved", True)
 
     # Canonical confusion matrix classification
     is_joint = (support_semantics == "joint") and (len(case.expected_supporting_ids) > 1)
@@ -248,6 +250,8 @@ def evaluate_case_record(record: CaseExecutionRecord, case: EvalCase) -> None:
         invalid_cited_ids=record.invalid_cited_ids,
         is_joint_supporting=is_joint,
         expected_supporting_ids=case.expected_supporting_ids,
+        exact_fact_preserved=record.exact_fact_preserved,
+        qualifier_preserved=record.qualifier_preserved,
     )
     record.passed = (record.classification in ("TP", "TN"))
 

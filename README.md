@@ -31,6 +31,9 @@
 - [📊 Live Comparative Evaluation: Dialogue Evidence vs. Contextual Grading (Task 44)](#-live-comparative-evaluation-dialogue-evidence-vs-contextual-grading-task-44)
 - [📊 Task 50 Live Comparative Evaluation: Production Baseline vs. Contextual Grading V1](#-task-50-live-comparative-evaluation-production-baseline-vs-contextual-grading-v1)
 - [🔬 Task 51 & 52: Grader Prompt Audit & Reproducible Static Evidence Cache](#-task-51--52-grader-prompt-audit--reproducible-static-evidence-cache)
+- [📊 Tasks 53–56: Grader Prompt Diagnostic & Paired End-to-End Live Evaluation](#-tasks-5356-grader-prompt-diagnostic--paired-end-to-end-live-evaluation)
+- [⚖️ Tasks 57 & 58: Evaluation Integrity Audit & Strict Fact-Fidelity Scoring Contract](#️-tasks-57--58-evaluation-integrity-audit--strict-fact-fidelity-scoring-contract)
+- [🔍 Task 59: Benchmark Provenance & Critical Data-Path Integrity Audit](#-task-59-benchmark-provenance--critical-data-path-integrity-audit)
 - [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
 - [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
 - [🧭 Deterministic Query Routing](#-deterministic-query-routing)
@@ -536,6 +539,59 @@ Tasks 51 and 52 investigated the false positive profile of Contextual Grading V1
 
 ---
 
+## 📊 Tasks 53–56: Grader Prompt Diagnostic & Paired End-to-End Live Evaluation
+
+### Task 53: Grader Prompt Diagnostic on Frozen Candidates
+Task 53 conducted an isolated diagnostic comparison between the **Existing Contextual Grader Prompt (Prompt A / Condition A)** and a **Revised Grader Prompt (Prompt B / Condition B)** using the frozen 69-candidate evidence cache from Task 52.
+- **Diagnostic Findings**: Prompt B reduced false-positive evidence retention on unanswerable queries (`CASE-08`, `CASE-010`, `CASE-011`) while retaining 100% of required facts on answerable cases.
+- **Runner**: [`run_task53_grader_comparison.py`](run_task53_grader_comparison.py)
+
+### Tasks 54 & 55: Operational Metrics & Candidate Necessity Audits
+- **Task 54**: Audited false-alarm rates, candidate rejection rates, and operational latency across the 12 canonical cases.
+- **Task 55**: Verified candidate necessity, confirming that all filtered candidates were genuine distractors and that no critical supporting messages were rejected.
+
+### Task 56: Paired Live End-to-End Comparison (Condition A vs. Condition B)
+Task 56 executed a live, paired end-to-end evaluation across all 12 canonical benchmark cases within an 84-call hard ceiling, evaluating whether the evidence filtering gains of Condition B translated into superior end-to-end question answering and hallucination resistance.
+- **Evidence Filtering Gains**: Condition B reduced retained evidence units from 43 to 19 (**-55.8% reduction**) and achieved clean unanswerable context rejection on 3 of 5 unanswerable cases (`CASE-05`, `CASE-07`, `CASE-010`).
+- **Groundedness Bypass on Empty Context**: For the 3 clean abstentions where 0 units were retained, Condition B safely bypassed groundedness verification, saving 3 LLM calls (33 vs 36).
+- **Generator Resistance Bottleneck**: Despite cleaner context, remaining distractors in `CASE-08` and `CASE-011` still induced hallucinated citations in the generator, and joint synthesis failed in `CASE-09`. Both conditions achieved identical end-to-end legacy accuracy (75.0% / 9/12).
+- **Runner**: [`run_task56_comparison_live.py`](run_task56_comparison_live.py)
+
+---
+
+## ⚖️ Tasks 57 & 58: Evaluation Integrity Audit & Strict Fact-Fidelity Scoring Contract
+
+### Task 57: Integrity & Scoring Diagnosis
+An exhaustive audit of the Task 56 live evaluation identified an unearned True Positive credit in `CASE-04` (*"Did the database migration script finish without any errors?"*):
+- The model generated `"finished successfully"` but omitted the mandatory cleanliness qualifier (`"completely clean"`).
+- `evaluate_exact_facts_and_qualifiers()` detected the omission (`exact_fact_preserved=False`), but `classify_case_outcome()` evaluated only coarse `semantic_answer_correct=True`, erroneously classifying `CASE-04` as `TP`.
+
+### Task 58: Strict Answer-Fidelity Scoring Contract Synchronization
+Task 58 synchronized the scoring contract across [`evaluation_scoring.py`](evaluation_scoring.py) and all active runners:
+1. **Strict Fidelity Contract (`strict_fidelity=True`)**: Answerable cases require `semantic_answer_correct=True`, `exact_fact_preserved=True`, `qualifier_preserved=True`, `grounded=True`, `attribution_recall=1.0`, and `attribution_precision=1.0`. Any missing fidelity field raises `ScoringContractError(ValueError)`.
+2. **Explicit Qualification Default**: For benchmark cases with no special condition, `qualifier_preserved` defaults explicitly to `True` rather than `None`.
+3. **Legacy Compatibility Path**: Callers requiring coarse semantic scoring can invoke `classify_case_outcome_legacy()` or set `strict_fidelity=False`.
+4. **All Runners Synchronized**: `run_dialogue_evidence_live.py`, `run_task46_comparison_live.py`, `run_task50_comparison_live.py`, and `run_task56_comparison_live.py` were updated to pass exact-fact and qualifier booleans.
+5. **Re-scored Task 56 Benchmark**:
+   - Reclassifying `CASE-04` from `TP` to `FN` adjusted the strict end-to-end accuracy of both Condition A and Condition B from **75.00% (9/12)** to **66.67% (8/12)** (5 TP, 2 FN, 3 TN, 2 FP).
+   - Reconciled citation discrepancies: confirmed `CASE-011` cited strictly `[123]` (never `[124]`), and `CASE-08` cited `[115, 116]`.
+6. **Test Suite**: Added 14 unit tests to [`test_evaluation_scoring.py`](test_evaluation_scoring.py) (46 passing tests).
+
+---
+
+## 🔍 Task 59: Benchmark Provenance & Critical Data-Path Integrity Audit
+
+Task 59 conducted a read-only audit of Task 58 and evaluated four critical data-path and parsing findings:
+1. **Benchmark Provenance Verified**: Reconciled Task 58 JSON audit and Markdown report against the raw Task 56 trace, confirming 100% bitwise parity on queries, answers, ground-truth supporting IDs, and cited IDs across all 12 canonical cases.
+2. **Path Propagation vs. Sandbox Isolation**:
+   - Confirmed a defect in the public API `rag_graph.ask(database_path=...)`: `retrieve()` fails to pass `database_path` down to `hybrid_search()`, causing non-sandboxed custom queries to fall back to `./chat_data.db` and `./chroma_db`.
+   - Verified that historical evaluations were **100% isolated** because `SafeEvaluationSandbox` monkeypatched module globals and loaders in memory.
+3. **Date Parser Inversion**: Confirmed `parser.py:DATE_FORMATS` prioritizes `%m/%d/%y` over `%d/%m/%y`, causing days 1–12 of non-US exports to be parsed as Month/Day, creating artificial 40-day chronological jumps within the same chat.
+4. **Same-Minute Context Drop**: Confirmed `chat_database.py:get_chronological_context` uses strict `<` and `>`, dropping adjacent sibling messages sent in the exact same minute.
+5. **Bare Bracket Citation Parsing**: Confirmed `rag_graph.py:extract_answer_citations` strictly requires `[ID ...]`, ignoring bare numeric brackets `[123]`.
+
+---
+
 ## 🔎 Dual-Level Hybrid Retrieval Engine
 
 ChatLens rejects simple vector search in favor of a 3-way hybrid retrieval and evidence-scoring architecture that balances semantic nuance with keyword precision:
@@ -915,14 +971,12 @@ ChatLens-RAG/
 ├── run_context_grading_live.py        # Safe live evaluation runner with runtime budget enforcement
 ├── run_dialogue_evidence_live.py      # Live dialogue evidence evaluation runner (Mode A)
 ├── run_task44_comparison_live.py      # Task 44 live paired comparison runner (Mode A vs Mode B)
-- [x] Canonical evaluation metric contract separating citation validity from attribution and defining joint support (Tasks 48-49).
-- [x] Task 50 live paired comparison confirming Contextual Grading V1 +25.0% accuracy improvement (66.7% vs 41.7%) and 100% evidence recall.
-- [x] Task 51 fail-closed preflight audit identifying missing candidate text payloads in historical artifacts.
-- [x] Task 52 reproducible static evidence cache with 10-point invariant validation and non-leaking evaluation capture.
-├── run_task46_comparison_live.py     # Task 46 live paired comparison runner (V1 vs V2)
-├── run_task50_comparison_live.py     # Task 50 live paired comparison runner (Baseline vs Contextual V1)
-├── evaluation_scoring.py             # Canonical evaluation scoring & audit engine (Tasks 48/49)
-├── evidence_cache.py                 # Static evidence cache builder and 10-point validator (Task 52)
+├── run_task46_comparison_live.py      # Task 46 live paired comparison runner (V1 vs V2)
+├── run_task50_comparison_live.py      # Task 50 live paired comparison runner (Baseline vs Contextual V1)
+├── run_task53_grader_comparison.py    # Task 53 prompt diagnostic comparison runner (frozen candidates)
+├── run_task56_comparison_live.py      # Task 56 live paired comparison runner (Condition A vs B)
+├── evaluation_scoring.py              # Strict fact-fidelity scoring contract & audit engine (Tasks 48, 58)
+├── evidence_cache.py                  # Static evidence cache builder and 10-point validator (Task 52)
 │
 ├── test_contextual_grading_pipeline.py# 23 offline tests for Task 43 contextual grading prototype
 ├── test_contextual_grading_v2.py     # 25 offline tests for Contextual Grading V2
@@ -1130,6 +1184,16 @@ python benchmark_suite.py
 - [x] Live dialogue-evidence evaluation harness and baseline benchmark on local Ollama models (Task 42).
 - [x] Opt-in contextual grading after evidence assembly prototype (`retrieval_strategy="contextual_grading"`) with 23 offline unit and pipeline tests (Task 43 / Mode B).
 - [x] Task 44 live paired comparison between Dialogue Evidence and Contextual Grading within 84-call budget, confirming 100% terse recall and +20% abstention improvement on unanswerable queries.
+- [x] Canonical evaluation metric contract separating citation validity from attribution and defining joint support (Tasks 48-49).
+- [x] Task 50 live paired comparison confirming Contextual Grading V1 +25.0% accuracy improvement (66.7% vs 41.7%) and 100% evidence recall.
+- [x] Task 51 fail-closed preflight audit identifying missing candidate text payloads in historical artifacts.
+- [x] Task 52 reproducible static evidence cache with 10-point invariant validation and non-leaking evaluation capture.
+- [x] Task 53 diagnostic evaluation of revised contextual grader prompt on frozen candidates.
+- [x] Tasks 54 & 55 operational metrics and candidate necessity audit of evidence filtering.
+- [x] Task 56 paired live end-to-end evaluation confirming 55.8% evidence reduction and identical 75.0% legacy / 66.67% strict accuracy.
+- [x] Task 57 evaluation integrity audit diagnosing CASE-04 qualifier omission.
+- [x] Task 58 strict fact-fidelity scoring contract synchronization, legacy fallback, and 46 unit tests.
+- [x] Task 59 read-only benchmark provenance, custom path propagation, date parser, and citation integrity audit.
 
 ### 🚀 Upcoming Roadmap
 - [ ] Add streaming response token generation in the Streamlit UI.

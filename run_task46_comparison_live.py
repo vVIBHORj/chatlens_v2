@@ -137,6 +137,8 @@ class CaseExecutionRecord:
     classification: str = "UNKNOWN"  # TP, FP, TN, FN
     passed: bool = False
     exact_fact_preserved: Optional[bool] = None
+    qualifier_preserved: Optional[bool] = None
+    semantic_answer_correct: Optional[bool] = None
 
     # Telemetry
     latency_seconds: float = 0.0
@@ -222,14 +224,16 @@ def evaluate_case_record(record: CaseExecutionRecord, case: EvalCase) -> None:
         answer=record.answer,
         expected_keywords=case.expected_answer_keywords,
     )
+    record.semantic_answer_correct = bool(fact_eval["semantic_answer_correct"])
     record.exact_fact_preserved = fact_eval["exact_fact_preserved"]
+    record.qualifier_preserved = fact_eval.get("qualifier_preserved", True)
 
     # Canonical confusion matrix classification
     is_joint = (support_semantics == "joint") and (len(case.expected_supporting_ids) > 1)
     record.classification = classify_case_outcome(
         expected_answerable=case.expected_answerable,
         target_in_final_evidence=record.target_in_final_evidence,
-        semantic_answer_correct=bool(record.exact_fact_preserved),
+        semantic_answer_correct=record.semantic_answer_correct,
         grounded=record.grounded,
         attribution_precision=record.attribution_precision,
         attribution_recall=record.attribution_recall,
@@ -238,6 +242,8 @@ def evaluate_case_record(record: CaseExecutionRecord, case: EvalCase) -> None:
         invalid_cited_ids=record.invalid_cited_ids,
         is_joint_supporting=is_joint,
         expected_supporting_ids=case.expected_supporting_ids,
+        exact_fact_preserved=record.exact_fact_preserved,
+        qualifier_preserved=record.qualifier_preserved,
     )
     record.passed = (record.classification in ("TP", "TN"))
 

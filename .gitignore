@@ -32,6 +32,8 @@ eval_results/
 evaluation_reports/
 scratch/
 *.jsonl
+*.checkpoint*.json
+.checkpoint_*.json
 temp_*.py
 scratch_*.py
 inspect_*.py
