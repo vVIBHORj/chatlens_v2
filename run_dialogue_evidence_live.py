@@ -924,6 +924,7 @@ def execute_paired_evaluation(
                         question=case.query,
                         dialogue_evidence_mode=False,
                         database_path=str(env.db_path),
+                        persist_dir=str(env.chroma_path),
                     )
                     base_run.latency_seconds = round(time.time() - t0_base, 3)
                     base_run.llm_calls_made = budget_llm.total_attempted - calls_before_base
@@ -977,6 +978,7 @@ def execute_paired_evaluation(
                         question=case.query,
                         dialogue_evidence_mode=True,
                         database_path=str(env.db_path),
+                        persist_dir=str(env.chroma_path),
                     )
                     treat_run.latency_seconds = round(time.time() - t0_treat, 3)
                     treat_run.llm_calls_made = budget_llm.total_attempted - calls_before_treat

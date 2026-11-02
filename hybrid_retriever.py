@@ -10,6 +10,42 @@ from chat_database import search_messages
 
 
 # ============================================================
+# STORAGE CONFIGURATION & VALIDATION
+# ============================================================
+
+class StorageConfigurationError(ValueError):
+    """Raised when custom storage configuration is incomplete or invalid."""
+    pass
+
+
+def validate_storage_paths(
+    database_path: Optional[str] = None,
+    persist_dir: Optional[str] = None,
+) -> None:
+    """
+    Validate that custom storage paths are complete.
+
+    Validation Rules:
+      - Neither supplied (both None): preserve existing configured defaults.
+      - Both supplied: valid, explicit paths will be used throughout retrieval.
+      - Only one custom path supplied: fail early with StorageConfigurationError
+        before retrieval begins.
+
+    Do not create or initialize missing database or Chroma resources implicitly
+    as part of path resolution.
+    """
+    has_db = database_path is not None
+    has_persist = persist_dir is not None
+
+    if has_db != has_persist:
+        raise StorageConfigurationError(
+            "Incomplete custom storage configuration: both 'database_path' and 'persist_dir' "
+            f"must be provided when customizing storage paths, but received database_path={database_path!r} "
+            f"and persist_dir={persist_dir!r}."
+        )
+
+
+# ============================================================
 # CONFIG
 # ============================================================
 
@@ -335,9 +371,24 @@ def rrf_score(
 def semantic_message_search(
     query: str,
     top_k: int = MESSAGE_SEMANTIC_TOP_K,
+    persist_dir: Optional[str] = None,
 ):
+    """
+    Search individual messages by semantic similarity.
 
-    store = load_message_vectorstore()
+    Parameters
+    ----------
+    query : str
+        Semantic search query.
+    top_k : int
+        Number of candidate messages to retrieve.
+    persist_dir : Optional[str]
+        Explicit Chroma directory. If omitted, uses the configured default.
+    """
+    if persist_dir is not None:
+        store = load_message_vectorstore(persist_dir=persist_dir)
+    else:
+        store = load_message_vectorstore()
 
     return store.similarity_search_with_score(
         query,
@@ -353,12 +404,21 @@ def lexical_search(
     query: str,
     top_k: int = LEXICAL_TOP_K,
     query_terms: Optional[List[str]] = None,
+    database_path: Optional[str] = None,
 ):
     """
     Run SQLite lexical retrieval using expanded query terms.
 
-    The original query is preserved when no expanded terms
-    are provided.
+    Parameters
+    ----------
+    query : str
+        Search query.
+    top_k : int
+        Number of lexical candidates to retrieve.
+    query_terms : Optional[List[str]]
+        Expanded query terms.
+    database_path : Optional[str]
+        Explicit SQLite database path. If omitted, uses the configured default.
     """
 
     if query_terms:
@@ -369,6 +429,13 @@ def lexical_search(
         )
     else:
         lexical_query = query
+
+    if database_path is not None:
+        return search_messages(
+            lexical_query,
+            limit=top_k,
+            database_path=database_path,
+        )
 
     return search_messages(
         lexical_query,
@@ -383,9 +450,24 @@ def lexical_search(
 def semantic_chunk_search(
     query: str,
     top_k: int = CHUNK_TOP_K,
+    persist_dir: Optional[str] = None,
 ):
+    """
+    Search conversation chunks by semantic similarity.
 
-    store = load_chunk_vectorstore()
+    Parameters
+    ----------
+    query : str
+        Semantic search query.
+    top_k : int
+        Number of chunks to retrieve.
+    persist_dir : Optional[str]
+        Explicit Chroma directory. If omitted, uses the configured default.
+    """
+    if persist_dir is not None:
+        store = load_chunk_vectorstore(persist_dir=persist_dir)
+    else:
+        store = load_chunk_vectorstore()
 
     return store.similarity_search_with_score(
         query,
@@ -557,7 +639,33 @@ def hybrid_search(
     message_top_k: int = MESSAGE_SEMANTIC_TOP_K,
     lexical_top_k: int = LEXICAL_TOP_K,
     chunk_top_k: int = CHUNK_TOP_K,
+    database_path: Optional[str] = None,
+    persist_dir: Optional[str] = None,
 ):
+    """
+    Execute 3-way hybrid retrieval and evidence scoring.
+
+    Parameters
+    ----------
+    query : str
+        Natural language query.
+    message_top_k : int
+        Number of individual message candidates.
+    lexical_top_k : int
+        Number of lexical SQLite candidates.
+    chunk_top_k : int
+        Number of conversation chunk candidates.
+    database_path : Optional[str]
+        Explicit SQLite database path for lexical retrieval.
+    persist_dir : Optional[str]
+        Explicit Chroma persist directory for semantic message and chunk retrieval.
+
+    Raises
+    ------
+    StorageConfigurationError
+        If only one custom path is provided without the other.
+    """
+    validate_storage_paths(database_path=database_path, persist_dir=persist_dir)
 
     query_terms = extract_query_terms(query)
 
@@ -579,10 +687,17 @@ def hybrid_search(
     # 1. SEMANTIC RETRIEVAL
     # ========================================================
 
-    semantic_results = semantic_message_search(
-        semantic_query,
-        top_k=message_top_k,
-    )
+    if persist_dir is not None:
+        semantic_results = semantic_message_search(
+            semantic_query,
+            top_k=message_top_k,
+            persist_dir=persist_dir,
+        )
+    else:
+        semantic_results = semantic_message_search(
+            semantic_query,
+            top_k=message_top_k,
+        )
 
     # ========================================================
     # 2. PROCESS SEMANTIC RESULTS
@@ -664,11 +779,19 @@ def hybrid_search(
     # 3. LEXICAL RETRIEVAL
     # ========================================================
 
-    lexical_results = lexical_search(
-        query,
-        top_k=lexical_top_k,
-        query_terms=expanded_query_terms,
-    )
+    if database_path is not None:
+        lexical_results = lexical_search(
+            query,
+            top_k=lexical_top_k,
+            query_terms=expanded_query_terms,
+            database_path=database_path,
+        )
+    else:
+        lexical_results = lexical_search(
+            query,
+            top_k=lexical_top_k,
+            query_terms=expanded_query_terms,
+        )
 
     # ========================================================
     # 4. PROCESS LEXICAL RESULTS
@@ -862,10 +985,17 @@ def hybrid_search(
     # 9. CONVERSATION CHUNKS  (deduplicated by chunk_id)
     # ========================================================
 
-    chunk_results = semantic_chunk_search(
-        query,
-        top_k=chunk_top_k,
-    )
+    if persist_dir is not None:
+        chunk_results = semantic_chunk_search(
+            query,
+            top_k=chunk_top_k,
+            persist_dir=persist_dir,
+        )
+    else:
+        chunk_results = semantic_chunk_search(
+            query,
+            top_k=chunk_top_k,
+        )
 
     chunks = []
     seen_chunk_ids = set()

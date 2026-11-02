@@ -396,6 +396,7 @@ def execute_task46_comparison(
                         question=case.query,
                         retrieval_strategy=STRATEGY_CONTEXTUAL_GRADING,
                         database_path=str(env.db_path),
+                        persist_dir=str(env.chroma_path),
                         initial_rewrite_count=MAX_REWRITES,  # 0 rewrites permitted
                     )
                     rec_a.latency_seconds = round(time.time() - t0_a, 3)
@@ -470,6 +471,7 @@ def execute_task46_comparison(
                         question=case.query,
                         retrieval_strategy=STRATEGY_CONTEXTUAL_GRADING_V2,
                         database_path=str(env.db_path),
+                        persist_dir=str(env.chroma_path),
                         initial_rewrite_count=MAX_REWRITES,  # 0 rewrites permitted
                     )
                     rec_b.latency_seconds = round(time.time() - t0_b, 3)

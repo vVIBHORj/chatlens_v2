@@ -495,6 +495,7 @@ def execute_task56_comparison(
                             question=case.query,
                             retrieval_strategy=STRATEGY_CONTEXTUAL_GRADING,
                             database_path=str(env.db_path),
+                            persist_dir=str(env.chroma_path),
                             initial_rewrite_count=MAX_REWRITES,
                             capture_eval_evidence=True,
                         )
@@ -577,6 +578,7 @@ def execute_task56_comparison(
                             question=case.query,
                             retrieval_strategy=STRATEGY_CONTEXTUAL_GRADING,
                             database_path=str(env.db_path),
+                            persist_dir=str(env.chroma_path),
                             initial_rewrite_count=MAX_REWRITES,
                             capture_eval_evidence=True,
                         )

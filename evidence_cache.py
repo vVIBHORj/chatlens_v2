@@ -157,6 +157,8 @@ def build_evidence_cache(
                 message_top_k=20,
                 lexical_top_k=20,
                 chunk_top_k=5,
+                database_path=str(sandbox.db_path),
+                persist_dir=str(sandbox.chroma_path),
             )
             candidates = retrieval_res["candidates"]
             chunks = retrieval_res["chunks"]

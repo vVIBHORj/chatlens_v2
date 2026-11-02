@@ -103,7 +103,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.documents import Document
 from langgraph.graph import StateGraph, END
 
-from hybrid_retriever import hybrid_search
+from hybrid_retriever import hybrid_search, StorageConfigurationError, validate_storage_paths
 from analytics import build_style_profile
 from context_expander import assemble_dialogue_evidence_units
 
@@ -217,6 +217,7 @@ class GraphState(TypedDict, total=False):
     retrieval_strategy: Optional[str]
     grader_llm: Optional[Any]
     database_path: Optional[str]
+    persist_dir: Optional[str]
     embedding_function: Optional[Any]
     contextual_grading_decisions: Optional[List[Dict[str, Any]]]
     capture_eval_evidence: Optional[bool]
@@ -481,6 +482,7 @@ def expand_document_context(
 def keyword_retrieve(
     question: str,
     limit: int = KEYWORD_TOP_K,
+    database_path: Optional[str] = None,
 ) -> List[Document]:
     """
     Retrieve exact/keyword matches from SQLite FTS5.
@@ -499,10 +501,17 @@ def keyword_retrieve(
         short expressions
     """
 
-    rows = search_messages(
-        question,
-        limit=limit,
-    )
+    if database_path is not None:
+        rows = search_messages(
+            question,
+            limit=limit,
+            database_path=database_path,
+        )
+    else:
+        rows = search_messages(
+            question,
+            limit=limit,
+        )
 
     documents = []
 
@@ -579,11 +588,18 @@ def retrieve(
         f"Question: {question}"
     )
 
+    database_path = state.get("database_path")
+    persist_dir = state.get("persist_dir")
+
+    validate_storage_paths(database_path=database_path, persist_dir=persist_dir)
+
     result = hybrid_search(
         question,
         message_top_k=20,
         lexical_top_k=20,
         chunk_top_k=5,
+        database_path=database_path,
+        persist_dir=persist_dir,
     )
 
     candidates = result["candidates"]
@@ -3197,6 +3213,7 @@ def ask(
     grader_llm: Optional[Any] = None,
     embedding_function: Optional[Any] = None,
     database_path: Optional[str] = None,
+    persist_dir: Optional[str] = None,
     initial_rewrite_count: int = 0,
     capture_eval_evidence: bool = False,
 ) -> dict:
@@ -3237,6 +3254,11 @@ def ask(
 
     database_path:
         Optional explicit database path for isolated environments.
+        If provided, persist_dir must also be provided.
+
+    persist_dir:
+        Optional explicit Chroma persist directory for isolated environments.
+        If provided, database_path must also be provided.
 
     Returns
     -------
@@ -3256,6 +3278,8 @@ def ask(
         raise ValueError(
             "Question cannot be empty."
         )
+
+    validate_storage_paths(database_path=database_path, persist_dir=persist_dir)
 
     # Validate strategy configuration early to fail closed on conflicting inputs
     test_state: GraphState = {
@@ -3294,6 +3318,7 @@ def ask(
         "grader_llm": grader_llm,
         "embedding_function": embedding_function,
         "database_path": database_path,
+        "persist_dir": persist_dir,
         "capture_eval_evidence": capture_eval_evidence,
     }
 

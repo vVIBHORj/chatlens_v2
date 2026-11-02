@@ -369,6 +369,7 @@ def execute_task44_comparison(
                         question=case.query,
                         retrieval_strategy=STRATEGY_DIALOGUE_EVIDENCE,
                         database_path=str(env.db_path),
+                        persist_dir=str(env.chroma_path),
                     )
                     rec_a.latency_seconds = round(time.time() - t0_a, 3)
                     rec_a.llm_calls_made = budget_llm.total_attempted - calls_before_a
@@ -430,6 +431,7 @@ def execute_task44_comparison(
                         question=case.query,
                         retrieval_strategy=STRATEGY_CONTEXTUAL_GRADING,
                         database_path=str(env.db_path),
+                        persist_dir=str(env.chroma_path),
                     )
                     rec_b.latency_seconds = round(time.time() - t0_b, 3)
                     rec_b.llm_calls_made = budget_llm.total_attempted - calls_before_b
