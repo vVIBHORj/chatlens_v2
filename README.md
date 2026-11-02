@@ -592,6 +592,46 @@ Task 59 conducted a read-only audit of Task 58 and evaluated four critical data-
 
 ---
 
+## 🛡️ Task 60: Explicit Database & Vector-Store Path Propagation
+
+Task 60 eliminated hidden storage fallbacks by propagating custom SQLite and Chroma paths end-to-end throughout the retrieval graph:
+1. **Full Call Chain Propagation**:
+   - `ask()` → `GraphState` → `retrieve()` → `hybrid_search()` → `lexical_search()` / `semantic_message_search()` / `semantic_chunk_search()` → SQLite and Chroma loaders.
+   - Both `database_path` and `persist_dir` are now first-class arguments across all retrieval layers.
+2. **Fail-Safe Storage Validation (`StorageConfigurationError`)**:
+   - Validates that either *both* paths are supplied or *neither* is supplied.
+   - Partial configurations (e.g. custom DB without custom Chroma dir) raise `StorageConfigurationError(ValueError)` immediately before retrieval begins, preventing cross-environment data leakage.
+   - Preserves 100% backward compatibility when both paths are omitted (falling back to production `./chat_data.db` and `./chroma_db`).
+3. **Safe Evaluation Sandbox Compatibility**:
+   - Updated `evidence_cache.py` and evaluation runners (`run_dialogue_evidence_live.py`, `run_task44_comparison_live.py`, `run_task46_comparison_live.py`, `run_task50_comparison_live.py`, `run_task56_comparison_live.py`) to pass explicit paths.
+4. **Deterministic Verification**: 11 unit tests in [`test_storage_path_propagation.py`](test_storage_path_propagation.py) covering path injection, validation errors, context expansion, and branch routing.
+
+---
+
+## 📅 Task 61: File-Level WhatsApp Date Format Detection
+
+Task 61 resolved the confirmed `DD/MM` vs. `MM/DD` timestamp parsing defect in [`parser.py`](parser.py):
+1. **File-Level Inference (`infer_date_order`)**:
+   - Inspects date tokens across the complete export *prior* to parsing individual messages.
+   - **Decisive Evidence**: Identifies unambiguous numeric tokens (first component > 12 → DD/MM; second component > 12 → MM/DD) and checks consistency across the file.
+   - **Secondary Chronological Evidence**: When all components are ≤ 12, tests chronological non-decreasing progression under both interpretations. If one interpretation creates chronological reversals (e.g. jumping backward by 30 days or 11 months), the consistent interpretation is confidently selected.
+2. **Confidence Status Outcomes**:
+   - `DMY_CONFIDENT`: Decisive day tokens or secondary chronological consistency uniquely proving DMY.
+   - `MDY_CONFIDENT`: Decisive month-first tokens or secondary chronological consistency uniquely proving MDY.
+   - `AMBIGUOUS`: All components ≤ 12 and both interpretations produce valid monotonic sequences. Falls back to legacy default `MDY` with an explicit `UserWarning`.
+   - `CONFLICTING_EVIDENCE`: Both `DD > 12` and `MM > 12` observed in the same file. Falls back to legacy default with an explicit `UserWarning`.
+   - `INSUFFICIENT_DATE_EVIDENCE`: No matching timestamps found.
+3. **Strict Single-Format Pinning & Per-Line Isolation**:
+   - Pins one resolved date order for the whole file. Unparseable lines fail safely (`timestamp=None`) without silently flipping the format for subsequent messages.
+4. **Streamlit UI Integration**:
+   - Added a `Date Format` selectbox (`auto`, `DMY`, `MDY`) in the [`app.py`](app.py) sidebar.
+   - Combined file content and date format selection into upload fingerprints to trigger automatic re-indexing when the user changes format selection.
+5. **Chronology Integrity Validated**:
+   - Verified that a synthetic DMY export spanning May 4–15, 2024 (`04/05/24` to `15/05/24`) computes an elapsed difference of **11 days, 5 hours, 45 minutes**, eliminating the legacy 40-day bug.
+6. **Deterministic Verification**: 17 regression tests in [`test_whatsapp_date_parser.py`](test_whatsapp_date_parser.py).
+
+---
+
 ## 🔎 Dual-Level Hybrid Retrieval Engine
 
 ChatLens rejects simple vector search in favor of a 3-way hybrid retrieval and evidence-scoring architecture that balances semantic nuance with keyword precision:
@@ -1194,6 +1234,8 @@ python benchmark_suite.py
 - [x] Task 57 evaluation integrity audit diagnosing CASE-04 qualifier omission.
 - [x] Task 58 strict fact-fidelity scoring contract synchronization, legacy fallback, and 46 unit tests.
 - [x] Task 59 read-only benchmark provenance, custom path propagation, date parser, and citation integrity audit.
+- [x] Task 60 explicit database and vector-store path propagation across the retrieval pipeline with StorageConfigurationError validation.
+- [x] Task 61 file-level WhatsApp date format detection, whole-file DMY/MDY inference, and chronology integrity validation.
 
 ### 🚀 Upcoming Roadmap
 - [ ] Add streaming response token generation in the Streamlit UI.

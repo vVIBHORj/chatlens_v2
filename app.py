@@ -229,6 +229,13 @@ with st.sidebar:
         help="WhatsApp → Chat → Export chat → Without media",
     )
 
+    date_order_option = st.selectbox(
+        "Date Format",
+        options=["auto", "DMY", "MDY"],
+        index=0,
+        help="Infers DD/MM vs MM/DD automatically. Override if your export is ambiguous or known.",
+    )
+
     st.divider()
 
     st.markdown("### 🧠 Local AI")
@@ -263,12 +270,13 @@ def ingest_chat_file(
     persist_dir: str = "./chroma_db",
     save_fn=save_messages,
     vectorstore_fn=build_vectorstore,
+    date_order: str = "auto",
 ):
     """
     Parse raw WhatsApp export, enrich records, persist to SQLite,
     and build Chroma vector store.
     """
-    messages = parse_whatsapp_export(file_path)
+    messages = parse_whatsapp_export(file_path, date_order=date_order)
     enriched = enrich_messages(messages)
     df = to_dataframe(enriched)
 
@@ -287,6 +295,7 @@ def handle_upload(
     save_fn=save_messages,
     vectorstore_fn=build_vectorstore,
     status_callback=None,
+    date_order: str = "auto",
 ) -> Tuple[bool, Optional[str], Optional[pd.DataFrame], int]:
     """
     Coordinate upload lifecycle with content-hash fingerprinting:
@@ -296,7 +305,8 @@ def handle_upload(
     - Only updates processed_file_hash when ingestion succeeds.
     - Keeps session_state blocked if ingestion fails, enabling retry.
     """
-    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    combined_fingerprint = file_bytes + f"::date_order={date_order}".encode("utf-8")
+    file_hash = hashlib.sha256(combined_fingerprint).hexdigest()
 
     # If already successfully processed this exact file content, do not rebuild
     if session_state.get("processed_file_hash") == file_hash and session_state.get("df") is not None:
@@ -326,6 +336,7 @@ def handle_upload(
             persist_dir=persist_dir,
             save_fn=save_fn,
             vectorstore_fn=vectorstore_fn,
+            date_order=date_order,
         )
 
         if len(messages) == 0:
@@ -341,6 +352,7 @@ def handle_upload(
         session_state["df"] = df
         session_state["vectorstore_ready"] = True
         session_state["processed_file_hash"] = file_hash
+        session_state["date_inference"] = getattr(messages, "date_inference", None)
 
         return True, None, df, len(df)
 
@@ -422,7 +434,8 @@ def get_citation_diagnostics(result: dict) -> dict:
 if uploaded is not None:
 
     file_bytes = uploaded.getvalue()
-    file_hash = hashlib.sha256(file_bytes).hexdigest()
+    combined_fingerprint = file_bytes + f"::date_order={date_order_option}".encode("utf-8")
+    file_hash = hashlib.sha256(combined_fingerprint).hexdigest()
 
     if st.session_state.processed_file_hash != file_hash:
 
@@ -437,6 +450,7 @@ if uploaded is not None:
                 file_bytes=file_bytes,
                 session_state=st.session_state,
                 status_callback=lambda msg: st.write(f"📄 {msg}"),
+                date_order=date_order_option,
             )
 
             processing_time = (
