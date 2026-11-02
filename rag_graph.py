@@ -94,7 +94,7 @@ import math
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Optional, TypedDict, Dict, Tuple, Any, Set, Callable
+from typing import List, Optional, TypedDict, Dict, Tuple, Any, Set, Callable, Iterable
 from datetime import datetime
 
 import pandas as pd
@@ -1685,9 +1685,10 @@ def generate(
     # Clean abstention representation enforcement:
     # If the generated response is purely an abstention stating that information is not found/mentioned,
     # strip any extraneous citation brackets that the model mistakenly attached.
-    if is_pure_abstention(raw_answer):
-        cleaned_answer = re.sub(r"\s*\[(?:ID|message_id)\s*=?\s*\d+\]", "", raw_answer, flags=re.IGNORECASE).strip()
-        if cleaned_answer != raw_answer:
+    available_ids_set = extract_available_message_ids(documents)
+    if is_pure_abstention(raw_answer, available_ids=available_ids_set):
+        cleaned_answer, was_stripped = strip_abstention_citations(raw_answer, available_ids=available_ids_set)
+        if was_stripped:
             raw_citations_stripped = True
             answer = cleaned_answer
 
@@ -1729,7 +1730,63 @@ class CitationValidationResult:
         }
 
 
-def is_pure_abstention(answer: str) -> bool:
+def strip_abstention_citations(
+    text: str,
+    available_ids: Optional[Iterable[int]] = None,
+) -> Tuple[str, bool]:
+    """
+    Strip recognized citation brackets from an abstention answer.
+    Preserves ordinary bracketed numbers like [404] or [2024] unless they match
+    available evidence IDs or have an explicit ID/message_id prefix.
+    """
+    if not text or not isinstance(text, str):
+        return text, False
+
+    was_stripped = False
+    avail_set = set(available_ids) if available_ids is not None else None
+
+    def replacer(match: re.Match) -> str:
+        nonlocal was_stripped
+        full = match.group(0)
+        inside = match.group(1).strip()
+
+        # Malformed non-message markers (chunk/episode/message_id)
+        if re.match(r"^\s*(?:chunk|episode|message_id)", inside, re.IGNORECASE):
+            was_stripped = True
+            return ""
+
+        tokens = [t.strip() for t in re.split(r"[\s,]+", inside) if t.strip()]
+        if not tokens:
+            return full
+
+        has_id_keyword = any(t.upper() == "ID" for t in tokens)
+        if has_id_keyword:
+            was_stripped = True
+            return ""
+
+        if all(t.isdigit() for t in tokens):
+            nums = [int(t) for t in tokens]
+            if avail_set is not None:
+                if any(n in avail_set for n in nums):
+                    was_stripped = True
+                    return ""
+                return full
+            else:
+                was_stripped = True
+                return ""
+
+        return full
+
+    cleaned = re.sub(r"\s*\[([^\]]+)\]", replacer, text)
+    cleaned = re.sub(r"\s+([.,!?;])", r"\1", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned, was_stripped
+
+
+def is_pure_abstention(
+    answer: str,
+    available_ids: Optional[Iterable[int]] = None,
+) -> bool:
     """
     Check if the answer is purely an explicit abstention stating that the requested
     information was not found, not mentioned, or not discussed in the conversation.
@@ -1748,7 +1805,7 @@ def is_pure_abstention(answer: str) -> bool:
 
     # Extract clauses and sentences: split on sentence ends, semicolons, and contrastive conjunctions
     # First remove bracketed citations to evaluate the prose
-    prose = re.sub(r"\[(?:ID|message_id)\s*=?\s*\d+\]", "", raw_text, flags=re.IGNORECASE).strip()
+    prose, _ = strip_abstention_citations(raw_text, available_ids=available_ids)
     clauses = [
         c.strip()
         for c in re.split(r"(?:[.!?]+|\s*;\s*|,\s*(?:but|however|although|while|though|yet)\s+|\b(?:but|however|although|while|though)\b)", prose)
@@ -1783,9 +1840,18 @@ def is_pure_abstention(answer: str) -> bool:
     return True
 
 
-def extract_answer_citations(answer: str) -> Tuple[List[int], List[str]]:
+def extract_answer_citations(
+    answer: str,
+    available_ids: Optional[Iterable[int]] = None,
+) -> Tuple[List[int], List[str]]:
     """
     Extract citation IDs and identify malformed citations from the generated answer.
+    Supports both [ID 123] and numeric-only [123] formats, including comma-separated
+    combinations, whitespace variations, and case-insensitivity.
+
+    Where available_ids is provided, unknown numeric-only bracket values (e.g. [404], [2024])
+    are preserved as ordinary text unless they match retrieved evidence or contain an explicit ID prefix.
+
     Returns:
         (cited_ids, malformed_citations)
     """
@@ -1794,42 +1860,68 @@ def extract_answer_citations(answer: str) -> Tuple[List[int], List[str]]:
 
     cited_ids: List[int] = []
     malformed_citations: List[str] = []
+    avail_set = set(available_ids) if available_ids is not None else None
 
-    # 1. Match all brackets that start with ID or id: e.g. [ID ...]
-    id_bracket_pattern = re.compile(r"\[ID\s*([^\]]*)\]", re.IGNORECASE)
-    for match in id_bracket_pattern.finditer(answer):
-        raw_inside = match.group(1).strip()
+    bracket_pattern = re.compile(r"\[([^\]]+)\]")
+    for match in bracket_pattern.finditer(answer):
         full_bracket = match.group(0)
+        inside = match.group(1).strip()
 
-        if not raw_inside:
-            malformed_citations.append(full_bracket)
+        # 1. Non-message citation formats (e.g. [chunk_123], [episode_123], [message_id=45])
+        if re.match(r"^\s*(?:chunk|episode|message_id)", inside, re.IGNORECASE):
+            if full_bracket not in malformed_citations:
+                malformed_citations.append(full_bracket)
             continue
 
-        # Split by comma or whitespace, ignoring optional "ID" repetition (e.g. [ID 10, ID 12])
-        tokens = [t.strip() for t in re.split(r"[\s,]+", raw_inside) if t.strip()]
-        has_valid_num = False
-        is_malformed = False
+        # 2. Tokenize inside content by comma and whitespace
+        tokens = [t.strip() for t in re.split(r"[\s,]+", inside) if t.strip()]
+        if not tokens:
+            continue
 
-        for token in tokens:
-            if token.upper() == "ID":
-                continue
-            if token.isdigit():
-                val = int(token)
-                if val not in cited_ids:
-                    cited_ids.append(val)
-                has_valid_num = True
+        has_id_keyword = any(t.upper() == "ID" for t in tokens)
+
+        if has_id_keyword:
+            # Explicit ID citation bracket (e.g. [ID 123], [ID 123, 124], [123, ID 124], [ID], [ID abc])
+            num_tokens = []
+            has_invalid_token = False
+            for t in tokens:
+                if t.upper() == "ID":
+                    continue
+                if t.isdigit():
+                    num_tokens.append(int(t))
+                else:
+                    has_invalid_token = True
+
+            if has_invalid_token or not num_tokens:
+                if full_bracket not in malformed_citations:
+                    malformed_citations.append(full_bracket)
             else:
-                is_malformed = True
+                for val in num_tokens:
+                    if val not in cited_ids:
+                        cited_ids.append(val)
+        else:
+            # No ID keyword: check if all tokens are pure digits
+            all_digits = all(t.isdigit() for t in tokens)
+            if not all_digits:
+                # Ordinary non-citation bracket (e.g. [10:30], [notes], [table 1])
+                continue
 
-        if is_malformed or not has_valid_num:
-            malformed_citations.append(full_bracket)
-
-    # 2. Check for other non-message citation formats (e.g. [chunk_123], [message_id=45])
-    non_id_pattern = re.compile(r"\[(?:chunk|episode|message_id)[^\]]*\]", re.IGNORECASE)
-    for match in non_id_pattern.finditer(answer):
-        full_token = match.group(0)
-        if full_token not in malformed_citations:
-            malformed_citations.append(full_token)
+            parsed_nums = [int(t) for t in tokens]
+            if avail_set is not None:
+                # Disambiguate against retrieved evidence IDs
+                if any(n in avail_set for n in parsed_nums):
+                    for val in parsed_nums:
+                        if val not in cited_ids:
+                            cited_ids.append(val)
+                else:
+                    # Unknown numeric bracket value without ID prefix (e.g. [404], [2024])
+                    # Preserved as ordinary text, not treated as a citation
+                    pass
+            else:
+                # Standalone extraction without evidence context
+                for val in parsed_nums:
+                    if val not in cited_ids:
+                        cited_ids.append(val)
 
     return cited_ids, malformed_citations
 
@@ -1854,7 +1946,7 @@ def validate_citations(
     available_ids_set = extract_available_message_ids(documents)
     available_ids = sorted(list(available_ids_set))
 
-    cited_ids, malformed_citations = extract_answer_citations(answer)
+    cited_ids, malformed_citations = extract_answer_citations(answer, available_ids=available_ids_set)
 
     has_citations = len(cited_ids) > 0 or len(malformed_citations) > 0
 
@@ -1862,7 +1954,7 @@ def validate_citations(
     invalid_cited_ids = [cid for cid in cited_ids if cid not in available_ids_set]
 
     # For specific retrieval queries, citations are expected; report missing citations unless the answer is an explicit abstention
-    is_abstention = is_pure_abstention(answer)
+    is_abstention = is_pure_abstention(answer, available_ids=available_ids_set)
     missing_citations = (scope != "broad" and not has_citations and len(available_ids) > 0 and not is_abstention)
 
     all_cited_valid = (

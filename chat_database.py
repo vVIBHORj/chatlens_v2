@@ -899,7 +899,7 @@ def get_chronological_context(
     message_id: int,
     before: int = 40,
     after: int = 40,
-    database_path: str = DATABASE_PATH,
+    database_path: Optional[str] = None,
 ) -> List[sqlite3.Row]:
     """
     Retrieve messages chronologically surrounding a target message.
@@ -912,8 +912,10 @@ def get_chronological_context(
     chronological neighbors.
     """
 
+    db_path = database_path or DATABASE_PATH
+
     connection = get_connection(
-        database_path
+        db_path
     )
 
     cursor = connection.cursor()
@@ -949,49 +951,65 @@ def get_chronological_context(
     # Messages BEFORE target
     # -------------------------------------------------------------
 
-    cursor.execute(
-        """
-        SELECT *
-        FROM messages
-        WHERE
-            timestamp IS NOT NULL
-            AND timestamp < ?
-        ORDER BY
-            timestamp DESC,
-            id DESC
-        LIMIT ?
-        """,
-        (
-            target_timestamp,
-            int(before),
-        ),
-    )
-
-    before_rows = cursor.fetchall()
+    before_count = max(0, int(before))
+    if before_count > 0:
+        cursor.execute(
+            """
+            SELECT *
+            FROM messages
+            WHERE
+                timestamp IS NOT NULL
+                AND (
+                    timestamp < ?
+                    OR (timestamp = ? AND id < ?)
+                )
+            ORDER BY
+                timestamp DESC,
+                id DESC
+            LIMIT ?
+            """,
+            (
+                target_timestamp,
+                target_timestamp,
+                int(message_id),
+                before_count,
+            ),
+        )
+        before_rows = cursor.fetchall()
+    else:
+        before_rows = []
 
     # -------------------------------------------------------------
     # Messages AFTER target
     # -------------------------------------------------------------
 
-    cursor.execute(
-        """
-        SELECT *
-        FROM messages
-        WHERE
-            timestamp IS NOT NULL
-            AND timestamp > ?
-        ORDER BY
-            timestamp ASC,
-            id ASC
-        LIMIT ?
-        """,
-        (
-            target_timestamp,
-            int(after),
-        ),
-    )
-
-    after_rows = cursor.fetchall()
+    after_count = max(0, int(after))
+    if after_count > 0:
+        cursor.execute(
+            """
+            SELECT *
+            FROM messages
+            WHERE
+                timestamp IS NOT NULL
+                AND (
+                    timestamp > ?
+                    OR (timestamp = ? AND id > ?)
+                )
+            ORDER BY
+                timestamp ASC,
+                id ASC
+            LIMIT ?
+            """,
+            (
+                target_timestamp,
+                target_timestamp,
+                int(message_id),
+                after_count,
+            ),
+        )
+        after_rows = cursor.fetchall()
+    else:
+        after_rows = []
 
     connection.close()
 
