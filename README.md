@@ -34,6 +34,13 @@
 - [📊 Tasks 53–56: Grader Prompt Diagnostic & Paired End-to-End Live Evaluation](#-tasks-5356-grader-prompt-diagnostic--paired-end-to-end-live-evaluation)
 - [⚖️ Tasks 57 & 58: Evaluation Integrity Audit & Strict Fact-Fidelity Scoring Contract](#️-tasks-57--58-evaluation-integrity-audit--strict-fact-fidelity-scoring-contract)
 - [🔍 Task 59: Benchmark Provenance & Critical Data-Path Integrity Audit](#-task-59-benchmark-provenance--critical-data-path-integrity-audit)
+- [🛡️ Task 60: Explicit Database & Vector-Store Path Propagation](#️-task-60-explicit-database--vector-store-path-propagation)
+- [📅 Task 61: File-Level WhatsApp Date Format Detection](#-task-61-file-level-whatsapp-date-format-detection)
+- [⏱️ Task 62: Same-Minute Chronological Context Ordering](#️-task-62-same-minute-chronological-context-ordering)
+- [🔢 Tasks 63 & 64: Numeric Bracket Citation Parsing & Parity Audit](#-tasks-63--64-numeric-bracket-citation-parsing--parity-audit)
+- [📊 Task 65: Fresh End-to-End Benchmark of Baseline vs. Contextual Grading](#-task-65-fresh-end-to-end-benchmark-of-baseline-vs-contextual-grading)
+- [🔍 Task 66: Benchmark Provenance & Metric Integrity Audit](#-task-66-benchmark-provenance--metric-integrity-audit)
+- [🧪 Task 67: Controlled Generator Prompt Hardening Diagnostic](#-task-67-controlled-generator-prompt-hardening-diagnostic)
 - [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
 - [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
 - [🧭 Deterministic Query Routing](#-deterministic-query-routing)
@@ -629,6 +636,101 @@ Task 61 resolved the confirmed `DD/MM` vs. `MM/DD` timestamp parsing defect in [
 5. **Chronology Integrity Validated**:
    - Verified that a synthetic DMY export spanning May 4–15, 2024 (`04/05/24` to `15/05/24`) computes an elapsed difference of **11 days, 5 hours, 45 minutes**, eliminating the legacy 40-day bug.
 6. **Deterministic Verification**: 17 regression tests in [`test_whatsapp_date_parser.py`](test_whatsapp_date_parser.py).
+
+---
+
+## ⏱️ Task 62: Same-Minute Chronological Context Ordering
+
+Task 62 resolved the defect in [`chat_database.py:get_chronological_context`](chat_database.py) where sibling messages sharing the target message's minute timestamp were inadvertently excluded from preceding or following context windows:
+1. **Root Cause**: SQL queries previously used strict inequality (`timestamp < target_timestamp` and `timestamp > target_timestamp`). Messages recorded in the same minute with identical timestamps were omitted from surrounding context.
+2. **Composite Tie-Breaking Logic**:
+   - Preceding messages: `WHERE (timestamp < :t) OR (timestamp = :t AND id < :id) ORDER BY timestamp DESC, id DESC LIMIT :before` (reversed in memory to maintain chronological order).
+   - Following messages: `WHERE (timestamp > :t) OR (timestamp = :t AND id > :id) ORDER BY timestamp ASC, id ASC LIMIT :after`.
+3. **Deterministic Ascending Contract**: Preserved the contract where retrieved context rows are returned in strict ascending chronological order `(timestamp ASC, id ASC)`.
+4. **Deterministic Verification**: 12 regression tests in [`test_same_minute_context.py`](test_same_minute_context.py) verifying preceding, following, and bidirectional same-minute context expansion.
+
+---
+
+## 🔢 Tasks 63 & 64: Numeric Bracket Citation Parsing & Parity Audit
+
+Tasks 63 & 64 resolved the citation parsing defect in [`rag_graph.py`](rag_graph.py) where standard numeric bracket citations such as `[123]` or citation groups `[123, 124]` were ignored because the parser strictly required an `ID` prefix:
+1. **Flexible Syntax Support**: Added robust regex and parsing support for all standard citation formats:
+   - Single citations: `[ID 123]`, `[123]`, `[id 123]`.
+   - Group citations: `[ID 123, ID 124]`, `[123, 124]`, `[ID 123, 124]`, `[123, ID 124]`.
+   - Robust normalization handling whitespace variations, case-insensitivity, and deduplication.
+2. **Evidence-Aware Disambiguation**:
+   - Numbers matching `available_citation_ids` from retrieved context are reliably extracted as citations.
+   - Non-matching standalone numbers (e.g. years `[2024]`, HTTP status codes `[404]`, times `[10:30]`, or message counts) remain ordinary natural language text, eliminating false-positive invalid citation penalties.
+3. **Task 64 Pipeline Consistency Audit**:
+   - Verified 100% extraction parity between runtime generation in `rag_graph.py` and evaluation scoring in `evaluation_scoring.py`.
+   - Verified that evaluation scoring directly consumes runtime-extracted citation IDs rather than independently reparsing output text.
+   - Verified pure-abstention citation stripping: citations mistakenly attached to pure negative abstention statements are cleanly stripped without penalized invalid citations.
+4. **Deterministic Verification**: 21 unit tests in [`test_numeric_bracket_citations.py`](test_numeric_bracket_citations.py) and verified zero regressions across 279 total project tests.
+
+---
+
+## 📊 Task 65: Fresh End-to-End Benchmark of Baseline vs. Contextual Grading
+
+Task 65 conducted a fresh, controlled, paired end-to-end benchmark comparing the current default **Condition A** (`baseline`) against the improved **Condition B** (`contextual_grading` with the frozen Task 53 Condition B prompt):
+1. **Experimental Controls**:
+   - 12 canonical test cases (7 answerable, 5 unanswerable) across 24 paired runs.
+   - Local models: `qwen2.5:3b` (Inference) and `qwen3-embedding:0.6b` (Embeddings) at temperature 0.0.
+   - Query rewrites disabled (`initial_rewrite_count = MAX_REWRITES`) for strict paired comparability.
+   - Strict storage isolation: 24 isolated temporary SQLite and Chroma sandboxes; zero reads/writes to `./chat_data.db` or `./chroma_db`.
+   - Fail-closed runtime budget: Hard ceiling of 84 calls enforced via `GlobalBudgetEnforcingLLM` (actual: 69 calls).
+2. **Benchmark Results**:
+
+| Metric | Condition A (Baseline) | Condition B (Contextual Grading) | Delta (B vs. A) |
+| :--- | :---: | :---: | :---: |
+| **Overall Strict Accuracy** | **41.7%** (5/12) | **66.7%** (8/12) | **+25.0%** |
+| **Answerable Accuracy (TP/7)** | **42.9%** (3/7) | **71.4%** (5/7) | **+28.6%** |
+| **Correct Abstention (TN/5)** | **40.0%** (2/5) | **60.0%** (3/5) | **+20.0%** |
+| **Unanswerable False Positives** | **3** | **2** | **-1** |
+| **Overall Evidence Recall (7 ans)** | **71.4%** | **100.0%** | **+28.6%** |
+| **Citation Validity Rate** | **100.0%** (13/13) | **100.0%** (10/10) | — |
+| **Macro Attribution Precision** | **92.9%** | **100.0%** | **+7.1%** |
+| **Micro Attribution Precision** | **88.9%** | **100.0%** | **+11.1%** |
+| **Total Evidence Units Retained** | **36** (3.0/case) | **19** (1.58/case) | **-17 (-47.2%)** |
+
+3. **Key Findings**: Contextual grading improved strict accuracy from 41.7% to 66.7% while eliminating 47.2% of noise units before generation, directly preventing context dilution.
+
+---
+
+## 🔍 Task 66: Benchmark Provenance & Metric Integrity Audit
+
+Task 66 performed a comprehensive read-only audit of Task 65 to verify canonical benchmark identity, strict scoring contracts, citation metric semantics, and historical comparisons:
+1. **Provenance Verification & Commentary Erratum**:
+   - Reconciled all 12 cases against canonical fixtures. Condition A and Condition B ran on 100% identical fixture hashes.
+   - Reconciled CASE-03: The phrase `"In the bottom drawer."` mentioned in the Task 65 commentary was an isolated **prose reporting erratum**. The raw SQLite fixture, JSON trace, generated answer, and evaluation scoring used the canonical target text `"It is in the second folder."`.
+2. **Strict Scoring Recalculation**:
+   - Independently re-scored all 24 case traces using `evaluation_scoring.py` under the Task 58 strict contract. Verified 100% mathematical fidelity across all outcomes (Cond A: 5/12, Cond B: 8/12).
+3. **Citation Metric Semantics**:
+   - Clarified the relationship between 100% citation validity, 100% answerable attribution precision, and unanswerable false positives:
+     - *Citation Validity (100%)* measures syntactic existence of cited IDs in prompt context.
+     - *Attribution Precision (100%)* is conditioned on the **answerable subset** (7/7).
+     - *All-Cases Attribution Precision* is **70.0%** (7/10) when including unanswerable false positives (`[115, 116]` in CASE-08, `[123]` in CASE-011) in the denominator.
+4. **Historical Reconciliation**:
+   - Corrected historical comparisons: Task 56 Prompt B scored 75.0% under pre-Task 58 lenient scoring, but scores **66.67% (8/12)** under the strict contract. Under identical strict scoring, **Task 65 Condition B strictly matches Task 56 Prompt B at 66.7% (8/12: 5 TP, 2 FP, 3 TN, 2 FN)**.
+5. **Invocation Reconciliation**:
+   - Reconciled 69 total calls (36 Cond A, 33 Cond B). Identified the 3 `"unknown"` calls as zero-context abstention generations from `CASE-05`, `CASE-07`, and `CASE-010`.
+
+---
+
+## 🧪 Task 67: Controlled Generator Prompt Hardening Diagnostic
+
+Task 67 executed an isolated, paired generator-only experiment evaluating whether explicit evidence-discipline instructions improve the 4 persistent failure cases (`CASE-04`, `CASE-08`, `CASE-09`, `CASE-011`) without modifying retrieval or grading:
+1. **Experimental Protocol**:
+   - Frozen inputs: Condition B final evidence contexts from Task 65.
+   - Exactly 8 LLM calls on `qwen2.5:3b` at temperature 0.0 with a fail-closed 8-call ceiling.
+   - Zero embeddings, zero retrieval, zero expansion, zero grader, zero grounding calls.
+2. **Condition A vs. Condition B Results**:
+   - **CASE-09 (Joint Support `[117, 119]`): RESOLVED (FN → TP)**. The hardened prompt's joint completeness rule prompted the model to cite both prerequisite messages `[117]` and `[119]`, curing the citation recall deficit.
+   - **CASE-04 (Qualifier Preservation): FN → FN**. The model summarized `"Yes, completely clean"` into generic `"finished successfully"`, omitting the required qualifier.
+   - **CASE-08 (Query-Echo Candidate): FP → FP**. The model correctly recognized non-relevance but commented on the messages with citations instead of emitting a clean, citation-free abstention.
+   - **CASE-011 (Staging vs. Prod JWT): FP → FP**. Persistent semantic extrapolation (`dev` → `prod`) occurred at generation once the distractor reached context.
+3. **Core Architectural Insight**:
+   - Multi-message citation attribution is directly solvable at generation time via prompt hardening.
+   - Negative distractor filtering (`CASE-08`, `CASE-011`) is most reliably enforced **upstream at the relevance grading stage** rather than relying on generator self-policing for 3B parameter models.
 
 ---
 
@@ -1236,6 +1338,11 @@ python benchmark_suite.py
 - [x] Task 59 read-only benchmark provenance, custom path propagation, date parser, and citation integrity audit.
 - [x] Task 60 explicit database and vector-store path propagation across the retrieval pipeline with StorageConfigurationError validation.
 - [x] Task 61 file-level WhatsApp date format detection, whole-file DMY/MDY inference, and chronology integrity validation.
+- [x] Task 62 same-minute chronological context ordering using composite (timestamp, id) tie-breaking.
+- [x] Tasks 63 & 64 numeric bracket citation parsing, evidence-aware disambiguation, and runtime-to-evaluation parity.
+- [x] Task 65 fresh controlled end-to-end benchmark of baseline vs. contextual grading (+25% strict accuracy).
+- [x] Task 66 benchmark provenance reconciliation, strict scoring recalculation, and historical score alignment.
+- [x] Task 67 controlled generator prompt hardening diagnostic and joint citation resolution.
 
 ### 🚀 Upcoming Roadmap
 - [ ] Add streaming response token generation in the Streamlit UI.
