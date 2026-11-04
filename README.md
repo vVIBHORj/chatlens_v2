@@ -41,6 +41,7 @@
 - [📊 Task 65: Fresh End-to-End Benchmark of Baseline vs. Contextual Grading](#-task-65-fresh-end-to-end-benchmark-of-baseline-vs-contextual-grading)
 - [🔍 Task 66: Benchmark Provenance & Metric Integrity Audit](#-task-66-benchmark-provenance--metric-integrity-audit)
 - [🧪 Task 67: Controlled Generator Prompt Hardening Diagnostic](#-task-67-controlled-generator-prompt-hardening-diagnostic)
+- [🎯 Task 68: Targeted Grader Diagnostic for Query Echo & Environment Mismatch](#-task-68-targeted-grader-diagnostic-for-query-echo--environment-mismatch)
 - [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
 - [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
 - [🧭 Deterministic Query Routing](#-deterministic-query-routing)
@@ -734,6 +735,42 @@ Task 67 executed an isolated, paired generator-only experiment evaluating whethe
 
 ---
 
+## 🎯 Task 68: Targeted Grader Diagnostic for Query Echo & Environment Mismatch
+
+Task 68 executed an isolated, paired grader-only diagnostic targeting the two persistent false-positive candidate retention failure modes observed in Task 65 and Task 67:
+- **CASE-08 (`Who approved the firewall port change?`)**: Question-echo distractor containing message `[115]` ("Who approved the firewall port change yesterday?").
+- **CASE-011 (`Where is the production JWT secret stored?`)**: Dev vs. production environment mismatch containing message `[123]` ("In secrets.dev.json.").
+
+### 1. Diagnostic Protocol & Frozen Inputs
+- **Frozen Inputs**: Pre-grading candidate units extracted verbatim from Task 65 execution traces (`task65_end_to_end_comparison_20261103_210909.json`) with candidate SHA-256 integrity verification (`b6a9c38c...` for CASE-08, `862c6d84...` for CASE-011).
+- **Execution Ceiling**: Fail-closed hard ceiling of 4 total LLM invocations on `qwen2.5:3b` at temperature 0.0 (exactly 2 for Condition A + 2 for Condition B). Zero retrieval, expansion, embedding, generator, or grounding calls.
+- **Grader Conditions**:
+  - **Condition A (Prompt B)**: Frozen Task 53 Condition B grader prompt (`b04b25c8e08ddf93e5d100b2bd0d166ed42159e4aac27204aa170e87b6ae7573`).
+  - **Condition B (Diagnostic Prompt C)**: Experimental prompt (`a358ca6452deea6de31d491a0e136c818deb5c7adb92d07737d972ac00cd6a21`) adding explicit evidence-sufficiency decision logic:
+    1. Rejecting inquiry/question echoes as non-answers.
+    2. Enforcing strict entity and environment qualifier matching (`production` != `development`/`staging`).
+    3. Outputting deterministic JSON reason strings (`inquiry_only`, `environment_mismatch`, `factual_answer`).
+
+### 2. Paired Grader Diagnostic Results
+
+| Case ID | Core Failure Mode | Cond A (Prompt B) Retained | Cond B (Prompt C) Retained | Diagnostic Outcome | Gate Status |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| `CASE-08` | Query-Echo Inquiry Distractor | 1 / 6 units | 1 / 6 units | Failed Rejection | ❌ FAIL |
+| `CASE-011`| Dev vs. Prod Environment Mismatch | 1 / 6 units | 1 / 6 units | Failed Rejection | ❌ FAIL |
+
+- **CASE-08 Behavior**: Candidate 1 was marked `relevant` under both Prompt B and Prompt C. In Prompt C, `qwen2.5:3b` reasoned: *"Candidate 1 contains a factual answer to the user's question: 'Who approved the firewall port change yesterday?'"*, failing to treat an interrogative echo as an unverified inquiry.
+- **CASE-011 Behavior**: Candidate 2 was marked `relevant` under both Prompt B and Prompt C. In Prompt C, `qwen2.5:3b` reasoned: *"Candidate 2 provides a factual answer to the user's question about where the dev environment JWT secret is stored."*, ignoring the user's explicit `production` scope constraint.
+
+### 3. Decision Gate Outcome: Option 3
+> **Option 3: Prompt C does not materially improve grading for the targeted failure modes.**  
+> Prompt engineering alone cannot overcome strong semantic keyword gravity (verbatim lexical overlap in CASE-08 and high conceptual co-occurrence between JWT secrets in CASE-011) in compact 3B parameter models.
+
+### 4. Strategic Governance & Next Steps
+1. **Production Strategy Invariant**: Production default strategy strictly remains **`baseline`**, and production prompt templates in `rag_graph.py` remain untouched.
+2. **Structural Enforcement Recommendation**: Future mitigation for these failure modes should use deterministic structural filters upstream (such as regex-based interrogative message detection for question echoes and explicit metadata/keyword slot matching for environment scopes) rather than relying exclusively on LLM prompt compliance.
+
+---
+
 ## 🔎 Dual-Level Hybrid Retrieval Engine
 
 ChatLens rejects simple vector search in favor of a 3-way hybrid retrieval and evidence-scoring architecture that balances semantic nuance with keyword precision:
@@ -1343,6 +1380,7 @@ python benchmark_suite.py
 - [x] Task 65 fresh controlled end-to-end benchmark of baseline vs. contextual grading (+25% strict accuracy).
 - [x] Task 66 benchmark provenance reconciliation, strict scoring recalculation, and historical score alignment.
 - [x] Task 67 controlled generator prompt hardening diagnostic and joint citation resolution.
+- [x] Task 68 targeted grader diagnostic for query echo and environment mismatch (Option 3 decision gate).
 
 ### 🚀 Upcoming Roadmap
 - [ ] Add streaming response token generation in the Streamlit UI.
