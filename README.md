@@ -42,6 +42,10 @@
 - [🔍 Task 66: Benchmark Provenance & Metric Integrity Audit](#-task-66-benchmark-provenance--metric-integrity-audit)
 - [🧪 Task 67: Controlled Generator Prompt Hardening Diagnostic](#-task-67-controlled-generator-prompt-hardening-diagnostic)
 - [🎯 Task 68: Targeted Grader Diagnostic for Query Echo & Environment Mismatch](#-task-68-targeted-grader-diagnostic-for-query-echo--environment-mismatch)
+- [🛡️ Task 69: Deterministic Evidence-Scope Guard Prototype & Offline Replay](#️-task-69-deterministic-evidence-scope-guard-prototype--offline-replay)
+- [⚖️ Task 70: Evidence Guard Ground-Truth & Metric Reconciliation](#️-task-70-evidence-guard-ground-truth--metric-reconciliation)
+- [🧩 Task 71: Opt-In Integration of Deterministic Evidence-Scope Guard](#-task-71-opt-in-integration-of-deterministic-evidence-scope-guard)
+- [📊 Task 72: Paired End-to-End Evaluation of Contextual Grading vs. Guarded Contextual Grading](#-task-72-paired-end-to-end-evaluation-of-contextual-grading-vs-guarded-contextual-grading)
 - [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
 - [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
 - [🧭 Deterministic Query Routing](#-deterministic-query-routing)
@@ -69,10 +73,11 @@ Unlike generic RAG pipelines that suffer from conversational fragmentation, lost
 
 ### Core Capabilities:
 1. **Evidence-Grounded Semantic Q&A**: Ask factual or thematic questions in natural language. Answers are backed by canonical message citations (`[ID N]`) with verified provenance and strict anti-hallucination checks.
-2. **Three Selectable Retrieval Strategies**:
+2. **Four Selectable Retrieval Strategies**:
    - **Baseline (Default Production)**: Retrieve candidates → Grade individual evidence (with bounded preceding context lookahead for short replies) → Expand context → Generate → Verify groundedness.
    - **Dialogue Evidence Treatment (Mode A)**: Retrieve candidates → Assemble chronological dialogue evidence units → Contextual RRF ranking → Generate → Verify groundedness. Bypasses LLM pre-grading to maximize terse answer recall.
    - **Contextual Grading Prototype (Mode B)**: Retrieve candidates → Assemble chronological dialogue evidence units → Grade assembled units for relevance → Rank retained units via RRF → Generate → Verify groundedness. Balances high terse recall with distractor filtering.
+   - **Guarded Contextual Grading (Mode C / Opt-In Strategy)**: Retrieve candidates → Assemble chronological dialogue evidence units → Deterministic Evidence-Scope Guard (filter query-echo and environment mismatch distractors) → Contextual Grader → Rank retained units via RRF → Generate → Verify groundedness. Achieves 83.3% strict accuracy and 100% correct abstention on unanswerables.
 3. **Dual-Level Hybrid Retrieval**: Combines per-message Chroma vector search, conversation-chunk Chroma search, and full-text SQLite FTS5 BM25 search, unified via evidence-weighted scoring and Reciprocal Rank Fusion.
 4. **Deterministic Analytics**: Generates response-time trends, initiator ratios, weekly sentiment trajectories, and word-frequency distributions using pure `pandas` mathematics—never synthetic LLM guesses.
 5. **Universal Benchmark & Live Evaluation Infrastructure**: Evaluates 11 conversational phenomena and 12 canonical test cases with strict runtime LLM inference budget enforcement (`BudgetEnforcingLLMWrapper`) and fail-closed isolated storage sandboxes.
@@ -120,6 +125,12 @@ flowchart TB
         ASMB_GRADE --> CHECK_POST{"Retained Units?"}
         CHECK_POST -- "No & Rewrites &lt; 2" --> REWRITE
         CHECK_POST -- "Yes or Rewrites = 2" --> GENERATE
+
+        STRAT -- "contextual_grading_guarded (Mode C)" --> GUARD["evidence_scope_guard<br/>Deterministic pre-grading filter<br/>(Query echo + Env mismatch)"]
+        GUARD --> ASMB_GRADE_G["assemble_grade_rank_evidence_guarded<br/>Grade surviving units & rank RRF"]
+        ASMB_GRADE_G --> CHECK_POST_G{"Retained Units?"}
+        CHECK_POST_G -- "No & Rewrites &lt; 2" --> REWRITE
+        CHECK_POST_G -- "Yes or Rewrites = 2" --> GENERATE
 
         PROFILE --> GENERATE["generate<br/>qwen2.5:3b (temp=0)<br/>Canonical [ID N] evidence formatting"]
         EXPAND --> GENERATE
@@ -229,10 +240,12 @@ class GraphState(TypedDict, total=False):
     available_citation_ids: List[int]     # All message IDs present in final prompt
     grader_status: Optional[str]          # "success" or "failure" (fail-open)
     evidence_mode: str                    # "standard" or "dialogue_evidence_unit"
-    retrieval_strategy: Optional[str]     # "baseline" | "dialogue_evidence" | "contextual_grading"
+    retrieval_strategy: Optional[str]     # "baseline" | "dialogue_evidence" | "contextual_grading" | "contextual_grading_guarded"
     dialogue_evidence_mode: Optional[bool]# Opt-in legacy feature flag override (Mode A)
     contextual_grading_mode: Optional[bool]# Opt-in legacy feature flag override (Mode B)
+    contextual_grading_guarded_mode: Optional[bool]# Opt-in feature flag override (Mode C)
     contextual_grading_decisions: Optional[List[Dict[str, Any]]] # Grader rationale & decisions
+    evidence_guard_decisions: Optional[List[Dict[str, Any]]] # Deterministic guard rationale & metrics
     grader_llm: Optional[Any]             # Injected LLM instance for grading
     database_path: Optional[str]          # Isolated SQLite path (for testing/sandboxing)
     embedding_function: Optional[Any]     # Injected embedding function for scoring/ranking
@@ -771,6 +784,135 @@ Task 68 executed an isolated, paired grader-only diagnostic targeting the two pe
 
 ---
 
+## 🛡️ Task 69: Deterministic Evidence-Scope Guard Prototype & Offline Replay
+
+Task 69 designed and evaluated an isolated deterministic pre-grading filter ([`evidence_scope_guard.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/evidence_scope_guard.py)) targeting the two persistent false-positive failure modes identified in Tasks 65, 67, and 68:
+1. **Query-Echo Distractors (`CASE-08`)**: Interrogative candidates mirroring the user's query question without providing an answering factual reply.
+2. **Environment Mismatches (`CASE-011`)**: Candidates explicitly referencing development, staging, or test environments when the query explicitly requested production facts (and vice-versa).
+
+### 1. Guard Architecture & Decision Taxonomy
+
+The guard operates deterministically upstream of the LLM grader:
+```
+evaluate_evidence_scope(query, candidate_text, anchor_message_id, included_message_ids, metadata) -> GuardResult
+```
+
+- **Decision States**:
+  - `PASS`: Candidate exhibits no deterministic disqualifiers and is safe for contextual LLM grading.
+  - `REJECT_QUERY_ECHO`: Candidate asks the user's query without receiving an answering reply; discarded prior to grading.
+  - `REJECT_ENVIRONMENT_MISMATCH`: Candidate specifies an environment conflicting with the query's explicit scope; discarded prior to grading.
+  - `NEEDS_REVIEW`: Ambiguous context, mixed environments, or unhandled dialogue structure; **fails open** and is forwarded to the contextual LLM grader.
+- **Fail-Open Safety Contract**: Any runtime exception or structural ambiguity defaults to `NEEDS_REVIEW`, ensuring zero silent loss of evidence.
+- **Robust Role Disambiguation**: Sender prefixes (e.g., `Dev_Security:`, `Dev_Ops:`) are stripped during environment tokenization so developer usernames never trigger false `development` classification.
+
+### 2. Offline Candidate Replay & Validation
+
+The prototype was evaluated against the frozen 69-candidate population from Task 65/Task 53 via [`run_task69_offline_replay.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/run_task69_offline_replay.py):
+- **Supporting Evidence Preservation**: **100.0% (26 / 26)** canonical supporting candidates passed (`PASS`), achieving **0 false rejections**.
+- **Terse Answer Preservation**: 100% preservation across elliptical short replies (`CASE-01`, `CASE-02`, `CASE-04`).
+- **Joint Support Preservation**: 100% preservation across multi-message exchanges (`CASE-09`).
+- **Distractor Filtering**: Deterministically filtered 16 unsupported candidates before grading (8 question echoes, 8 environment mismatches), completely bypassing downstream LLM grading calls.
+- **Unit Test Coverage**: 20 unit tests in [`test_evidence_scope_guard.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/test_evidence_scope_guard.py) verifying boundaries, edge cases, and role prefixes.
+
+---
+
+## ⚖️ Task 70: Evidence Guard Ground-Truth & Metric Reconciliation
+
+Task 70 performed a comprehensive read-only provenance audit of Task 69 before integrating the guard into `rag_graph.py`:
+1. **Ground-Truth Distribution Reconciliation**:
+   - Reconciled the canonical 69-candidate benchmark population from Task 53: 26 `answer_support`, 8 `question_only`, 8 `entity_mismatch`, 3 `ambiguous`, 24 `irrelevant`.
+   - Identified that an initial Task 69 diagnostic counter listed 28 supporting candidates due to grouping 2 borderline contextual units (`CASE-03` Candidate 2 and `CASE-09` Candidate 4); verified that all 26 canonical `answer_support` annotations remained intact and were 100% preserved with zero false rejections.
+2. **CASE-06 Message Mapping Audit**:
+   - Reconciled support message mapping: verified that `[112]` is the canonical required anchor (`"The primary IP address for the Redis cache cluster is 10.0.4.15."`). Candidate 1 included `[112, 113]` in context; confirmed that `[112]` is preserved across all pipelines.
+3. **Query-Echo Denominator Audit**:
+   - Reconciled query-echo recall: across the 8 canonical `question_only` annotated candidates, recall is **100% (8 / 8)**. Across an expanded linguistic set of 10 inquiry-like candidates, recall is **80% (8 / 10)**, with the remaining 2 candidates safely falling open as `NEEDS_REVIEW` due to subsequent conversational dialogue turns.
+
+---
+
+## 🧩 Task 71: Opt-In Integration of Deterministic Evidence-Scope Guard
+
+Task 71 integrated `evidence_scope_guard.py` into ChatLens-RAG as an explicit, opt-in experimental strategy: `contextual_grading_guarded`.
+
+### 1. Pipeline Execution Flow
+
+```mermaid
+flowchart LR
+    RET[Retrieve Candidates] --> ASMB[Assemble Dialogue Units]
+    ASMB --> GUARD{"Deterministic Guard<br/>(evidence_scope_guard)"}
+    GUARD -- "REJECT (Echo / Env)" --> DROP[Discard Candidate]
+    GUARD -- "PASS / NEEDS_REVIEW" --> GRADER[Contextual LLM Grader]
+    DROP -. "All units rejected" .-> BYPASS[Bypass Grader → Rewrite / Empty]
+    GRADER --> RRF[Contextual RRF Ranking]
+    RRF --> GEN[Generate with Citations]
+    GEN --> GROUND[Strict Groundedness Check]
+
+    style GUARD fill:#f59e0b,color:#000
+    style DROP fill:#ef4444,color:#fff
+    style GRADER fill:#8b5cf6,color:#fff
+    style GEN fill:#2ea44f,color:#fff
+```
+
+### 2. Architecture & Production Invariants
+- **Production Invariant**: The production default retrieval strategy remains strictly **`baseline`**. Existing strategies `dialogue_evidence`, `contextual_grading`, and `contextual_grading_v2` are 100% unchanged.
+- **Opt-In Selection**: Activated via `retrieval_strategy="contextual_grading_guarded"`, `contextual_grading_guarded_mode=True`, or environment variable `CHATLENS_CONTEXTUAL_GRADING_GUARDED_EXPERIMENT=true`.
+- **Validation Guards**: Mutually exclusive configuration checks raise `ValueError` on conflicting strategy flags or environment variables.
+- **Fail-Open Safety**: Invocations to `evaluate_evidence_scope()` are wrapped in a fail-open handler; any unexpected exception logs a warning and marks candidates `NEEDS_REVIEW`.
+- **Operational Efficiency**: If all candidate units for a query are deterministically rejected by the guard, the LLM grader invocation is entirely bypassed, saving inference latency and token budget.
+- **Regression Suite**: Tested via 22 offline unit and pipeline tests in [`test_contextual_grading_guarded.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/test_contextual_grading_guarded.py) and verified via offline replay in [`run_task71_offline_replay.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/run_task71_offline_replay.py).
+
+---
+
+## 📊 Task 72: Paired End-to-End Evaluation of Contextual Grading vs. Guarded Contextual Grading
+
+Task 72 executed a controlled, paired end-to-end benchmark ([`run_task72_comparison_live.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/run_task72_comparison_live.py)) comparing the existing `contextual_grading` strategy against the new opt-in `contextual_grading_guarded` strategy across the 12 canonical benchmark cases (24 paired live runs).
+
+### 1. Benchmark Configuration & Preflight
+- **Evaluator Models**: `qwen2.5:3b` (Inference, temp=0.0) | `qwen3-embedding:0.6b` (Embeddings) via local Ollama.
+- **Execution Ceiling**: Fail-closed hard ceiling of 84 LLM calls enforced via `BudgetEnforcingLLMWrapper`.
+- **Preflight Verification**: Passed 13-point verification suite covering citation edge cases (`[123]`, `[404]`, `[123, 999]`, timestamps `[10:30]`), isolated storage path propagation, file-level date detection, same-minute ordering, and strict scoring contracts.
+
+### 2. Executive A/B Comparison Results
+
+| Metric | Condition A (Contextual Grading V1) | Condition B (Guarded Contextual Grading) | Delta (Cond B - Cond A) |
+| :--- | :---: | :---: | :---: |
+| **Overall Strict Accuracy** | **50.0%** (6 / 12) | **83.3%** (10 / 12) | **+33.3%** 🚀 |
+| **Answerable Accuracy (TP / 7)** | **42.9%** (3 / 7) | **71.4%** (5 / 7) | **+28.6%** |
+| **Correct Abstention Rate (TN / 5)** | **60.0%** (3 / 5) | **100.0%** (5 / 5) | **+40.0%** 🎯 |
+| **Unanswerable False Positives (FP)** | **2** | **0** | **-2 (100% eliminated)** |
+| **Terse Evidence Recall (CASE 1, 2, 4)** | **100.0%** | **100.0%** | **+0.0%** (Preserved) |
+| **Overall Evidence Recall (7 answerable)**| **85.7%** | **100.0%** | **+14.3%** |
+| **Mandatory IDs Retained (8 total)** | **7 / 8** | **8 / 8** | **+1** |
+| **CASE-09 Joint Support (`[117, 119]`)** | **Preserved** | **Preserved** | — |
+| **Citation Validity Rate** | **100.0%** | **100.0%** | — |
+| **Attribution Precision (All Cases)** | **66.7%** | **100.0%** | **+33.3%** |
+| **Guard Rejections (Condition B)** | N/A | **12 units** (8 Echo, 4 Env) | — |
+| **Total LLM Calls Used** | **33** | **31** | **-2 calls** (64 / 84 budget) |
+| **Mean Latency per Case** | **9.19s** | **7.92s** | **-1.27s (13.8% faster)** |
+
+### 3. Case-by-Case Paired Transitions
+
+| Case ID | Query Phenomenon | Cond A | Cond B | Retained IDs (Cond B) | Guard Action | Transition |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `CASE-01` | Terse Location (*"In Vault 9."*) | FN | **TP** | `[101]` | 1 Echo Rejected | 📈 **FN → TP** |
+| `CASE-02` | Short Time (*"9pm."*) | **TP** | **TP** | `[103]` | 1 Echo Rejected | Unchanged |
+| `CASE-03` | Pronoun Anaphora (*"It is in the second folder."*) | FN | **TP** | `[106]` | 1 Echo Rejected | 📈 **FN → TP** |
+| `CASE-04` | Qualifier Preservation (*"Yes, completely clean."*) | FN | FN | `[107]` | 1 Echo Rejected | Unchanged (Missing qualifier) |
+| `CASE-05` | Misleading Context Distractor | **TN** | **TN** | `[]` | 0 Rejected | Unchanged |
+| `CASE-06` | Self-Contained Factual Answer | **TP** | **TP** | `[112]` | 0 Rejected | Unchanged |
+| `CASE-07` | Self-Contained Irrelevant Banter | **TN** | **TN** | `[]` | 0 Rejected | Unchanged |
+| `CASE-08` | Query-Echo Interrogative Distractor | **FP** | **TN** | `[]` | 4 Echoes Rejected | 🛡️ **FP → TN** |
+| `CASE-09` | Multi-Message Joint Support (`[117, 119]`) | FN | FN | `[117, 119]` | 0 Rejected | Unchanged (Cites only `[119]`) |
+| `CASE-010`| Ambiguous Context Abstention | **TN** | **TN** | `[]` | 0 Rejected | Unchanged |
+| `CASE-011`| Similar Entity Mismatch (Dev vs Prod JWT) | **FP** | **TN** | `[]` | 4 Envs Rejected | 🛡️ **FP → TN** |
+| `CASE-012`| Ordinary-Length Bypass | **TP** | **TP** | `[125]` | 0 Rejected | Unchanged |
+
+**Net Transition Summary**:
+- **Upgrades**: 4 cases upgraded (`CASE-01`, `CASE-03`, `CASE-08`, `CASE-011`).
+- **Regressions**: **0 cases** (Zero regressions across the entire suite).
+- **Core Value**: Guarded Contextual Grading completely cured the two persistent false-positive failure modes while preserving 100% of true supporting evidence, achieving the highest benchmark score (**83.3%**) recorded to date.
+
+---
+
 ## 🔎 Dual-Level Hybrid Retrieval Engine
 
 ChatLens rejects simple vector search in favor of a 3-way hybrid retrieval and evidence-scoring architecture that balances semantic nuance with keyword precision:
@@ -1154,9 +1296,16 @@ ChatLens-RAG/
 ├── run_task50_comparison_live.py      # Task 50 live paired comparison runner (Baseline vs Contextual V1)
 ├── run_task53_grader_comparison.py    # Task 53 prompt diagnostic comparison runner (frozen candidates)
 ├── run_task56_comparison_live.py      # Task 56 live paired comparison runner (Condition A vs B)
+├── run_task68_diagnostic.py           # Task 68 targeted grader diagnostic runner (Prompt B vs C)
+├── run_task69_offline_replay.py       # Task 69 evidence guard offline candidate replay
+├── run_task71_offline_replay.py       # Task 71 guarded contextual grading offline replay
+├── run_task72_comparison_live.py      # Task 72 paired live comparison runner (V1 vs Guarded)
+├── evidence_scope_guard.py            # Deterministic evidence-scope guard (Tasks 69, 71)
 ├── evaluation_scoring.py              # Strict fact-fidelity scoring contract & audit engine (Tasks 48, 58)
 ├── evidence_cache.py                  # Static evidence cache builder and 10-point validator (Task 52)
 │
+├── test_contextual_grading_guarded.py # 22 offline tests for Guarded Contextual Grading (Task 71)
+├── test_evidence_scope_guard.py       # 20 unit tests for deterministic evidence-scope guard (Task 69)
 ├── test_contextual_grading_pipeline.py# 23 offline tests for Task 43 contextual grading prototype
 ├── test_contextual_grading_v2.py     # 25 offline tests for Contextual Grading V2
 ├── test_evaluation_scoring.py        # 26 tests for canonical metric contract & edge cases
@@ -1244,10 +1393,11 @@ Key pipeline parameters can be configured directly in their respective modules:
 | `EPISODE_GAP_MINUTES` | `vectorstore.py` | `120` | Inactivity silence threshold defining a new conversation episode |
 | `NORMAL_GAP_MINUTES` | `context_expander.py` | `180` | Soft conversational boundary for context expansion |
 | `HARD_GAP_HOURS` | `context_expander.py` | `12` | Absolute hard temporal boundary never crossed during expansion |
-| `retrieval_strategy` | `rag_graph.py` | `"baseline"` | Strategy selector: `"baseline"`, `"dialogue_evidence"`, or `"contextual_grading"` |
+| `retrieval_strategy` | `rag_graph.py` | `"baseline"` | Strategy selector: `"baseline"`, `"dialogue_evidence"`, `"contextual_grading"`, or `"contextual_grading_guarded"` |
 | `CHATLENS_RETRIEVAL_STRATEGY` | Environment | None | Global environment override for retrieval strategy |
-| `CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT` | Environment | None | Opt-in boolean flag enabling contextual grading |
-| `CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT` | Environment | None | Opt-in boolean flag enabling dialogue evidence |
+| `CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT` | Environment | None | Opt-in boolean flag enabling contextual grading (Mode B) |
+| `CHATLENS_CONTEXTUAL_GRADING_GUARDED_EXPERIMENT` | Environment | None | Opt-in boolean flag enabling guarded contextual grading (Mode C) |
+| `CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT` | Environment | None | Opt-in boolean flag enabling dialogue evidence (Mode A) |
 
 ---
 
@@ -1295,8 +1445,25 @@ python -m pytest test_citation_remediation_task41.py -v
 # 13. Run the live comparison harness verification tests (budget counter & sandbox isolation)
 python -m pytest test_dialogue_evidence_live_harness.py -v
 
-# 14. Execute the comprehensive 86-test offline regression suite in one pass
-python -m pytest test_contextual_grading_pipeline.py test_dialogue_evidence_pipeline.py test_citation_remediation_task41.py test_citation_integrity.py test_dialogue_evidence_live_harness.py -v
+# 14. Run the Task 69 deterministic evidence-scope guard tests (20 tests)
+python -m pytest test_evidence_scope_guard.py -v
+
+# 15. Run the Task 71 guarded contextual grading integration tests (22 tests)
+python -m pytest test_contextual_grading_guarded.py -v
+
+# 16. Execute the comprehensive 107-test offline regression suite across all active components
+python -m pytest test_contextual_grading_guarded.py test_evidence_scope_guard.py test_contextual_grading_pipeline.py test_dialogue_evidence_pipeline.py test_citation_remediation_task41.py test_citation_integrity.py -v
+```
+
+### Task 72 Live Paired Comparison Runner (Contextual Grading vs. Guarded Contextual Grading)
+The live comparison runner evaluates the 12 canonical cases across Contextual Grading V1 and Guarded Contextual Grading under a hard budget ceiling of 84 calls:
+
+```bash
+# Dry run: verifies sandboxes, displays execution plan and budget breakdown (0 model calls)
+python run_task72_comparison_live.py
+
+# Live execution: paired comparison on local qwen2.5:3b (enforces 84-call hard ceiling)
+python run_task72_comparison_live.py --confirm-live
 ```
 
 ### Task 44 Live Paired Comparison Runner (Mode A vs. Mode B)
@@ -1381,6 +1548,10 @@ python benchmark_suite.py
 - [x] Task 66 benchmark provenance reconciliation, strict scoring recalculation, and historical score alignment.
 - [x] Task 67 controlled generator prompt hardening diagnostic and joint citation resolution.
 - [x] Task 68 targeted grader diagnostic for query echo and environment mismatch (Option 3 decision gate).
+- [x] Task 69 deterministic evidence-scope guard prototype (`evidence_scope_guard.py`) and offline replay with zero false rejections across all 26 supporting candidates.
+- [x] Task 70 read-only provenance audit reconciling candidate distributions, denominator definitions, and message mappings.
+- [x] Task 71 opt-in integration of deterministic evidence-scope guard as `contextual_grading_guarded` in `rag_graph.py` with 22 unit tests and fail-open guarantees.
+- [x] Task 72 paired live end-to-end evaluation achieving 83.3% strict accuracy (+33.3%), 100% correct abstention rate, and 0 false positives within budget.
 
 ### 🚀 Upcoming Roadmap
 - [ ] Add streaming response token generation in the Streamlit UI.

@@ -151,17 +151,20 @@ SEMANTIC_EXPANSION_MAX_CHARS = 35
 DIALOGUE_EVIDENCE_ENV_VAR = "CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT"
 CONTEXTUAL_GRADING_ENV_VAR = "CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT"
 CONTEXTUAL_GRADING_V2_ENV_VAR = "CHATLENS_CONTEXTUAL_GRADING_V2_EXPERIMENT"
+CONTEXTUAL_GRADING_GUARDED_ENV_VAR = "CHATLENS_CONTEXTUAL_GRADING_GUARDED_EXPERIMENT"
 RETRIEVAL_STRATEGY_ENV_VAR = "CHATLENS_RETRIEVAL_STRATEGY"
 
 STRATEGY_BASELINE = "baseline"
 STRATEGY_DIALOGUE_EVIDENCE = "dialogue_evidence"
 STRATEGY_CONTEXTUAL_GRADING = "contextual_grading"
 STRATEGY_CONTEXTUAL_GRADING_V2 = "contextual_grading_v2"
+STRATEGY_CONTEXTUAL_GRADING_GUARDED = "contextual_grading_guarded"
 VALID_RETRIEVAL_STRATEGIES = {
     STRATEGY_BASELINE,
     STRATEGY_DIALOGUE_EVIDENCE,
     STRATEGY_CONTEXTUAL_GRADING,
     STRATEGY_CONTEXTUAL_GRADING_V2,
+    STRATEGY_CONTEXTUAL_GRADING_GUARDED,
 }
 
 TOP_K_EVIDENCE_UNITS = 5
@@ -214,6 +217,7 @@ class GraphState(TypedDict, total=False):
     dialogue_evidence_mode: Optional[bool]
     contextual_grading_mode: Optional[bool]
     contextual_grading_v2_mode: Optional[bool]
+    contextual_grading_guarded_mode: Optional[bool]
     retrieval_strategy: Optional[str]
     grader_llm: Optional[Any]
     database_path: Optional[str]
@@ -222,6 +226,8 @@ class GraphState(TypedDict, total=False):
     contextual_grading_decisions: Optional[List[Dict[str, Any]]]
     capture_eval_evidence: Optional[bool]
     captured_evaluation_evidence: Optional[List[Dict[str, Any]]]
+    guard_decisions: Optional[List[Dict[str, Any]]]
+    guard_diagnostics: Optional[Dict[str, Any]]
 
 # =====================================================================
 # Scope classification
@@ -2161,6 +2167,7 @@ def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
     if state is not None:
         ctx_flag = state.get("contextual_grading_mode")
         ctx2_flag = state.get("contextual_grading_v2_mode")
+        ctx_guarded_flag = state.get("contextual_grading_guarded_mode")
         diag_flag = state.get("dialogue_evidence_mode")
         legacy_diag_flag = state.get("use_dialogue_evidence")
         if diag_flag is None and legacy_diag_flag is not None:
@@ -2174,14 +2181,16 @@ def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
                     f"Unknown retrieval_strategy: {strat_val!r}. "
                     f"Must be one of: {sorted(VALID_RETRIEVAL_STRATEGIES)}"
                 )
-            if norm_strat == STRATEGY_BASELINE and (bool(ctx_flag) or bool(ctx2_flag) or bool(diag_flag)):
+            if norm_strat == STRATEGY_BASELINE and (bool(ctx_flag) or bool(ctx2_flag) or bool(ctx_guarded_flag) or bool(diag_flag)):
                 raise ValueError("Conflicting configuration: retrieval_strategy='baseline' but experimental mode flag is True.")
-            if norm_strat == STRATEGY_DIALOGUE_EVIDENCE and (bool(ctx_flag) or bool(ctx2_flag)):
+            if norm_strat == STRATEGY_DIALOGUE_EVIDENCE and (bool(ctx_flag) or bool(ctx2_flag) or bool(ctx_guarded_flag)):
                 raise ValueError("Conflicting configuration: retrieval_strategy='dialogue_evidence' but contextual grading mode flag is True.")
-            if norm_strat == STRATEGY_CONTEXTUAL_GRADING and (bool(diag_flag) or bool(ctx2_flag)):
+            if norm_strat == STRATEGY_CONTEXTUAL_GRADING and (bool(diag_flag) or bool(ctx2_flag) or bool(ctx_guarded_flag)):
                 raise ValueError("Conflicting configuration: retrieval_strategy='contextual_grading' but other mode flag is True.")
-            if norm_strat == STRATEGY_CONTEXTUAL_GRADING_V2 and (bool(diag_flag) or bool(ctx_flag)):
+            if norm_strat == STRATEGY_CONTEXTUAL_GRADING_V2 and (bool(diag_flag) or bool(ctx_flag) or bool(ctx_guarded_flag)):
                 raise ValueError("Conflicting configuration: retrieval_strategy='contextual_grading_v2' but other mode flag is True.")
+            if norm_strat == STRATEGY_CONTEXTUAL_GRADING_GUARDED and (bool(diag_flag) or bool(ctx_flag) or bool(ctx2_flag)):
+                raise ValueError("Conflicting configuration: retrieval_strategy='contextual_grading_guarded' but other mode flag is True.")
             return norm_strat
 
         true_flags = [
@@ -2189,6 +2198,7 @@ def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
                 ("dialogue_evidence_mode", diag_flag),
                 ("contextual_grading_mode", ctx_flag),
                 ("contextual_grading_v2_mode", ctx2_flag),
+                ("contextual_grading_guarded_mode", ctx_guarded_flag),
             ] if bool(val)
         ]
         if len(true_flags) > 1:
@@ -2196,13 +2206,15 @@ def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
                 f"Conflicting retrieval experiment flags: multiple flags enabled ({', '.join(true_flags)}). "
                 "Please specify only one strategy."
             )
+        if bool(ctx_guarded_flag):
+            return STRATEGY_CONTEXTUAL_GRADING_GUARDED
         if bool(ctx2_flag):
             return STRATEGY_CONTEXTUAL_GRADING_V2
         if bool(ctx_flag):
             return STRATEGY_CONTEXTUAL_GRADING
         if bool(diag_flag):
             return STRATEGY_DIALOGUE_EVIDENCE
-        if ctx_flag is False and ctx2_flag is False and diag_flag is False:
+        if ctx_flag is False and ctx2_flag is False and diag_flag is False and ctx_guarded_flag is False:
             return STRATEGY_BASELINE
 
     # Check environment variables
@@ -2217,6 +2229,7 @@ def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
 
     env_ctx = os.environ.get(CONTEXTUAL_GRADING_ENV_VAR, "0").strip().lower() in ("1", "true", "yes", "on")
     env_ctx2 = os.environ.get(CONTEXTUAL_GRADING_V2_ENV_VAR, "0").strip().lower() in ("1", "true", "yes", "on")
+    env_ctx_guarded = os.environ.get(CONTEXTUAL_GRADING_GUARDED_ENV_VAR, "0").strip().lower() in ("1", "true", "yes", "on")
     env_diag = os.environ.get(DIALOGUE_EVIDENCE_ENV_VAR, "0").strip().lower() in ("1", "true", "yes", "on")
 
     active_envs = [
@@ -2224,6 +2237,7 @@ def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
             ("CHATLENS_DIALOGUE_EVIDENCE_EXPERIMENT", env_diag),
             ("CHATLENS_CONTEXTUAL_GRADING_EXPERIMENT", env_ctx),
             ("CHATLENS_CONTEXTUAL_GRADING_V2_EXPERIMENT", env_ctx2),
+            ("CHATLENS_CONTEXTUAL_GRADING_GUARDED_EXPERIMENT", env_ctx_guarded),
         ] if val
     ]
     if len(active_envs) > 1:
@@ -2231,6 +2245,8 @@ def resolve_retrieval_strategy(state: Optional[GraphState] = None) -> str:
             f"Conflicting environment variables: multiple experiments active ({', '.join(active_envs)}). "
             "Please activate only one experiment."
         )
+    if env_ctx_guarded:
+        return STRATEGY_CONTEXTUAL_GRADING_GUARDED
     if env_ctx2:
         return STRATEGY_CONTEXTUAL_GRADING_V2
     if env_ctx:
@@ -2261,6 +2277,14 @@ def is_contextual_grading_v2_enabled(state: Optional[GraphState] = None) -> bool
     """Check whether the opt-in contextual-grading v2 retrieval pipeline is active."""
     try:
         return resolve_retrieval_strategy(state) == STRATEGY_CONTEXTUAL_GRADING_V2
+    except ValueError:
+        return False
+
+
+def is_contextual_grading_guarded_enabled(state: Optional[GraphState] = None) -> bool:
+    """Check whether the opt-in guarded contextual-grading retrieval pipeline is active."""
+    try:
+        return resolve_retrieval_strategy(state) == STRATEGY_CONTEXTUAL_GRADING_GUARDED
     except ValueError:
         return False
 
@@ -3007,6 +3031,305 @@ def assemble_grade_rank_evidence_v2(
     }
 
 
+def assemble_grade_rank_evidence_guarded(
+    state: GraphState,
+    grader_llm: Optional[Any] = None,
+    embedding_function: Optional[Any] = None,
+    database_path: Optional[str] = None,
+) -> GraphState:
+    """
+    Opt-in LangGraph node for guarded contextual grading strategy (Task 71).
+    Pipeline:
+      1. Assembles retrieved message anchors into chronological dialogue units.
+      2. Deterministic Evidence-Scope Guard:
+         - Inspects each candidate unit.
+         - Drops pure query-echo questions (REJECT_QUERY_ECHO).
+         - Drops environment mismatches (e.g., dev/staging vs prod query) (REJECT_ENVIRONMENT_MISMATCH).
+         - Fails open on exceptions as NEEDS_REVIEW.
+         - Forwards PASS and NEEDS_REVIEW candidates to the contextual grader.
+      3. Grader bypass: If all candidates are rejected, skips LLM grader completely (grader_invoked=False).
+      4. V1 Contextual Grading:
+         - Grades surviving units using grade_candidate_batch.
+         - Retains units marked 'relevant' or 'uncertain'.
+      5. Contextual RRF Ranking:
+         - Ranks retained units using hybrid retrieval + contextual transcript similarity.
+         - Bounds evidence to TOP_K_EVIDENCE_UNITS.
+      6. Diagnostic Accounting:
+         - Stores guard_decisions and guard_diagnostics in graph state.
+    """
+    from evidence_scope_guard import evaluate_evidence_scope, GuardDecision, GuardResult
+
+    documents = state.get("documents", [])
+    question = state.get("original_question") or state.get("question", "")
+    db_path = database_path or state.get("database_path")
+
+    print("\n" + "=" * 70)
+    print("OPT-IN GUARDED CONTEXTUAL RELEVANCE GRADING (TASK 71)")
+    print("=" * 70)
+    print(f"Retrieved candidate documents: {len(documents)}")
+
+    empty_diagnostics = {
+        "total_candidates": 0,
+        "passed": 0,
+        "needs_review": 0,
+        "rejected_query_echo": 0,
+        "rejected_environment_mismatch": 0,
+        "total_rejected": 0,
+        "grader_invoked": False,
+        "candidates_sent_to_grader": 0,
+        "candidates_passed_grader": 0,
+    }
+
+    if not documents:
+        print("No candidates retrieved to assemble, guard, and grade.")
+        return {
+            **state,
+            "documents": [],
+            "evidence_mode": "contextual_grading_guarded",
+            "retrieval_strategy": STRATEGY_CONTEXTUAL_GRADING_GUARDED,
+            "grader_status": "success",
+            "guard_decisions": [],
+            "guard_diagnostics": empty_diagnostics,
+            "contextual_grading_decisions": [],
+        }
+
+    # 1. Assemble complete dialogue units
+    evidence_units = assemble_dialogue_evidence_units(
+        documents,
+        before=2,
+        after=1,
+        database_path=db_path,
+    )
+    print(f"Assembled dialogue evidence units: {len(evidence_units)}")
+
+    if not evidence_units:
+        return {
+            **state,
+            "documents": [],
+            "evidence_mode": "contextual_grading_guarded",
+            "retrieval_strategy": STRATEGY_CONTEXTUAL_GRADING_GUARDED,
+            "grader_status": "success",
+            "guard_decisions": [],
+            "guard_diagnostics": empty_diagnostics,
+            "contextual_grading_decisions": [],
+            "captured_evaluation_evidence": [] if state.get("capture_eval_evidence", False) else None,
+        }
+
+    # Evaluation-only evidence capture
+    captured_eval_units: List[Dict[str, Any]] = []
+    if state.get("capture_eval_evidence", False):
+        for idx, unit in enumerate(evidence_units, start=1):
+            anchor_id = (
+                unit.metadata.get("anchor_message_id")
+                if unit.metadata.get("anchor_message_id") is not None
+                else unit.metadata.get("message_id")
+            )
+            anchor_key = "?" if anchor_id is None or anchor_id == 0 else anchor_id
+            formatted_input = format_candidate_for_contextual_grader(idx, unit)
+            cand_text = unit.page_content or ""
+            captured_eval_units.append({
+                "candidate_index": idx,
+                "anchor_message_id": anchor_key,
+                "included_message_ids": unit.metadata.get("included_message_ids", []),
+                "candidate_text": cand_text,
+                "formatted_grader_input": formatted_input,
+                "candidate_text_hash": hashlib.sha256(cand_text.encode("utf-8")).hexdigest(),
+                "formatted_grader_input_hash": hashlib.sha256(formatted_input.encode("utf-8")).hexdigest(),
+                "source_metadata": copy.deepcopy(unit.metadata or {}),
+            })
+
+    # 2. Deterministic Evidence-Scope Guard Phase
+    guard_decisions: List[Dict[str, Any]] = []
+    surviving_units: List[Document] = []
+
+    for idx, unit in enumerate(evidence_units, start=1):
+        anchor_id = unit.metadata.get("anchor_message_id") or unit.metadata.get("message_id") or "?"
+        included_ids = unit.metadata.get("included_message_ids", [])
+        cand_text = unit.page_content or ""
+        meta = unit.metadata or {}
+
+        try:
+            guard_result = evaluate_evidence_scope(
+                query=question,
+                candidate_text=cand_text,
+                anchor_message_id=anchor_id if isinstance(anchor_id, int) else None,
+                included_message_ids=included_ids,
+                metadata=meta,
+            )
+        except Exception as e:
+            guard_result = GuardResult(
+                decision=GuardDecision.NEEDS_REVIEW,
+                rule="FAIL_OPEN_ON_EXCEPTION",
+                explanation=f"Guard exception fail-open: {e}",
+                details={"exception": str(e)},
+            )
+
+        pattern_matches = guard_result.details.get("pattern_matches", [])
+        guard_entry = {
+            "candidate_index": idx,
+            "anchor_message_id": anchor_id,
+            "included_message_ids": included_ids,
+            "decision": guard_result.decision.value,
+            "rule": guard_result.rule,
+            "rationale": guard_result.explanation,
+            "pattern_matches": pattern_matches,
+            "details": guard_result.details,
+        }
+        guard_decisions.append(guard_entry)
+
+        if guard_result.decision in (GuardDecision.REJECT_QUERY_ECHO, GuardDecision.REJECT_ENVIRONMENT_MISMATCH):
+            print(f"  [GUARD REJECTED ({guard_result.decision.value})] Anchor={anchor_id}: {guard_result.explanation}")
+        else:
+            surviving_units.append(unit)
+            print(f"  [GUARD {guard_result.decision.value}] Anchor={anchor_id}: {guard_result.explanation}")
+
+    total_candidates = len(evidence_units)
+    rej_echo = sum(1 for d in guard_decisions if d["decision"] == GuardDecision.REJECT_QUERY_ECHO.value)
+    rej_env = sum(1 for d in guard_decisions if d["decision"] == GuardDecision.REJECT_ENVIRONMENT_MISMATCH.value)
+    pass_cnt = sum(1 for d in guard_decisions if d["decision"] == GuardDecision.PASS.value)
+    rev_cnt = sum(1 for d in guard_decisions if d["decision"] == GuardDecision.NEEDS_REVIEW.value)
+    total_rej = rej_echo + rej_env
+
+    # 3. Grader bypass if no candidates survived the guard
+    if not surviving_units:
+        print(f"Guard rejected all {total_candidates} candidates. Bypassing LLM relevance grader.")
+        guard_diagnostics = {
+            "total_candidates": total_candidates,
+            "passed": pass_cnt,
+            "needs_review": rev_cnt,
+            "rejected_query_echo": rej_echo,
+            "rejected_environment_mismatch": rej_env,
+            "total_rejected": total_rej,
+            "grader_invoked": False,
+            "candidates_sent_to_grader": 0,
+            "candidates_passed_grader": 0,
+        }
+        out_state = {
+            **state,
+            "documents": [],
+            "evidence_mode": "contextual_grading_guarded",
+            "retrieval_strategy": STRATEGY_CONTEXTUAL_GRADING_GUARDED,
+            "grader_status": "success",
+            "contextual_grading_decisions": [],
+            "guard_decisions": guard_decisions,
+            "guard_diagnostics": guard_diagnostics,
+        }
+        if state.get("capture_eval_evidence", False):
+            out_state["captured_evaluation_evidence"] = captured_eval_units
+        return out_state
+
+    # 4. Grade surviving units with V1 contextual grader
+    active_llm = grader_llm or state.get("grader_llm") or llm
+    kept_units: List[Document] = []
+    grading_decisions: List[Dict[str, Any]] = []
+    rejected_count = 0
+    any_failure = False
+    any_success = False
+
+    for batch_start in range(0, len(surviving_units), GRADE_BATCH_SIZE):
+        batch = surviving_units[batch_start : batch_start + GRADE_BATCH_SIZE]
+        graded_results = grade_candidate_batch(
+            question=question,
+            batch_docs=batch,
+            grader_llm=active_llm,
+            database_path=db_path,
+            candidate_formatter=format_candidate_for_contextual_grader,
+            preceding_contexts=[None] * len(batch),
+        )
+
+        for doc, decision, reason, grader_status in graded_results:
+            if grader_status == "failure":
+                any_failure = True
+            else:
+                any_success = True
+
+            new_metadata = dict(doc.metadata)
+            new_metadata["relevance_decision"] = decision
+            new_metadata["relevance_reason"] = reason
+            new_metadata["grader_status"] = grader_status
+            new_metadata["grader_failure"] = (grader_status == "failure")
+
+            updated_doc = Document(
+                page_content=doc.page_content,
+                metadata=new_metadata,
+            )
+
+            anchor_id = new_metadata.get("anchor_message_id") or new_metadata.get("message_id") or "?"
+            grading_decisions.append({
+                "anchor_message_id": anchor_id,
+                "included_message_ids": new_metadata.get("included_message_ids", []),
+                "decision": decision,
+                "reason": reason,
+                "grader_status": grader_status,
+                "grader_failure": (grader_status == "failure"),
+            })
+            if captured_eval_units:
+                for c_eval in captured_eval_units:
+                    if c_eval.get("anchor_message_id") == anchor_id:
+                        c_eval["decision"] = decision
+                        c_eval["reason"] = reason
+                        c_eval["grader_status"] = grader_status
+            if decision == "irrelevant":
+                rejected_count += 1
+                print(f"  [GRADER REJECTED] DialogueUnit Anchor={anchor_id}: {reason}")
+            else:
+                kept_units.append(updated_doc)
+                status_note = f" (grader_{grader_status})" if grader_status == "failure" else ""
+                print(f"  [GRADER {decision.upper()}{status_note}] DialogueUnit Anchor={anchor_id}: {reason}")
+
+    if any_failure and any_success:
+        overall_grader_status = "degraded"
+    elif any_failure:
+        overall_grader_status = "failed"
+    else:
+        overall_grader_status = "success"
+
+    print(
+        f"Guarded contextual grading summary: {total_rej} rejected by guard, "
+        f"sent {len(surviving_units)} to grader, kept {len(kept_units)}/{len(surviving_units)} "
+        f"evidence units ({rejected_count} rejected as irrelevant, status={overall_grader_status})."
+    )
+
+    # 5. Contextual RRF ranking ONLY on retained units
+    if kept_units:
+        embedder = embedding_function or state.get("embedding_function")
+        ranked_units = rank_dialogue_evidence_units(
+            question=question,
+            evidence_units=kept_units,
+            embedding_function=embedder,
+        )
+        bounded_units = ranked_units[:TOP_K_EVIDENCE_UNITS]
+    else:
+        bounded_units = []
+
+    guard_diagnostics = {
+        "total_candidates": total_candidates,
+        "passed": pass_cnt,
+        "needs_review": rev_cnt,
+        "rejected_query_echo": rej_echo,
+        "rejected_environment_mismatch": rej_env,
+        "total_rejected": total_rej,
+        "grader_invoked": True,
+        "candidates_sent_to_grader": len(surviving_units),
+        "candidates_passed_grader": len(kept_units),
+    }
+
+    out_state = {
+        **state,
+        "documents": bounded_units,
+        "evidence_mode": "contextual_grading_guarded",
+        "retrieval_strategy": STRATEGY_CONTEXTUAL_GRADING_GUARDED,
+        "grader_status": overall_grader_status,
+        "contextual_grading_decisions": grading_decisions,
+        "guard_decisions": guard_decisions,
+        "guard_diagnostics": guard_diagnostics,
+    }
+    if state.get("capture_eval_evidence", False):
+        out_state["captured_evaluation_evidence"] = captured_eval_units
+    return out_state
+
+
+
 def route_post_retrieval(state: GraphState) -> str:
     """
     Routing decision immediately after retrieval:
@@ -3016,6 +3339,8 @@ def route_post_retrieval(state: GraphState) -> str:
     - Otherwise (default production behavior): routes to grade_documents.
     """
     strategy = resolve_retrieval_strategy(state)
+    if strategy == STRATEGY_CONTEXTUAL_GRADING_GUARDED:
+        return "assemble_grade_rank_evidence_guarded"
     if strategy == STRATEGY_CONTEXTUAL_GRADING_V2:
         return "assemble_grade_rank_evidence_v2"
     if strategy == STRATEGY_CONTEXTUAL_GRADING:
@@ -3130,6 +3455,11 @@ def build_graph():
     )
 
     workflow.add_node(
+        "assemble_grade_rank_evidence_guarded",
+        assemble_grade_rank_evidence_guarded,
+    )
+
+    workflow.add_node(
         "rewrite_query",
         rewrite_query,
     )
@@ -3201,6 +3531,9 @@ def build_graph():
 
             "assemble_grade_rank_evidence_v2":
                 "assemble_grade_rank_evidence_v2",
+
+            "assemble_grade_rank_evidence_guarded":
+                "assemble_grade_rank_evidence_guarded",
         },
     )
 
@@ -3256,6 +3589,19 @@ def build_graph():
         },
     )
 
+    # Experimental guarded contextual grading path: assembly -> guard -> grading -> ranking -> decision
+    workflow.add_conditional_edges(
+        "assemble_grade_rank_evidence_guarded",
+        decide_post_contextual_grading,
+        {
+            "generate":
+                "generate",
+
+            "rewrite_query":
+                "rewrite_query",
+        },
+    )
+
     # -------------------------------------------------------------
     # Context expansion
     # -------------------------------------------------------------
@@ -3301,6 +3647,7 @@ def ask(
     dialogue_evidence_mode: Optional[bool] = None,
     contextual_grading_mode: Optional[bool] = None,
     contextual_grading_v2_mode: Optional[bool] = None,
+    contextual_grading_guarded_mode: Optional[bool] = None,
     retrieval_strategy: Optional[str] = None,
     grader_llm: Optional[Any] = None,
     embedding_function: Optional[Any] = None,
@@ -3378,6 +3725,7 @@ def ask(
         "dialogue_evidence_mode": dialogue_evidence_mode,
         "contextual_grading_mode": contextual_grading_mode,
         "contextual_grading_v2_mode": contextual_grading_v2_mode,
+        "contextual_grading_guarded_mode": contextual_grading_guarded_mode,
         "retrieval_strategy": retrieval_strategy,
     }
     resolved_strategy = resolve_retrieval_strategy(test_state)
@@ -3406,6 +3754,7 @@ def ask(
         "dialogue_evidence_mode": dialogue_evidence_mode,
         "contextual_grading_mode": contextual_grading_mode,
         "contextual_grading_v2_mode": contextual_grading_v2_mode,
+        "contextual_grading_guarded_mode": contextual_grading_guarded_mode,
         "retrieval_strategy": resolved_strategy,
         "grader_llm": grader_llm,
         "embedding_function": embedding_function,
@@ -3454,6 +3803,10 @@ def ask(
         "retrieval_strategy": result.get("retrieval_strategy", resolved_strategy),
 
         "contextual_grading_decisions": result.get("contextual_grading_decisions", []),
+
+        "guard_decisions": result.get("guard_decisions", []),
+
+        "guard_diagnostics": result.get("guard_diagnostics"),
     }
 
     if capture_eval_evidence:
