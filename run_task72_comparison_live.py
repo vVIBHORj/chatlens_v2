@@ -149,6 +149,7 @@ class CaseExecutionRecord:
     grounded_status: str = "N/A"  # "Passed", "Failed", "N/A"
     semantic_grounded: bool = False
     rewrites_used: int = 0
+    final_rewrite_counter: int = 0
     grader_status: str = "unknown"
     grader_failure: bool = False
 
@@ -403,7 +404,24 @@ def compute_condition_summary(
 
     if total_cits > 0:
         summary.citation_validity_rate = total_valid_cits / total_cits
-        summary.citation_level_attribution_precision = total_valid_cits / total_cits
+    else:
+        summary.citation_validity_rate = None
+
+    # Factual micro attribution precision (true supporting citations / total citations emitted)
+    total_supporting_cits = 0
+    for r in records:
+        if r.expected_answerable:
+            exp_set = set(r.expected_supporting_ids)
+            val_set = set(r.valid_cited_ids)
+            total_supporting_cits += len(val_set.intersection(exp_set))
+        else:
+            # Emitted citations on unanswerable queries are attribution failures (0 supporting)
+            pass
+
+    if total_cits > 0:
+        summary.citation_level_attribution_precision = total_supporting_cits / total_cits
+    else:
+        summary.citation_level_attribution_precision = None
 
     cits_cases = [r for r in records if (len(r.valid_cited_ids) + len(r.invalid_cited_ids)) > 0]
     if cits_cases:
@@ -733,7 +751,9 @@ def execute_task72_live_benchmark(
                     rec_a.valid_cited_ids = res_a.get("valid_citation_ids", [])
                     rec_a.invalid_cited_ids = res_a.get("invalid_citation_ids", [])
                     rec_a.available_citation_ids = res_a.get("available_citation_ids", [])
-                    rec_a.rewrites_used = res_a.get("rewrites_used", 0)
+                    raw_rewrites_a = res_a.get("rewrites_used", 0)
+                    rec_a.final_rewrite_counter = raw_rewrites_a
+                    rec_a.rewrites_used = max(0, raw_rewrites_a - MAX_REWRITES)
                     rec_a.grader_status = res_a.get("grader_status", "unknown")
 
                     val_a = res_a.get("citation_validation", {}) or {}
@@ -833,7 +853,9 @@ def execute_task72_live_benchmark(
                     rec_b.valid_cited_ids = res_b.get("valid_citation_ids", [])
                     rec_b.invalid_cited_ids = res_b.get("invalid_citation_ids", [])
                     rec_b.available_citation_ids = res_b.get("available_citation_ids", [])
-                    rec_b.rewrites_used = res_b.get("rewrites_used", 0)
+                    raw_rewrites_b = res_b.get("rewrites_used", 0)
+                    rec_b.final_rewrite_counter = raw_rewrites_b
+                    rec_b.rewrites_used = max(0, raw_rewrites_b - MAX_REWRITES)
                     rec_b.grader_status = res_b.get("grader_status", "unknown")
 
                     val_b = res_b.get("citation_validation", {}) or {}

@@ -341,13 +341,19 @@ class GlobalBudgetEnforcingLLM:
         }
 
     def _classify_operation(self, prompt_text: str) -> str:
-        if "relevance grader" in prompt_text.lower() or "retrieved candidates" in prompt_text.lower():
+        lower = prompt_text.lower()
+        if "relevance grader" in lower or "retrieved candidates" in lower:
             return "grading"
-        if "rewrite the following question" in prompt_text.lower():
+        if "rewrite the following question" in lower:
             return "rewrite"
-        if "groundedness checker" in prompt_text.lower() or "factual groundedness" in prompt_text.lower():
+        if "groundedness checker" in lower or "factual groundedness" in lower:
             return "grounding"
-        if "answering a user's question" in prompt_text.lower() or "strict grounding rules" in prompt_text.lower():
+        if (
+            "answering a user's question" in lower
+            or "strict grounding rules" in lower
+            or "no reliable retrieved context available" in lower
+            or ("answering a question about a whatsapp conversation" in lower and "insufficient" in lower)
+        ):
             return "generate"
         return "unknown"
 

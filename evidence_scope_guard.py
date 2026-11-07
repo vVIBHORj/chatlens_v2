@@ -56,7 +56,11 @@ ENV_PATTERNS: Dict[str, List[str]] = {
         r"\.env\.stag(?:e|ing)\b",
     ],
     "development": [
-        r"\b(?:development|dev)\b",
+        r"\bdevelopment\b",
+        r"\bdev\s+(?:env(?:ironment)?|cluster|setup|tier|secrets?|branch|conf(?:ig(?:uration)?)?|db|database|server|host)\b",
+        r"\b(?:env(?:ironment)?|cluster|setup|tier|branch|config(?:uration)?)\s*[:=]?\s*dev\b",
+        r"\bdev\s+(?:and|or|vs|versus|to)\s+(?:prod(?:uction)?|staging|test|local)\b",
+        r"\b(?:prod(?:uction)?|staging|test|local)\s+(?:and|or|vs|versus|to)\s+dev\b",
         r"secrets[\._-]dev[\._-]json",
         r"dev\.(?:yaml|yml|json|env|conf)",
         r"\.env\.dev(?:elopment)?\b",
@@ -152,16 +156,29 @@ def parse_candidate_messages(candidate_text: str) -> List[Dict[str, Any]]:
                 else:
                     context_lines.append(line)
     else:
-        in_anchor = False
-        for line in lines:
-            if "[RETRIEVED ANCHOR]" in line:
-                in_anchor = True
-                continue
-            if in_anchor:
-                if not line.strip():
-                    in_anchor = False
-                continue
-            context_lines.append(line)
+        # Standalone anchor or raw candidate without [CHRONOLOGICAL CONTEXT]
+        has_anchor_section = any("[RETRIEVED ANCHOR]" in line for line in lines)
+        if has_anchor_section:
+            in_anchor = False
+            for line in lines:
+                if "[RETRIEVED ANCHOR]" in line:
+                    in_anchor = True
+                    continue
+                if in_anchor:
+                    # Stop if another major section begins (e.g. metadata or other bracket header)
+                    if (
+                        line.startswith("[")
+                        and not line.startswith("[ID ")
+                        and not line.startswith("[Candidate")
+                    ):
+                        in_anchor = False
+                    else:
+                        context_lines.append(line)
+        else:
+            context_lines = [
+                l for l in lines
+                if not l.strip().startswith("---") and not l.strip().startswith("[Candidate")
+            ]
 
     msg_pattern = re.compile(
         r"^(?:\[ID\s+(?P<id>\d+)\]\s*)?"

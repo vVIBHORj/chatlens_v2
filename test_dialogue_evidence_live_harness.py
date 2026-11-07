@@ -141,3 +141,42 @@ def test_nominal_budget_fits_within_hard_ceiling():
     expected_nominal_total = 12 * 3 + 12 * 2
     assert expected_nominal_total == 60
     assert expected_nominal_total <= NOMINAL_BUDGET
+
+
+def test_operation_classification_contextual_and_zero_context():
+    """Verify GlobalBudgetEnforcingLLM accurately classifies contextual and zero-context generation."""
+    mock_inner = MagicMock()
+    counter = GlobalBudgetEnforcingLLM(inner_llm=mock_inner, max_calls=10)
+
+    # 1. Contextual generation prompt
+    p_gen_ctx = (
+        "You are an evidence-grounded AI assistant answering a user's question "
+        "about an archived WhatsApp conversation.\n\nSTRICT GROUNDING RULES:\n..."
+    )
+    assert counter._classify_operation(p_gen_ctx) == "generate"
+
+    # 2. Zero-context generation fallback prompt
+    p_gen_zero = (
+        "You are answering a question about a WhatsApp conversation.\n\n"
+        "There is no reliable retrieved context available.\n\n"
+        "Question:\nWhere is the production key?\n\n"
+        "Do not invent an answer. Clearly say that the available chat context is insufficient."
+    )
+    assert counter._classify_operation(p_gen_zero) == "generate"
+
+    # 3. Relevance grading prompt
+    p_grade = "You are an expert relevance grader for retrieved candidates."
+    assert counter._classify_operation(p_grade) == "grading"
+
+    # 4. Groundedness checker prompt
+    p_ground = "You are a factual groundedness checker verifying claims."
+    assert counter._classify_operation(p_ground) == "grounding"
+
+    # 5. Query rewrite prompt
+    p_rewrite = "Please rewrite the following question so that it retrieves useful messages."
+    assert counter._classify_operation(p_rewrite) == "rewrite"
+
+    # 6. Unrelated prompt
+    p_other = "What is the capital of France?"
+    assert counter._classify_operation(p_other) == "unknown"
+

@@ -46,6 +46,8 @@
 - [⚖️ Task 70: Evidence Guard Ground-Truth & Metric Reconciliation](#️-task-70-evidence-guard-ground-truth--metric-reconciliation)
 - [🧩 Task 71: Opt-In Integration of Deterministic Evidence-Scope Guard](#-task-71-opt-in-integration-of-deterministic-evidence-scope-guard)
 - [📊 Task 72: Paired End-to-End Evaluation of Contextual Grading vs. Guarded Contextual Grading](#-task-72-paired-end-to-end-evaluation-of-contextual-grading-vs-guarded-contextual-grading)
+- [🔍 Task 73: Independent Audit of Task 72 Benchmark](#-task-73-independent-audit-of-task-72-benchmark)
+- [🛡️ Task 74: Guard Correctness Hardening & Final Audit Reconciliation](#️-task-74-guard-correctness-hardening--final-audit-reconciliation)
 - [🔎 Dual-Level Hybrid Retrieval Engine](#-dual-level-hybrid-retrieval-engine)
 - [🪟 Timestamp-Aware Context Expansion](#-timestamp-aware-context-expansion)
 - [🧭 Deterministic Query Routing](#-deterministic-query-routing)
@@ -913,6 +915,59 @@ Task 72 executed a controlled, paired end-to-end benchmark ([`run_task72_compari
 
 ---
 
+## 🔍 Task 73: Independent Audit of Task 72 Benchmark
+
+Task 73 performed an independent, read-only provenance and metric audit of the Task 72 live benchmark artifacts without invoking new model calls, embedding generation, or database writes:
+
+### 1. Independent Strict Case Scoring Reproduction
+- **Scoring Reproduction**: Independently recalculated all 24 case outcomes using the Task 58 strict scoring contract.
+- **Accuracy Metrics**: Exactly verified 50.0% (6 / 12) accuracy for Condition A and 83.3% (10 / 12) for Condition B.
+- **Edge-Case Outcomes**:
+  - `CASE-04`: Confirmed strict FN in both conditions due to generator omitting the mandatory cleanliness/zero-error qualifier (*"Yes, completely clean"*).
+  - `CASE-09`: Confirmed strict FN in both conditions due to generator citing only `[119]` while the query strictly requires joint synthesis of both `[117, 119]`.
+
+### 2. Complete Model Invocation Ledger Reconstruction
+- **Raw Per-Call Accounting**: Reconciled all 64 model calls against the raw traces:
+  - 24 evidence grading calls (Condition A only; 0 in Condition B due to deterministic bypass).
+  - 16 standard generation calls (9 Cond A + 7 Cond B).
+  - 8 zero-context fallback generation calls (3 Cond A + 5 Cond B).
+  - 16 groundedness check calls (9 Cond A + 7 Cond B).
+- **Hard Ceiling Compliance**: Confirmed 100% adherence to the 84-call budget ceiling across all execution phases.
+
+### 3. Core Audit Findings & Edge Cases Identified
+1. **Short Token `dev` Ambiguity**: In `evidence_scope_guard.py`, unqualified `\bdev\b` regex matched developer role nouns (e.g., *"Which dev approved the release?"*), triggering false `development` classification.
+2. **Standalone Retrieved-Anchor Parsing**: In `evidence_scope_guard.py`, `parse_candidate_messages()` skipped lines under `[RETRIEVED ANCHOR]` when `[CHRONOLOGICAL CONTEXT]` was absent, resulting in empty parsed message lists for standalone anchors.
+3. **Attribution Precision Metric Formula**: In `run_task72_comparison_live.py`, `citation_level_attribution_precision` copied `total_valid_cits / total_cits` (citation validity: 100%) rather than `total_supporting_cits / total_cits` (true micro attribution precision: 58.3% overall for Cond A).
+4. **Operation Classifier Fallback**: In `run_dialogue_evidence_live.py`, zero-context prompts lacked the exact substring `"answering a user's question"`, causing 8 calls to categorize as `"unknown"`.
+5. **Condition B Macro Attribution Denominator**: Clarified that Condition B had 7 answerable cases emitting citations (all 1.0 precision), yielding $7.0 / 7 = 100.0\%$.
+6. **Rewrite-Counter Sentinel**: Clarified that recorded `rewrites_used = 2` was an input sentinel used to disable query rewriting, with 0 actual rewrites executed.
+
+---
+
+## 🛡️ Task 74: Guard Correctness Hardening & Final Audit Reconciliation
+
+Task 74 implemented targeted, surgical correctness fixes addressing all Task 73 audit findings and code-review edge cases under zero-live-inference conditions:
+
+### 1. Correctness Hardening Updates
+- **Contextual Environment Regex** ([`evidence_scope_guard.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/evidence_scope_guard.py)): Contextualized short token `dev` to require environment qualifiers (`dev env`, `dev cluster`, `dev branch`, `dev config`) or coordinated phrases (`dev and prod`, `dev or staging`). Queries using `dev` as a role noun (*"Which dev approved the release?"*) now correctly return `NO_ENV_SPECIFIED` (`PASS`).
+- **Robust Anchor Parser** ([`evidence_scope_guard.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/evidence_scope_guard.py)): Updated `parse_candidate_messages()` so that candidate units lacking `[CHRONOLOGICAL CONTEXT]` parse lines under `[RETRIEVED ANCHOR]`, eliminating silent guard bypass for standalone anchors.
+- **Accurate Attribution Formulas** ([`run_task72_comparison_live.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/run_task72_comparison_live.py)): Disentangled citation validity from citation-level attribution precision:
+  $$\text{Micro Attribution Precision} = \frac{\text{Total Supporting Citations}}{\text{Total Citations Emitted}}$$
+  Condition A true micro precision is correctly reported as **58.3% (7 / 12)** across all cases and **77.8% (7 / 9)** on answerable cases; Condition B is **100.0% (7 / 7)**.
+- **Complete Operation Classification** ([`run_dialogue_evidence_live.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/run_dialogue_evidence_live.py)): Enhanced prompt pattern matching to recognize zero-context prompts as `generate`, ensuring all 24 generation calls map correctly in the ledger.
+- **Explicit Rewrite Ledger**: Added `final_rewrite_counter` and documented $\text{executed rewrites} = \max(0, \text{raw} - \text{MAX\_REWRITES}) = 0$.
+
+### 2. Offline Replay & Test Verification
+- **Canonical Offline Replay** ([`run_task71_offline_replay.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/run_task71_offline_replay.py)): Re-ran against the frozen 69-candidate ground truth:
+  - **Supporting Preservation**: **100.0% (26 / 26)** supporting candidates preserved (**0 false rejections**).
+  - **Mandatory Support**: `[112]` (CASE-06) and `[117, 119]` (CASE-09) strictly preserved.
+  - **Distractor Filtering**: 12 unsupported candidates filtered (8 query echoes, 4 environment mismatches).
+- **Targeted Unit Tests**: Added 6 new unit tests (`test_21`–`test_26` in [`test_evidence_scope_guard.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/test_evidence_scope_guard.py)) and operation classification tests in [`test_dialogue_evidence_live_harness.py`](file:///c:/Users/vibhor/Desktop/chat_lens_v2/ChatLens-RAG/test_dialogue_evidence_live_harness.py).
+- **Core Regression Suite**: **118 passed in 8.16s, 0 failures** across 6 test suites.
+- **Audit Verdict**: Upgraded to **FULLY RECONCILED & ACCEPTED**.
+
+---
+
 ## 🔎 Dual-Level Hybrid Retrieval Engine
 
 ChatLens rejects simple vector search in favor of a 3-way hybrid retrieval and evidence-scoring architecture that balances semantic nuance with keyword precision:
@@ -1445,7 +1500,7 @@ python -m pytest test_citation_remediation_task41.py -v
 # 13. Run the live comparison harness verification tests (budget counter & sandbox isolation)
 python -m pytest test_dialogue_evidence_live_harness.py -v
 
-# 14. Run the Task 69 deterministic evidence-scope guard tests (20 tests)
+# 14. Run the Task 69 & Task 74 deterministic evidence-scope guard tests (26 tests)
 python -m pytest test_evidence_scope_guard.py -v
 
 # 15. Run the Task 71 guarded contextual grading integration tests (22 tests)
@@ -1453,6 +1508,9 @@ python -m pytest test_contextual_grading_guarded.py -v
 
 # 16. Execute the comprehensive 107-test offline regression suite across all active components
 python -m pytest test_contextual_grading_guarded.py test_evidence_scope_guard.py test_contextual_grading_pipeline.py test_dialogue_evidence_pipeline.py test_citation_remediation_task41.py test_citation_integrity.py -v
+
+# 17. Run the Task 74 hardened regression suite across all active components (118 tests)
+python -m pytest test_evidence_scope_guard.py test_contextual_grading_guarded.py test_contextual_grading_pipeline.py test_citation_integrity.py test_context_expander.py test_dialogue_evidence_live_harness.py -v
 ```
 
 ### Task 72 Live Paired Comparison Runner (Contextual Grading vs. Guarded Contextual Grading)
@@ -1552,6 +1610,8 @@ python benchmark_suite.py
 - [x] Task 70 read-only provenance audit reconciling candidate distributions, denominator definitions, and message mappings.
 - [x] Task 71 opt-in integration of deterministic evidence-scope guard as `contextual_grading_guarded` in `rag_graph.py` with 22 unit tests and fail-open guarantees.
 - [x] Task 72 paired live end-to-end evaluation achieving 83.3% strict accuracy (+33.3%), 100% correct abstention rate, and 0 false positives within budget.
+- [x] Task 73 independent artifact-based audit of Task 72 benchmark, invocation ledger reconstruction, and attribution verification.
+- [x] Task 74 guard correctness hardening, environment disambiguation, standalone anchor parsing fix, attribution metric reconciliation, and audit acceptance.
 
 ### 🚀 Upcoming Roadmap
 - [ ] Add streaming response token generation in the Streamlit UI.
